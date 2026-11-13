@@ -44,6 +44,7 @@ const HELP = `sasjs-release - releases from conventional commits
   --repo <owner/name>    repository on the host (default: from the remote)
   --api-url <url>        host API base (default: per host)
   --token-env <NAME>     environment variable holding the token
+  --token-header <h>     which header carries it (default: per host)
   --asset <path>         file to upload to the release (repeatable)
   --asset-link <n=url>   link to attach to the release (repeatable)
   --title <text>         release title (default: the tag)
@@ -199,17 +200,29 @@ function notes(version, parsed, previous, repo, date) {
  * Multipart without dependencies: node's own FormData and Blob, so an asset
  * upload needs no curl on the runner and no library in the tree.
  */
-async function upload(url, token, file, field, name) {
+async function upload(url, headers, file, field) {
   const body = new FormData()
   const bytes = readFileSync(file)
-  body.append(field, new Blob([bytes]), name || basename(file))
-  const response = await request(url, { method: 'POST', token, body })
+  body.append(field, new Blob([bytes]), basename(file))
+  const response = await request(url, { method: 'POST', headers, body })
   return response
 }
 
-async function request(url, { method = 'GET', token, body, json } = {}) {
-  const headers = { accept: 'application/json' }
-  if (token) headers.authorization = `Bearer ${token}`
+/**
+ * Each forge spells its credential differently, and getting this wrong is a
+ * 401 that looks like a permissions problem: GitHub and Gitea take an
+ * Authorization scheme, GitLab takes its own header and rejects Bearer. A
+ * GitLab job token works too - it needs no personal token at all.
+ */
+function authHeaders(host, token, header) {
+  if (!token) return {}
+  if (host === 'gitlab')
+    return { [header || (process.env.CI_JOB_TOKEN === token ? 'job-token' : 'private-token')]: token }
+  return { authorization: host === 'gitea' ? `token ${token}` : `Bearer ${token}` }
+}
+
+async function request(url, { method = 'GET', headers = {}, body, json } = {}) {
+  headers = { accept: 'application/json', ...headers }
   if (json !== undefined) headers['content-type'] = 'application/json'
 
   const response = await fetch(url, {
@@ -246,19 +259,23 @@ const HOSTS = {
  * no asset upload at all - a release carries links, which is why --asset-link
  * exists.
  */
-async function publish({ host, api, token, repo, tag, body, title, files, links }) {
+async function publish({ host, api, token, header, repo, tag, body, title, files, links, commit }) {
+  const headers = authHeaders(host, token, header)
   const encoded = repo.replace('/', '%2F')
 
   if (host === 'github') {
     const base = api || HOSTS.github.api
+    // target_commitish is what makes the tag exist at all: the API creates it
+    // when tag_name is new, so the job needs no git credentials and never
+    // pushes to the repository. Unused when the tag is already there.
     const release = await request(`${base}/repos/${repo}/releases`, {
       method: 'POST',
-      token,
-      json: { tag_name: tag, name: title, body }
+      headers,
+      json: { tag_name: tag, target_commitish: commit, name: title, body }
     })
     for (const file of files) {
       const url = String(release.upload_url).replace(/\{.*$/, '')
-      await upload(`${url}?name=${encodeURIComponent(basename(file))}`, token, file, 'file')
+      await upload(`${url}?name=${encodeURIComponent(basename(file))}`, headers, file, 'file')
     }
     return release
   }
@@ -267,13 +284,13 @@ async function publish({ host, api, token, repo, tag, body, title, files, links 
     if (!api) fail('--host gitea needs --api-url (https://your-host/api/v1)')
     const release = await request(`${api}/repos/${repo}/releases`, {
       method: 'POST',
-      token,
-      json: { tag_name: tag, name: title, body, draft: false }
+      headers,
+      json: { tag_name: tag, target_commitish: commit, name: title, body, draft: false }
     })
     for (const file of files) {
       await upload(
         `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(basename(file))}`,
-        token,
+        headers,
         file,
         'attachment'
       )
@@ -281,7 +298,7 @@ async function publish({ host, api, token, repo, tag, body, title, files, links 
     if (body !== release.body) {
       await request(`${api}/repos/${repo}/releases/${release.id}`, {
         method: 'PATCH',
-        token,
+        headers,
         json: { body }
       })
     }
@@ -290,15 +307,17 @@ async function publish({ host, api, token, repo, tag, body, title, files, links 
 
   if (host === 'gitlab') {
     const base = api || HOSTS.gitlab.api
+    // GitLab is the same shape: `ref` is what creates the tag when tag_name is
+    // new, and without it the call fails on a tag that does not exist yet.
     const release = await request(`${base}/projects/${encoded}/releases`, {
       method: 'POST',
-      token,
-      json: { name: title, tag_name: tag, description: body }
+      headers,
+      json: { name: title, tag_name: tag, ref: commit, description: body }
     })
     for (const link of links) {
       await request(`${base}/projects/${encoded}/releases/${encodeURIComponent(tag)}/assets/links`, {
         method: 'POST',
-        token,
+        headers,
         json: { name: link.name, url: link.url }
       })
     }
@@ -449,12 +468,14 @@ async function main() {
       host,
       api: arg('api-url'),
       token,
+      header: arg('token-header'),
       repo,
       tag,
       body,
       title: arg('title', tag),
       files: args('asset'),
-      links
+      links,
+      commit: head
     })
     console.log(`released ${tag} on ${host}`)
   }

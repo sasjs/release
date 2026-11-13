@@ -55,10 +55,12 @@ function run(cwd, ...argv) {
  * process, so a synchronous spawn would deadlock the request it has to answer.
  */
 const runAsync = promisify(execFile)
-const runInParallel = (cwd, ...argv) =>
-  runAsync('node', [CLI, '--repo-dir', cwd, ...argv], {
-    env: { ...process.env, ...envelope }
+const runInParallel = (cwd, ...argv) => {
+  const env = argv.at(-1) && typeof argv.at(-1) === 'object' ? argv.pop() : {}
+  return runAsync('node', [CLI, '--repo-dir', cwd, ...argv], {
+    env: { ...process.env, ...envelope, ...env }
   }).then(({ stdout }) => stdout)
+}
 
 /** The message a failing run prints, which is on stderr, not the exception. */
 function failure(cwd, ...argv) {
@@ -209,6 +211,8 @@ async function stub(respond) {
         method: request.method,
         url: request.url,
         auth: request.headers.authorization,
+        privateToken: request.headers['private-token'],
+        jobToken: request.headers['job-token'],
         type: request.headers['content-type'],
         body: Buffer.concat(chunks).toString()
       })
@@ -258,7 +262,10 @@ test('github: creates the release and uploads each asset to its upload_url', asy
   const created = replacement.seen.find((r) => r.url === '/repos/sasjs/app/releases')
   assert.equal(created.method, 'POST')
   assert.equal(created.auth, 'Bearer token-123')
-  assert.equal(JSON.parse(created.body).tag_name, 'v1.8.0')
+  const payload = JSON.parse(created.body)
+  assert.equal(payload.tag_name, 'v1.8.0')
+  // the host creates the tag where we say: no git credentials, no push
+  assert.equal(payload.target_commitish, git(cwd, 'rev-parse', 'HEAD'))
 
   // the {?name,label} template must be stripped before it is used
   const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=app.zip'))
@@ -277,7 +284,9 @@ test('gitea: creates the release over the REST API and posts the asset', async (
     replacement.base, '--repo', 'dc/dc', '--asset', asset)
 
   const created = replacement.seen.find((r) => r.url === '/repos/dc/dc/releases')
+  assert.equal(created.auth, 'token gitea-token')
   assert.equal(JSON.parse(created.body).tag_name, 'v1.7.2')
+  assert.equal(JSON.parse(created.body).target_commitish, git(cwd, 'rev-parse', 'HEAD'))
   const posted = replacement.seen.find((r) => r.url.startsWith('/repos/dc/dc/releases/42/assets'))
   assert.match(posted.type, /^multipart\/form-data/)
   // the body is patched after creation, because gitea returns the body it stored
@@ -295,9 +304,28 @@ test('gitlab: creates the release and attaches links, which is all it has', asyn
     '--asset-link', 'app.zip=https://example.com/app.zip')
 
   const created = replacement.seen.find((r) => r.url === '/projects/client%2Fapp/releases')
+  assert.equal(created.privateToken, 'gl-token')
   assert.equal(JSON.parse(created.body).tag_name, 'v1.7.2')
+  // without ref, gitlab fails on a tag that does not exist yet
+  assert.equal(JSON.parse(created.body).ref, git(cwd, 'rev-parse', 'HEAD'))
   const link = replacement.seen.find((r) => r.url === '/projects/client%2Fapp/releases/v1.7.2/assets/links')
   assert.deepEqual(JSON.parse(link.body), { name: 'app.zip', url: 'https://example.com/app.zip' })
+})
+
+test('a gitlab job token goes in its own header, so no personal token is needed', async (t) => {
+  const replacement = await stub(() => ({ json: { tag_name: 'v1.7.2' } }))
+  t.after(() => replacement.stop())
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+
+  await runInParallel(cwd, '--host', 'gitlab', '--release', '--api-url',
+    replacement.base, '--repo', 'client/app', '--token-env', 'CI_JOB_TOKEN', {
+      ...process.env,
+      CI_JOB_TOKEN: 'job-token-1'
+    })
+
+  const created = replacement.seen.find((r) => r.url === '/projects/client%2Fapp/releases')
+  assert.equal(created.jobToken, 'job-token-1')
+  assert.equal(created.privateToken, undefined)
 })
 
 test('no token is a failure that says which variable to set', () => {

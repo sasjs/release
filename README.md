@@ -1,6 +1,6 @@
 # @sasjs/release
 
-Releases from conventional commits, for any host. Zero dependencies, one file.
+Simple and safe release management. Releases from conventional commits, for any host. Zero dependencies, one file.
 
 The version is the git tag. Nothing writes a version into `package.json`, nothing commits, nothing pushes to a branch: the tag names the commit that was merged, and the release notes are the commits it covers. GitHub, Gitea, GitLab and a laptop all run the same command.
 
@@ -13,6 +13,14 @@ npx @sasjs/release --tag --host gitlab --release
 ## Why not a release toolchain
 
 `semantic-release` and `release-please` arrive with a few hundred packages, a plugin per job, and advisories that no one can fix (their copies of `npm`, `glob` and `undici` are bundled inside the tool). This is ~450 lines and installs nothing, so there is nothing to audit and nothing to upgrade. It also does not need a `gh` CLI, `curl`, `jq` or `tea`: the host calls are plain `fetch`.
+
+### What it deliberately does not do
+
+There is no release commit, so **no changelog file is written and `package.json` is not bumped in git**. Both of those mean a runner pushing to the default branch, which means a token with bypass on a protected branch, which is the permission that is hardest to justify and easiest to get wrong.
+
+- **The changelog is the release page.** It is generated from the commits the tag covers, on every run, from git alone.
+- If a file is wanted anyway, it does not have to be in git: attach the notes as an asset (`--notes-file NOTES.md --asset NOTES.md`), or generate the file at docs-build time from `git log <prev>..<tag>` - the same data, no write.
+- **`package.json` is stamped in the publishing job, not in the repository**: `npm version "${TAG#v}" --no-git-tag-version` before `npm publish`. The tarball carries the right version; the file in git keeps whatever it had. Nothing is committed.
 
 Two things it does that the toolchain cannot:
 
@@ -45,6 +53,28 @@ Two things it does that the toolchain cannot:
 Exit codes: `0` released or nothing to release, `2` usage, git or host error.
 
 The result is printed as `key=value` lines, so a pipeline can feed it to whatever variable protocol it has - `$GITHUB_OUTPUT`, `$GITHUB_ENV`, a dotenv artifact, nothing at all - with `--output`.
+
+## Permissions
+
+The whole release is one credential: a token that may write contents on the repository. No branch is written, nothing is committed, and no workflow-file change is involved.
+
+| What | Permission | Why it is needed |
+| --- | --- | --- |
+| Create the release | `contents: write` (GitHub, Gitea), Developer or the job token (GitLab) | creating a release is a write on the repository |
+| Create the tag | the same grant | the forge creates the tag from `target_commitish` (GitHub, Gitea) or `ref` (GitLab), so the job needs no git credentials and does not run `git push` |
+| Upload assets | the same grant | attached to the release |
+| `npm publish` with OIDC | `id-token: write` | stays in the calling workflow, so provenance names the package's own repository |
+
+A release therefore needs **one** call and no checkout credentials at all:
+
+```bash
+# the host creates the tag at this commit and the release in one call
+npx @sasjs/release --host github --release
+```
+
+`--tag --push-tag` exists for the case where the tag must exist before the release does - building artefacts from it in a later job, for instance - and it costs a git credential. The minimal path does not use it.
+
+A `permissions` block that grants `contents: write` to the release job is the same grant the release toolchain already asks for; what is lost is the app token that exists only to push a release commit.
 
 ## The version rule
 
@@ -97,9 +127,9 @@ release:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - npx --yes @sasjs/release --tag --push-tag --host gitlab
-        --release --api-url "$CI_API_V4_URL" --repo "$CI_PROJECT_PATH"
-        --output release.env
+    - npx --yes @sasjs/release --host gitlab --release
+        --api-url "$CI_API_V4_URL" --repo "$CI_PROJECT_PATH"
+        --token-env CI_JOB_TOKEN --output release.env
         --asset-link "app.zip=$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_SHA/download?job=build"
   artifacts:
     reports:
@@ -108,7 +138,7 @@ release:
     GIT_DEPTH: '0' # GitLab clones 20 commits deep by default
 ```
 
-GitLab releases carry links rather than uploaded files, which is what `--asset-link` is for; the usual link is the job artifact of the build that just ran.
+GitLab releases carry links rather than uploaded files, which is what `--asset-link` is for; the usual link is the job artifact of the build that just ran. GitLab does not accept `Authorization: Bearer`, so the token goes in `PRIVATE-TOKEN`, or in `JOB-TOKEN` when it is `$CI_JOB_TOKEN` - which needs no personal token at all. `--token-header` overrides the choice.
 
 ## Adapters
 
@@ -116,14 +146,14 @@ GitLab releases carry links rather than uploaded files, which is what `--asset-l
 
 - **GitHub** - `POST /repos/{repo}/releases`, then each asset to the `upload_url` in the response (with the `{?name,label}` template stripped).
 - **Gitea** - `POST {api}/repos/{repo}/releases`, multipart to `.../releases/{id}/assets`, and a `PATCH` for the body, because Gitea stores what it is given.
-- **GitLab** - `POST {api}/projects/{path}/releases`, then `.../releases/{tag}/assets/links` per link.
+- **GitLab** - `POST {api}/projects/{path}/releases` with `ref` (the tag is created from it when missing), then `.../releases/{tag}/assets/links` per link.
 
 A new host is one function plus an entry in `HOSTS`.
 
 ## Development
 
 ```bash
-npm test   # node --test: 21 tests, fixture repositories and a stub host
+npm test   # node --test: 22 tests, fixture repositories and a stub host
 ```
 
 The fixtures are real git repositories built per test, so the bump rules, the tag prefix, the path filter, prereleases and the re-run path are exercised against git rather than a mock. The host adapters are exercised against a stub HTTP server that records the requests.
