@@ -1,6 +1,6 @@
 {
   "name": "@sasjs/release",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Host-neutral releases from conventional commits: version, notes, tag, release. Zero dependencies.",
   "license": "ISC",
   "type": "module",
@@ -15,7 +15,8 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "node -e \"const v=require('./package.json').version; if (v === '0.0.0') { console.error('refusing to publish 0.0.0: the version is stamped from the tag (npm version <tag> --no-git-tag-version)'); process.exit(1) }\""
   },
   "repository": {
     "type": "git",

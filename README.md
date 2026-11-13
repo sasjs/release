@@ -20,7 +20,9 @@ There is no release commit, so **no changelog file is written and `package.json`
 
 - **The changelog is the release page.** It is generated from the commits the tag covers, on every run, from git alone.
 - If a file is wanted anyway, it does not have to be in git: attach the notes as an asset (`--notes-file NOTES.md --asset NOTES.md`), or generate the file at docs-build time from `git log <prev>..<tag>` - the same data, no write.
-- **`package.json` is stamped in the publishing job, not in the repository**: `npm version "${TAG#v}" --no-git-tag-version` before `npm publish`. The tarball carries the right version; the file in git keeps whatever it had. Nothing is committed.
+- **`package.json` is stamped in the publishing job, not in the repository**: `npm version "${TAG#v}" --no-git-tag-version` before `npm publish`. The tarball carries the right version and nothing is committed.
+- The committed `package.json` therefore says `0.0.0` - meaning unset, not stale. A version there would be a claim the repository cannot keep true, since updating it is the commit this design refuses. `prepublishOnly` refuses to publish while the version is still `0.0.0`, so a hand-run publish fails loudly instead of putting `0.0.0` on the registry.
+- Consequence: installing **from git** (`npm i github:sasjs/release`) or packing outside CI gives `0.0.0`. Install from the registry, or use the action at a pinned commit, which is what a consumer wants anyway.
 
 Two things it does that the toolchain cannot:
 
