@@ -1,0 +1,114 @@
+name: Publish
+
+# Publishes the version the release names.
+#
+# This file is the one an npm trusted publisher is registered against, because
+# the registry validates the workflow that actually runs `npm publish` (the OIDC
+# `job_workflow_ref` claim) - not the workflow that triggered it. Keeping the
+# publish here and the tag in release.yml means neither job holds the other's
+# permission: the release job never sees `id-token`, and this job never sees
+# `contents: write`.
+#
+# Nothing is committed. The tag is the version; the version is stamped into the
+# working tree because npm reads package.json, and the tree is thrown away.
+on:
+  release:
+    types: [published]
+  # a publish that failed can be retried: the release event fires once, and
+  # re-creating the release to republish is exactly the state to avoid
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (blank = the tag that triggered it)
+        required: false
+        default: ''
+      republish:
+        description: Publish even when the registry already serves this version
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # trusted publishing: the OIDC token is the credential
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # a fork's release event must not publish to the org's package
+    if: github.repository == 'sasjs/release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          RELEASED: ${{ github.event.release.tag_name }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED:-$RELEASED}"
+          if [ -z "$tag" ]; then
+            echo "::error::no tag - run this from a published release, or pass one"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "publishing $tag (version ${tag#v})"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: npm can do trusted publishing
+        # OIDC publishing needs npm 11.5.1 or later; an older CLI looks for a
+        # token instead, and fails with a message about authentication rather
+        # than about the version
+        run: |
+          set -euo pipefail
+          version="$(npm --version)"
+          echo "npm $version"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+          if [ "$major" -lt 11 ] || { [ "$major" -eq 11 ] && [ "$minor" -lt 5 ]; }; then
+            echo "::error::npm $version cannot do trusted publishing - needs 11.5.1 or later"
+            exit 1
+          fi
+
+      - name: The suite passes at this tag
+        run: node --test
+
+      # the version npm reads is the tag, stamped into the tree and not committed
+      - name: Stamp the version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Already on the registry?
+        id: existing
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          published="$(npm view "@sasjs/release@${VERSION}" version 2>/dev/null || true)"
+          if [ "$published" = "$VERSION" ] && [ "${{ inputs.republish }}" != "true" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is already on the registry - nothing to publish"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.existing.outputs.already != 'true'
+        run: npm publish --access public
+        # no NODE_AUTH_TOKEN: the OIDC token is exchanged for a short-lived
+        # credential, so there is no long-lived secret in this repository

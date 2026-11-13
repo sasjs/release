@@ -1,0 +1,48 @@
+name: Release
+
+# Cuts the tag and the GitHub release from the conventional commits merged
+# since the last tag. Nothing is committed, no branch is written, and the tag
+# is created by the release call itself (target_commitish), so the job needs no
+# git credentials and no push permission.
+#
+# DISPATCH ONLY FOR NOW. The push trigger below is what makes a merge release,
+# and it is deliberately still commented out: switching it on before the npm
+# trusted publisher exists would cut a release whose publish job then fails,
+# which is the half-finished release this tool exists to avoid. Uncomment the
+# two lines once @sasjs/release is configured on npmjs.
+on:
+  # push:
+  #   branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # the tag and the release
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # the range is classified from tags: a shallow clone sees one commit
+          # and invents a version
+          fetch-depth: 0
+          # the release call creates the tag over the API, so the checkout
+          # token does not need to stay in the git config
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # a defect must fail here rather than at release time
+      - name: The suite
+        run: node --test
+
+      - name: Tag and release
+        run: node release.mjs --host github --release --output "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
