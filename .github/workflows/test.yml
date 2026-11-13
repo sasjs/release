@@ -1,0 +1,37 @@
+name: Tests
+
+# The release tool for every other repository is itself released, so its own
+# gate is the same one those repositories run: the suite, on the node versions
+# the callers use, plus a rehearsal of the release path over this repository's
+# own history - which writes nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the rehearsal classifies this repository's own tags
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: The suite
+        run: node --test
+      - name: Rehearse a release over this repository
+        # a defect here would otherwise surface as a failed release elsewhere
+        run: node release.mjs --dry-run
+      - name: The action definition is what a caller will run
+        run: |
+          test -s action.yml
+          grep -q 'release.mjs' action.yml

@@ -1,0 +1,479 @@
+#!/usr/bin/env node
+/**
+ * Decide and cut a release from conventional commits.
+ *
+ * The version is the git tag. Nothing in this script writes a version into
+ * package.json, commits, or pushes to a branch: the tag names the commit that
+ * was merged, and the release notes are the commits it covers. That removes the
+ * release commit, the branch push and the retry-outs that come with it.
+ *
+ * Host-neutral by construction: the git side (classify, version, notes, tag)
+ * needs nothing but git, and the release side talks to an API over plain
+ * https, so GitHub, Gitea, GitLab and anything with the same shape work
+ * without a CLI installed. `--host none` does the git work only.
+ *
+ *     sasjs-release --dry-run
+ *     sasjs-release --tag --push-tag --host github --release
+ *     sasjs-release --tag --host gitlab --release --asset-link "app.zip=$URL"
+ *
+ * Exit 0: released, or nothing to release (`released=false` in --output).
+ * Exit 2: usage, git or host error; nothing is tagged when this is returned
+ * before the tag step, and the tag alone exists when it is returned after.
+ */
+import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync, appendFileSync } from 'node:fs'
+import { basename, join } from 'node:path'
+
+const LEVELS = { major: 3, minor: 2, patch: 1 }
+
+const HELP = `sasjs-release - releases from conventional commits
+
+  --repo-dir <path>      repository to work in (default: cwd)
+  --tag-prefix <p>       prefix before the version in the tag (default: v)
+  --since <ref>          count commits after this ref (default: newest prefixed tag)
+  --paths <a,b>          only commits touching these paths (monorepos)
+  --level <l>            force patch|minor|major instead of classifying
+  --prerelease <id>      cut <version>-<id>.1 (or continue the last one)
+  --dry-run              say what it would do; write nothing, send nothing
+  --notes-file <path>    write the release notes here
+  --output <path>        append key=value lines: released, version, tag, level
+  --tag                  create the annotated tag (reused if it is already here)
+  --push-tag             push the tag to origin
+  --host <h>             none|github|gitea|gitlab (default: none)
+  --release              create the host release (github/gitea/gitlab)
+  --repo <owner/name>    repository on the host (default: from the remote)
+  --api-url <url>        host API base (default: per host)
+  --token-env <NAME>     environment variable holding the token
+  --asset <path>         file to upload to the release (repeatable)
+  --asset-link <n=url>   link to attach to the release (repeatable)
+  --title <text>         release title (default: the tag)
+  --help                 this text
+`
+
+const flag = (name) => process.argv.includes(`--${name}`)
+
+const arg = (name, fallback = '') => {
+  const at = process.argv.indexOf(`--${name}`)
+  if (at === -1) return fallback
+  const value = process.argv[at + 1]
+  if (value === undefined || value.startsWith('--')) fail(`--${name} needs a value`)
+  return value
+}
+
+const args = (name) =>
+  process.argv.reduce((all, token, index) => {
+    if (token === `--${name}`) {
+      const value = process.argv[index + 1]
+      if (value === undefined || value.startsWith('--'))
+        fail(`--${name} needs a value`)
+      all.push(value)
+    }
+    return all
+  }, [])
+
+function fail(message) {
+  console.error(`sasjs-release: ${message}`)
+  process.exit(2)
+}
+
+// stderr is captured rather than inherited: several probes (a missing `origin`,
+// an absent tag) are expected to fail, and their noise is not a finding
+const git = (cwd, ...argv) =>
+  execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+
+const attempt = (fn) => {
+  try {
+    return fn()
+  } catch {
+    return ''
+  }
+}
+
+/** The commit range to classify: after the newest tag carrying our prefix. */
+const latestTag = (cwd, prefix) =>
+  attempt(() =>
+    git(cwd, 'describe', '--tags', '--abbrev=0', '--match', `${prefix}[0-9]*`)
+  )
+
+/** Subject and body per commit, newest last. NUL and 0x01 separate the fields. */
+function commits(cwd, from, paths, to = 'HEAD') {
+  const range = from ? `${from}..${to}` : to
+  const raw = attempt(() =>
+    git(cwd, 'log', range, '--pretty=format:%s%x00%b%x01', '--', ...paths)
+  )
+  if (!raw) return []
+  return raw
+    .split('\x01')
+    .filter(Boolean)
+    .map((entry) => {
+      const [subject, body = ''] = entry.split('\x00')
+      return { subject: subject.trim(), body: body.trim() }
+    })
+}
+
+const SUBJECT = /^([a-z]+)(\([^)]*\))?(!)?:\s*(.+)$/i
+const TYPES = { feat: 'feat', fix: 'fix', perf: 'perf', refactor: 'refactor' }
+const TITLES = {
+  breaking: 'BREAKING CHANGES',
+  feat: 'Features',
+  fix: 'Bug Fixes',
+  perf: 'Performance',
+  refactor: 'Refactors'
+}
+
+function classify({ subject, body }) {
+  const match = subject.match(SUBJECT)
+  if (!match) return { type: 'other', breaking: false, text: subject }
+  const [, type, , bang, text] = match
+  return {
+    type: type.toLowerCase(),
+    breaking: Boolean(bang) || /^BREAKING[ -]CHANGE:/m.test(body),
+    text: text.trim()
+  }
+}
+
+/** The stable part of a tag's version, so a prerelease base still bumps. */
+const stable = (version) => version.split('-')[0]
+
+function bump(base, level) {
+  const [major, minor, patch] = stable(base).split('.').map(Number)
+  if (level === 'major') return `${major + 1}.0.0`
+  if (level === 'minor') return `${major}.${minor + 1}.0`
+  return `${major}.${minor}.${patch + 1}`
+}
+
+/**
+ * A prerelease continues the last prerelease of the same base version, so
+ * re-running before the stable cut moves beta.1 -> beta.2 rather than
+ * producing a second beta.1.
+ */
+function bumpPrerelease(base, id, previous) {
+  base = stable(base)
+  if (previous) {
+    const match = previous.match(/^(\d+)\.(\d+)\.(\d+)-([^.]+)\.(\d+)$/)
+    if (match) {
+      const [, major, minor, patch, previousId, n] = match
+      const at = `${major}.${minor}.${patch}`
+      const next = Number(n) + 1
+      if (at === base && previousId === id) return `${base}-${id}.${next}`
+      return `${base}-${id}.1`
+    }
+  }
+  return `${base}-${id}.1`
+}
+
+/** https://host/owner/repo from any remote form, so notes can link to diffs. */
+function remoteUrl(cwd) {
+  const raw = attempt(() => git(cwd, 'remote', 'get-url', 'origin'))
+  if (!raw) return ''
+  const match = raw.match(/^(?:[\w-]+:\/\/)?(?:[^@/]+@)?([^:/]+)[:/](.+?)(?:\.git)?$/)
+  if (!match) return ''
+  const [, host, path] = match
+  return `https://${host}/${path.replace(/\.git$/, '')}`
+}
+
+function notes(version, parsed, previous, repo, date) {
+  const link = repo
+    ? previous
+      ? `${repo}/compare/${previous}...v${version}`
+      : `${repo}/releases/tag/v${version}`
+    : ''
+  const groups = { breaking: [], feat: [], fix: [], perf: [], refactor: [] }
+  for (const commit of parsed) {
+    if (commit.breaking) groups.breaking.push(commit)
+    if (commit.type in TYPES) groups[commit.type].push(commit)
+  }
+
+  const heading = link ? `## [${version}](${link})` : `## ${version}`
+  const lines = [`${heading}${date ? ` (${date})` : ''}`, '']
+  for (const key of Object.keys(TITLES)) {
+    if (!groups[key].length) continue
+    lines.push(`### ${TITLES[key]}`, '')
+    for (const commit of groups[key]) lines.push(`* ${commit.text}`)
+    lines.push('')
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Multipart without dependencies: node's own FormData and Blob, so an asset
+ * upload needs no curl on the runner and no library in the tree.
+ */
+async function upload(url, token, file, field, name) {
+  const body = new FormData()
+  const bytes = readFileSync(file)
+  body.append(field, new Blob([bytes]), name || basename(file))
+  const response = await request(url, { method: 'POST', token, body })
+  return response
+}
+
+async function request(url, { method = 'GET', token, body, json } = {}) {
+  const headers = { accept: 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
+  if (json !== undefined) headers['content-type'] = 'application/json'
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: json !== undefined ? JSON.stringify(json) : body
+  })
+
+  const text = await response.text()
+  if (!response.ok)
+    fail(`${method} ${url} answered ${response.status}: ${text.slice(0, 500)}`)
+  return text ? JSON.parse(text) : {}
+}
+
+const HOSTS = {
+  github: {
+    api: 'https://api.github.com',
+    token: 'GH_TOKEN'
+  },
+  gitea: {
+    api: '',
+    token: 'GITEA_TOKEN'
+  },
+  gitlab: {
+    api: 'https://gitlab.com/api/v4',
+    token: 'GITLAB_TOKEN'
+  }
+}
+
+/**
+ * Create (or find) the release and attach what was asked for. Each host is a
+ * small function because the shapes genuinely differ: GitHub needs a separate
+ * upload endpoint, Gitea posts multipart to its own asset URL, and GitLab has
+ * no asset upload at all - a release carries links, which is why --asset-link
+ * exists.
+ */
+async function publish({ host, api, token, repo, tag, body, title, files, links }) {
+  const encoded = repo.replace('/', '%2F')
+
+  if (host === 'github') {
+    const base = api || HOSTS.github.api
+    const release = await request(`${base}/repos/${repo}/releases`, {
+      method: 'POST',
+      token,
+      json: { tag_name: tag, name: title, body }
+    })
+    for (const file of files) {
+      const url = String(release.upload_url).replace(/\{.*$/, '')
+      await upload(`${url}?name=${encodeURIComponent(basename(file))}`, token, file, 'file')
+    }
+    return release
+  }
+
+  if (host === 'gitea') {
+    if (!api) fail('--host gitea needs --api-url (https://your-host/api/v1)')
+    const release = await request(`${api}/repos/${repo}/releases`, {
+      method: 'POST',
+      token,
+      json: { tag_name: tag, name: title, body, draft: false }
+    })
+    for (const file of files) {
+      await upload(
+        `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(basename(file))}`,
+        token,
+        file,
+        'attachment'
+      )
+    }
+    if (body !== release.body) {
+      await request(`${api}/repos/${repo}/releases/${release.id}`, {
+        method: 'PATCH',
+        token,
+        json: { body }
+      })
+    }
+    return release
+  }
+
+  if (host === 'gitlab') {
+    const base = api || HOSTS.gitlab.api
+    const release = await request(`${base}/projects/${encoded}/releases`, {
+      method: 'POST',
+      token,
+      json: { name: title, tag_name: tag, description: body }
+    })
+    for (const link of links) {
+      await request(`${base}/projects/${encoded}/releases/${encodeURIComponent(tag)}/assets/links`, {
+        method: 'POST',
+        token,
+        json: { name: link.name, url: link.url }
+      })
+    }
+    return release
+  }
+
+  fail(`unknown --host ${host}`)
+}
+
+async function main() {
+  if (flag('help')) {
+    console.log(HELP)
+    return
+  }
+
+  const cwd = arg('repo-dir', process.cwd())
+  const prefix = arg('tag-prefix', 'v')
+  const dry = flag('dry-run')
+  const host = arg('host', 'none')
+  const prerelease = arg('prerelease')
+  const forcedLevel = arg('level')
+  const paths = arg('paths') ? arg('paths').split(',').filter(Boolean) : []
+
+  if (forcedLevel && !(forcedLevel in LEVELS)) fail('--level must be patch, minor or major')
+  if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
+
+  const since = arg('since')
+  // an unresolvable --since used to read as "nothing to release", which is the
+  // worst possible answer: a shallow clone or a typo would silently ship no
+  // release. Name the ref instead.
+  if (since && !attempt(() => git(cwd, 'rev-parse', '-q', '--verify', `${since}^{commit}`)))
+    fail(`--since ${since} is not a commit in this repository (a shallow clone needs a full fetch)`)
+
+  const previous = since || latestTag(cwd, prefix)
+  const head = git(cwd, 'rev-parse', 'HEAD')
+  const atHead = (ref) =>
+    Boolean(ref) && attempt(() => git(cwd, 'rev-parse', '-q', '--verify', `${ref}^{commit}`)) === head
+
+  const parsed = commits(cwd, arg('since') ? arg('since') : previous, paths).map(classify)
+  const releasable = parsed.filter((c) => c.breaking || c.type in TYPES)
+
+  /**
+   * A run can end after the tag is cut - the push rejected, the release API
+   * down, the runner killed - and the tag then names the commit while nothing
+   * else exists. `--tag`, `--push-tag` and `--release` are all idempotent, so
+   * that state is finished rather than reported as "nothing to release", which
+   * is what makes a failure re-runnable instead of a hand repair.
+   */
+  const finishing =
+    !releasable.length &&
+    !forcedLevel &&
+    (flag('tag') || flag('push-tag') || flag('release')) &&
+    atHead(previous)
+
+  if (!releasable.length && !forcedLevel && !finishing) {
+    console.log(`nothing to release since ${previous || 'the first commit'}`)
+    output({ released: false })
+    return
+  }
+
+  const base = previous.replace(new RegExp(`^${prefix}`), '') || '0.0.0'
+  // A breaking change is a major, except before 1.0.0 where it is the minor -
+  // the convention every pre-1.0 tool in this space follows.
+  const level =
+    forcedLevel ||
+    (releasable.some((c) => c.breaking)
+      ? Number(base.split('.')[0]) === 0
+        ? 'minor'
+        : 'major'
+      : releasable.some((c) => c.type === 'feat')
+        ? 'minor'
+        : 'patch')
+
+  // A tag that is already a prerelease names a version that has not shipped,
+  // so the target does not move again: beta.2 plus a fix is beta.3, not
+  // 1.8.1-beta.1.
+  const inPrerelease = /^\d+\.\d+\.\d+-[^.]+\.\d+$/.test(base)
+  const target = inPrerelease ? stable(base) : bump(base, level)
+  const version = finishing
+    ? base
+    : prerelease
+      ? bumpPrerelease(target, prerelease, base)
+      : target
+  const tag = finishing ? previous : `${prefix}${version}`
+  const remote = remoteUrl(cwd)
+  const repo = arg('repo') || (remote.match(/https:\/\/[^/]+\/(.+)$/) || [])[1] || ''
+  // the notes for a finished tag are the commits it covers, not the (empty)
+  // ones after it
+  const covered = finishing
+    ? {
+        from: attempt(() => git(cwd, 'describe', '--tags', '--abbrev=0', '--match', `${prefix}[0-9]*`, `${previous}^`)),
+        commits: commits(cwd, attempt(() => git(cwd, 'describe', '--tags', '--abbrev=0', '--match', `${prefix}[0-9]*`, `${previous}^`)), [], previous).map(classify)
+      }
+    : { from: previous, commits: parsed }
+
+  const body = notes(
+    version,
+    covered.commits,
+    covered.from,
+    remote,
+    new Date().toISOString().slice(0, 10)
+  )
+
+  if (finishing)
+    console.log(`${tag} already names HEAD: finishing that release`)
+  else
+    console.log(`${level} release: ${previous || 'none'} -> ${tag} (${releasable.length} commits)`)
+  console.log(body)
+
+  if (dry) {
+    console.log('--dry-run: nothing tagged, nothing sent')
+    output({ released: false, version, tag, level })
+    return
+  }
+
+  const notesFile = arg('notes-file')
+  if (notesFile) writeFileSync(notesFile, `${body}\n`)
+  output({ released: true, version, tag, level })
+
+  if (flag('tag')) {
+    // Reuse a tag that already points at HEAD: a run that failed after the tag
+    // was cut can be finished by re-running, which a release tool that refuses
+    // an existing tag cannot do.
+    const existing = attempt(() => git(cwd, 'rev-parse', '-q', '--verify', `${tag}^{commit}`))
+    if (existing && existing === head) console.log(`tag ${tag} already names HEAD`)
+    else if (existing) fail(`tag ${tag} exists and names ${existing}, not HEAD`)
+    else
+      git(
+        cwd,
+        '-c', 'user.name=sasjs',
+        '-c', 'user.email=sasjs@4gl.io',
+        'tag', '-a', tag, '-m', tag
+      )
+  }
+
+  if (flag('push-tag')) git(cwd, 'push', 'origin', tag)
+
+  if (flag('release')) {
+    if (host === 'none') fail('--release needs --host')
+    const token = process.env[arg('token-env', HOSTS[host].token)]
+    if (!token) fail(`no token: set ${arg('token-env', HOSTS[host].token)}`)
+    const links = args('asset-link').map((pair) => {
+      const at = pair.indexOf('=')
+      if (at === -1) fail('--asset-link needs name=url')
+      return { name: pair.slice(0, at), url: pair.slice(at + 1) }
+    })
+    await publish({
+      host,
+      api: arg('api-url'),
+      token,
+      repo,
+      tag,
+      body,
+      title: arg('title', tag),
+      files: args('asset'),
+      links
+    })
+    console.log(`released ${tag} on ${host}`)
+  }
+}
+
+/**
+ * The result, on stdout and - when asked - as key=value lines a workflow can
+ * feed to whatever protocol it has (GITHUB_OUTPUT, GITHUB_ENV, a dotenv
+ * artifact, or nothing at all).
+ */
+function output(values) {
+  const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`)
+  for (const line of lines) console.log(line)
+  const path = arg('output')
+  if (path) appendFileSync(path, `${lines.join('\n')}\n`)
+}
+
+try {
+  await main()
+} catch (error) {
+  fail(error.stderr ? String(error.stderr).trim() : error.message)
+}

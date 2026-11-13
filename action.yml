@@ -1,0 +1,48 @@
+name: SASjs release
+description: >-
+  Release from conventional commits on any host: the version is the tag,
+  nothing is committed, and a failed run can be finished by re-running.
+author: sasjs
+
+inputs:
+  args:
+    description: >-
+      Arguments for sasjs-release, eg "--tag --push-tag --host github --release".
+      A bare run classifies and prints without writing anything.
+    required: false
+    default: --dry-run
+  version:
+    description: The version in play - the pinned package version by default
+    required: false
+    default: ''
+
+outputs:
+  released:
+    description: 'true when a release was cut, false when there was nothing to release'
+    value: ${{ steps.release.outputs.released }}
+  version:
+    description: The version the tag names
+    value: ${{ steps.release.outputs.version }}
+  tag:
+    description: The tag
+    value: ${{ steps.release.outputs.tag }}
+  level:
+    description: patch, minor or major
+    value: ${{ steps.release.outputs.level }}
+
+runs:
+  using: composite
+  steps:
+    - name: Classify and cut
+      id: release
+      shell: bash
+      # the arguments are a string the caller writes, so they are expanded as
+      # one word list rather than quoted as a single word. It is workflow text,
+      # not input from the web, and a tag prefix or path reaches it only if the
+      # author put it there.
+      run: |
+        set -euo pipefail
+        OUT="$RUNNER_TEMP/sasjs-release.out"
+        : > "$OUT"
+        node "$GITHUB_ACTION_PATH/release.mjs" ${{ inputs.args }} --output "$OUT"
+        cat "$OUT" >> "$GITHUB_OUTPUT"
