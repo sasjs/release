@@ -9,11 +9,19 @@ name: Publish
 # permission: the release job never sees `id-token`, and this job never sees
 # `contents: write`.
 #
+# A `release: published` trigger does NOT work here, and it fails silently: a
+# release created with the pipeline's own GITHUB_TOKEN fires no events, because
+# GitHub suppresses them to stop recursion. The first run proved it - the
+# release appeared and this workflow never started. workflow_run is not
+# suppressed, so publishing is chained off the Release workflow finishing.
+#
 # Nothing is committed. The tag is the version; the version is stamped into the
 # working tree because npm reads package.json, and the tree is thrown away.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
   # a publish that failed can be retried: the release event fires once, and
   # re-creating the release to republish is exactly the state to avoid
   workflow_dispatch:
@@ -38,37 +46,66 @@ concurrency:
 
 jobs:
   publish:
-    # a fork's release event must not publish to the org's package
-    if: github.repository == 'sasjs/release'
+    # a fork must not publish to the org's package, and a release run that
+    # failed has nothing to publish
+    if: |
+      github.repository == 'sasjs/release' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # the tag is how this workflow learns what to publish: the release
+          # run created it at the commit it released
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Resolve the tag
         id: tag
         env:
+          EVENT: ${{ github.event_name }}
           RELEASED: ${{ github.event.release.tag_name }}
           REQUESTED: ${{ inputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           tag="${REQUESTED:-$RELEASED}"
+
+          if [ -z "$tag" ] && [ "$EVENT" = "workflow_run" ]; then
+            # the tag the release run just created, at the commit it released
+            tag="$(git tag --points-at "$SHA" --sort=-v:refname | head -1)"
+            if [ -z "$tag" ]; then
+              echo "::notice::no tag at $SHA - that release had nothing to publish"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           if [ -z "$tag" ]; then
-            echo "::error::no tag - run this from a published release, or pass one"
+            echo "::error::no tag - dispatch this with one, or run it from the Release workflow"
             exit 1
           fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "publishing $tag (version ${tag#v})"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          persist-credentials: false
+      - name: Check out the tag
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: git checkout -q "refs/tags/$TAG"
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.tag.outputs.skip != 'true'
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: npm can do trusted publishing
+        if: steps.tag.outputs.skip != 'true'
         # OIDC publishing needs npm 11.5.1 or later; an older CLI looks for a
         # token instead, and fails with a message about authentication rather
         # than about the version
@@ -85,21 +122,24 @@ jobs:
           fi
 
       - name: The suite passes at this tag
+        if: steps.tag.outputs.skip != 'true'
         run: node --test
 
       # the version npm reads is the tag, stamped into the tree and not committed
       - name: Stamp the version
+        if: steps.tag.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Already on the registry?
         id: existing
+        if: steps.tag.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          published="$(npm view "@sasjs/release@${VERSION}" version 2>/dev/null || true)"
+          published="$(npm view "@sasjs/release@${VERSION}" version --prefer-online 2>/dev/null || true)"
           if [ "$published" = "$VERSION" ] && [ "${{ inputs.republish }}" != "true" ]; then
             echo "already=true" >> "$GITHUB_OUTPUT"
             echo "$VERSION is already on the registry - nothing to publish"
@@ -108,7 +148,7 @@ jobs:
           fi
 
       - name: Publish
-        if: steps.existing.outputs.already != 'true'
+        if: steps.tag.outputs.skip != 'true' && steps.existing.outputs.already != 'true'
         run: npm publish --access public
         # no NODE_AUTH_TOKEN: the OIDC token is exchanged for a short-lived
         # credential, so there is no long-lived secret in this repository
