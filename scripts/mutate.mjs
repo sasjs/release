@@ -36,6 +36,11 @@ const mutations = [
     replace: `  void holding`
   },
   {
+    name: '--no-registry-lookup asks anyway',
+    find: `  const lookup = !flag('no-registry-lookup')`,
+    replace: `  const lookup = true`
+  },
+  {
     name: 'an unpublished version is treated as published',
     find: `  if (response.status === 404) return false`,
     replace: `  if (response.status === 404) return true`

@@ -39,6 +39,9 @@ const HELP = `sasjs-release - releases from conventional commits
   --branch <ref>         the branch a publishable tag must be on (default: HEAD)
   --registry <url>       registry to ask (default: https://registry.npmjs.org)
   --republish            publish even when the version is already on the registry
+  --no-registry-lookup   do not ask the registry whether the version exists; the
+                         artifact ships somewhere that is not npm (a marketplace,
+                         an app store), so npm cannot answer the question
   --draft                create the release as a draft, so it is invisible until
                          something publishes it (gh release edit --draft=false)
   --prerelease <id>      cut <version>-<id>.1 (or continue the last one)
@@ -67,6 +70,7 @@ const known = new Set([
   'api-url', 'asset', 'asset-link', 'branch', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
 ])
 
@@ -590,15 +594,27 @@ async function preparePublish() {
   }
 
   // --- is this version already published?
+  //
+  // Only npm can answer that. A package that ships through a marketplace is not
+  // on npm at all - asking anyway reports 'not on registry' as though the version
+  // were new, which reads as a green light when it is really an unasked question.
   const registry = arg('registry', 'https://registry.npmjs.org').replace(/\/+$/, '')
   const tokenName = arg('token-env', 'NODE_AUTH_TOKEN')
-  const exists = await versionPublished(registry, pkg.name, version, process.env[tokenName])
+  const lookup = !flag('no-registry-lookup')
+  const exists = lookup ? await versionPublished(registry, pkg.name, version, process.env[tokenName]) : false
   const publish = !exists || flag('republish')
 
-  console.log(
-    `${pkg.name}@${version} is ${exists ? 'already on' : 'not on'} ${registry}` +
-      `${exists && !publish ? ' - nothing to publish' : ''}`
-  )
+  if (lookup) {
+    console.log(
+      `${pkg.name}@${version} is ${exists ? 'already on' : 'not on'} ${registry}` +
+        `${exists && !publish ? ' - nothing to publish' : ''}`
+    )
+  } else {
+    console.log(
+      `--no-registry-lookup: not asking ${registry} whether ${pkg.name}@${version} exists. ` +
+        `The caller decides, since the artifact does not ship there.`
+    )
+  }
   output({ skip: false, tag, version, publish, exists })
 }
 

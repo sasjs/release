@@ -257,3 +257,30 @@ test('a registry answering something unexpected stops the run with the status', 
   assert.equal(ok, false, out)
   assert.match(out, /answered 500/)
 })
+
+test('--no-registry-lookup never asks the registry, and says it did not', async (t) => {
+  // A 500 stops every other path in this file, so reaching the assertions proves
+  // the question was not asked rather than merely not caring about the answer.
+  const reg = await registry(500)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: 'v1.2.3' })
+
+  const { ok, out } = await run(cwd, '--registry', reg.url, '--no-registry-lookup')
+  assert.equal(ok, true, out)
+  assert.deepEqual(reg.seen, [], 'the registry was contacted')
+  assert.match(out, /--no-registry-lookup: not asking/)
+  assert.match(out, /publish=true/)
+  assert.match(out, /exists=false/)
+  assert.equal(JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8')).version, '1.2.3')
+})
+
+test('--no-registry-lookup still refuses a tag that is not in this clone', async (t) => {
+  // The flag skips one question, not the checks that protect the release.
+  const reg = await registry(500)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: 'v1.2.3' })
+
+  const { ok, out } = await run(cwd, '--registry', reg.url, '--no-registry-lookup', '--tag', 'v9.9.9')
+  assert.equal(ok, false, out)
+  assert.match(out, /v9\.9\.9 is not in this repository/)
+})
