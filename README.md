@@ -56,6 +56,7 @@ Two things it does that the toolchain cannot:
 | `--branch <ref>` | the branch a publishable tag must be on (default: `HEAD`) |
 | `--registry <url>` | registry to ask whether the version exists (default: the public npm registry) |
 | `--republish` | publish even when the registry already serves that version |
+| `--draft` | create the release as a draft: the tag exists, the release does not, until something publishes it (`gh release edit <tag> --draft=false`) |
 
 Exit codes: `0` released or nothing to release, `2` usage, git or host error.
 

@@ -434,3 +434,20 @@ test('the tag the host creates exists locally afterwards', async (t) => {
   const tags = git(cwd, 'tag', '--list').split('\n').filter(Boolean)
   assert.deepEqual(tags.sort(), ['v1.7.1', 'v1.8.0'])
 })
+
+test('--draft keeps the release out of sight until it is published', async (t) => {
+  const draftStub = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { status: 201, json: { id: 1, upload_url: 'http://x/upload{?name,label}' } }
+    return { json: { ok: true } }
+  })
+  t.after(() => draftStub.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  process.env.GH_TOKEN = 'token-123'
+  await runInParallel(cwd, '--host', 'github', '--release', '--draft',
+    '--api-url', draftStub.base, '--repo', 'sasjs/app')
+
+  const sent = draftStub.seen.find((r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases')
+  assert.match(sent.body, /"draft":true/)
+})

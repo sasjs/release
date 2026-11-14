@@ -39,6 +39,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --branch <ref>         the branch a publishable tag must be on (default: HEAD)
   --registry <url>       registry to ask (default: https://registry.npmjs.org)
   --republish            publish even when the version is already on the registry
+  --draft                create the release as a draft, so it is invisible until
+                         something publishes it (gh release edit --draft=false)
   --prerelease <id>      cut <version>-<id>.1 (or continue the last one)
   --dry-run              say what it would do; write nothing, send nothing
   --notes-file <path>    write the release notes here
@@ -328,7 +330,8 @@ async function publish({
   files,
   links,
   commit,
-  isPrerelease
+  isPrerelease,
+  draft
 }) {
   const headers = authHeaders(host, token, header)
   const encoded = repo.replace('/', '%2F')
@@ -343,7 +346,17 @@ async function publish({
       {
         method: 'POST',
         headers,
-        json: { tag_name: tag, target_commitish: commit, name: title, body, prerelease: isPrerelease }
+        json: {
+          tag_name: tag,
+          target_commitish: commit,
+          name: title,
+          body,
+          prerelease: isPrerelease,
+          // a draft keeps the release out of sight until the thing it names is
+          // actually installable: the tag is created either way, but a release
+          // advertising a version that failed to publish is worse than no release
+          draft: Boolean(draft)
+        }
       },
       () => request(`${base}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers })
     )
@@ -366,7 +379,7 @@ async function publish({
           target_commitish: commit,
           name: title,
           body,
-          draft: false,
+          draft: Boolean(draft),
           prerelease: isPrerelease
         }
       },
@@ -709,7 +722,8 @@ async function main() {
       files: args('asset'),
       links,
       commit: head,
-      isPrerelease: Boolean(prerelease)
+      isPrerelease: Boolean(prerelease),
+      draft: flag('draft')
     })
     if (tagLocally(cwd, tag, head))
       console.log(`tagged ${tag} locally as well - the tag came from the ${host} API`)
