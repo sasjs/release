@@ -51,10 +51,50 @@ Two things it does that the toolchain cannot:
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
+| `--prepare-publish` | gate a publish instead of cutting a release - see below |
+| `--sha <sha>` | commit to look for a tag at, with `--prepare-publish` (default: `HEAD`) |
+| `--branch <ref>` | the branch a publishable tag must be on (default: `HEAD`) |
+| `--registry <url>` | registry to ask whether the version exists (default: the public npm registry) |
+| `--republish` | publish even when the registry already serves that version |
 
 Exit codes: `0` released or nothing to release, `2` usage, git or host error.
 
 The result is printed as `key=value` lines, so a pipeline can feed it to whatever variable protocol it has - `$GITHUB_OUTPUT`, `$GITHUB_ENV`, a dotenv artifact, nothing at all - with `--output`.
+
+## The publishing half
+
+Before a publish workflow builds anything it has to answer three questions: which version is this run for, may it be published at all, and is it already on the registry? Those answers are the same in every repository, and the shell that produced them was copied into each one - where a shallow clone, a tag cut from an unmerged branch, and a version that had already been published were each handled slightly differently.
+
+`--prepare-publish` answers them from git and the registry, writes nothing but the version, and creates no tag:
+
+```bash
+npx @sasjs/release --prepare-publish --sha "$SHA" --branch main --output "$GITHUB_OUTPUT"
+```
+
+| Question | Answer |
+| --- | --- |
+| which version? | the newest `v*` tag at `--sha`; when there is none, `skip=true` - unless the clone is shallow, which is a failure, because a clone without tags cannot tell "this release cut no tag" from "I cannot see the tags" |
+| may it be published? | the tag has to be an ancestor of `--branch`; a tag cut from a branch nobody merged is refused |
+| what version will npm read? | the tag's, written into `package.json` - so the tarball and the release cannot disagree |
+| is it already there? | the registry is asked; an existing version gives `publish=false`, unless `--republish` |
+
+It prints, and emits with `--output`: `skip`, `tag`, `version`, `publish`, `exists`.
+
+It does not run `npm publish` - that stays in the publishing workflow, which is the identity npm trusts for provenance - and it does not create the tag or the release; that is what the rest of this tool is for. A publish workflow therefore reads:
+
+```yaml
+- uses: actions/checkout@<sha>
+  with: { ref: main, fetch-depth: 0, persist-credentials: false }
+- run: npm run release -- --prepare-publish --sha "${{ github.event.workflow_run.head_sha }}" --branch main --output "$GITHUB_OUTPUT"
+  id: prepare
+  env: { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' }
+- run: git checkout -q "refs/tags/${{ steps.prepare.outputs.tag }}"
+  if: steps.prepare.outputs.skip != 'true'
+- run: npm publish --provenance
+  if: steps.prepare.outputs.publish == 'true'
+```
+
+`--dry-run` prints the same decisions and writes nothing, which is how a failing publish job is debugged without publishing.
 
 ## Permissions
 

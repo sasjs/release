@@ -33,6 +33,12 @@ const HELP = `sasjs-release - releases from conventional commits
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
   --level <l>            force patch|minor|major instead of classifying
+  --prepare-publish      resolve and gate a publish, stamp the version, ask the
+                         registry; writes no tag and creates no release
+  --sha <sha>            commit to look for a tag at (default: HEAD)
+  --branch <ref>         the branch a publishable tag must be on (default: HEAD)
+  --registry <url>       registry to ask (default: https://registry.npmjs.org)
+  --republish            publish even when the version is already on the registry
   --prerelease <id>      cut <version>-<id>.1 (or continue the last one)
   --dry-run              say what it would do; write nothing, send nothing
   --notes-file <path>    write the release notes here
@@ -87,6 +93,19 @@ const attempt = (fn) => {
     return fn()
   } catch {
     return ''
+  }
+}
+
+// Whether a probe exited 0. `attempt` returns its output, and several git probes
+// (`merge-base --is-ancestor` above all) say yes by printing nothing at all - so
+// testing their output for truthiness answers a different question than the one
+// asked, and answers it wrongly exactly when it matters.
+const succeeds = (fn) => {
+  try {
+    fn()
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -398,9 +417,128 @@ async function publish({
   fail(`unknown --host ${host}`)
 }
 
+/**
+ * The half of a publishing pipeline that is the same in every repository: work
+ * out which version this run is for, refuse to publish one that was not cut from
+ * the branch, stamp it where npm will read it, and ask the registry whether it is
+ * already there.
+ *
+ * It writes no tag and creates no release - release.yml does that - and it never
+ * publishes a package. What it replaces is the block of shell that had to be
+ * copied into each repository's publish workflow, where the same three edge cases
+ * (a shallow clone, a tag off the branch, a version already published) were
+ * handled slightly differently in each copy.
+ */
+async function preparePublish() {
+  const cwd = arg('repo-dir', process.cwd())
+  const prefix = arg('tag-prefix', 'v')
+  const dry = flag('dry-run')
+  const branch = arg('branch', 'HEAD')
+
+  const packagePath = join(cwd, 'package.json')
+  let pkg
+  try {
+    pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
+  } catch (error) {
+    fail(`cannot read ${packagePath}: ${error.message}`)
+  }
+
+  // --- which tag is this run for?
+  let tag = arg('tag')
+  if (tag) {
+    if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${tag}^{commit}`)))
+      fail(`--tag ${tag} is not in this repository`)
+  } else {
+    const sha = arg('sha') || git(cwd, 'rev-parse', 'HEAD')
+    tag = (
+      attempt(() =>
+        git(cwd, 'tag', '--points-at', sha, '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
+      ) || ''
+    )
+      .split('\n')
+      .filter(Boolean)[0]
+
+    if (!tag) {
+      // A shallow clone has no tags, so it cannot tell "this release cut no tag"
+      // from "I cannot see the tags" - and reporting the first when it means the
+      // second is a green job that published nothing.
+      if (git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
+        fail(
+          `this checkout is shallow, so no tag can be seen at ${sha.slice(0, 7)} - ` +
+            'fetch the tags (fetch-depth: 0) rather than reporting that there was nothing to publish'
+        )
+      console.log(`no ${prefix}* tag at ${sha.slice(0, 7)} - that release cut nothing`)
+      output({ skip: true, tag: '', version: '', publish: false, exists: false })
+      return
+    }
+  }
+
+  const version = tag.slice(prefix.length)
+  if (!/^\d+\.\d+\.\d+/.test(version))
+    fail(`${tag} does not carry a version after the ${prefix} prefix`)
+
+  // --- a tag cut from a branch nobody merged is not a release of this branch
+  const ref = [branch, `origin/${branch}`].find((candidate) =>
+    succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${candidate}^{commit}`))
+  )
+  if (!ref) fail(`cannot resolve ${branch} in this repository`)
+  if (!succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tag}^{commit}`, ref)))
+    fail(`${tag} is not on ${branch} - refusing to publish it`)
+
+  // --- stamp the version npm will read, and so make drift impossible
+  const before = pkg.version
+  if (before === version) {
+    console.log(`package.json already states ${version}`)
+  } else if (dry) {
+    console.log(`--dry-run: would stamp package.json ${before} -> ${version}`)
+  } else {
+    pkg.version = version
+    writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`)
+    console.log(`stamped package.json ${before} -> ${version}`)
+  }
+
+  // --- is this version already published?
+  const registry = arg('registry', 'https://registry.npmjs.org').replace(/\/+$/, '')
+  const tokenName = arg('token-env', 'NODE_AUTH_TOKEN')
+  const exists = await versionPublished(registry, pkg.name, version, process.env[tokenName])
+  const publish = !exists || flag('republish')
+
+  console.log(
+    `${pkg.name}@${version} is ${exists ? 'already on' : 'not on'} ${registry}` +
+      `${exists && !publish ? ' - nothing to publish' : ''}`
+  )
+  output({ skip: false, tag, version, publish, exists })
+}
+
+/** Does the registry already serve this version? 200 yes, 404 no, anything else stops. */
+async function versionPublished(registry, name, version, token) {
+  const url = `${registry}/${name.replace('/', '%2F')}/${version}`
+  const response = await fetch(url, {
+    headers: {
+      accept: 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {})
+    }
+  })
+
+  if (response.status === 200) return true
+  if (response.status === 404) return false
+
+  if (response.status === 401 || response.status === 403)
+    fail(
+      `${url} answered ${response.status} - the registry needs a token, ` +
+        'in NODE_AUTH_TOKEN or the variable named by --token-env'
+    )
+  fail(`${url} answered ${response.status}`)
+}
+
 async function main() {
   if (flag('help')) {
     console.log(HELP)
+    return
+  }
+
+  if (flag('prepare-publish')) {
+    await preparePublish()
     return
   }
 
