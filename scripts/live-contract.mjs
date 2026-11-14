@@ -116,6 +116,15 @@ try {
   await exec('git', ['clone', '--quiet', '--depth', '1', url, scratch], {
     env: { ...process.env, ...envelope }
   })
+  // an empty repository clones happily and has no HEAD, and the tool then fails on
+  // target_commitish with a message about the field rather than about the sandbox
+  try {
+    await git(scratch, 'rev-parse', '--verify', 'HEAD')
+  } catch {
+    throw new Error(
+      `${repo} has no commits: seed it with one before pointing this contract at it`
+    )
+  }
   writeFileSync(join(scratch, 'asset.txt'), runId)
   console.log(`  cloned ${repo} at ${await git(scratch, 'rev-parse', '--short', 'HEAD')}`)
 
