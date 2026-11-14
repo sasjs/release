@@ -187,3 +187,37 @@ test('a registry that refuses the request stops the run and says which variable'
   assert.match(out, /answered 401/)
   assert.match(out, /NODE_AUTH_TOKEN/)
 })
+
+test('publishes from a clone whose local branch is behind origin', async (t) => {
+  const reg = await registry(404)
+  t.after(() => reg.stop())
+
+  const origin = mkdtempSync(join(tmpdir(), 'origin-'))
+  git(origin, 'init', '--bare', '-b', 'main', '.')
+
+  const ahead = mkdtempSync(join(tmpdir(), 'ahead-'))
+  git(ahead, 'clone', '-q', `file://${origin}`, '.')
+  write(ahead, '@fixture/pkg', '0.0.0')
+  git(ahead, 'add', '.')
+  git(ahead, 'commit', '-m', 'feat: one')
+  git(ahead, 'push', '-q', 'origin', 'main')
+
+  // cloned before the tag exists, and never fast-forwarded afterwards
+  const behind = mkdtempSync(join(tmpdir(), 'behind-'))
+  git(behind, 'clone', '-q', `file://${origin}`, '.')
+
+  writeFileSync(join(ahead, 'later'), 'later')
+  git(ahead, 'add', '.')
+  git(ahead, 'commit', '-m', 'feat: the release')
+  git(ahead, 'tag', '-a', 'v1.2.3', '-m', 'v1.2.3')
+  git(ahead, 'push', '-q', 'origin', 'main', '--tags')
+
+  // the clone learns about the tag and origin/main, but its own main stays put
+  git(behind, 'fetch', '-q', 'origin', '--tags')
+  assert.notEqual(git(behind, 'rev-parse', 'main'), git(behind, 'rev-parse', 'origin/main'))
+
+  const { ok, out } = await run(behind, '--tag', 'v1.2.3', '--branch', 'main', '--registry', reg.url)
+  assert.equal(ok, true, out)
+  assert.match(out, /the local main does not contain v1\.2\.3, origin\/main does/)
+  assert.match(out, /publish=true/)
+})

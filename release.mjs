@@ -477,13 +477,24 @@ async function preparePublish() {
   if (!/^\d+\.\d+\.\d+/.test(version))
     fail(`${tag} does not carry a version after the ${prefix} prefix`)
 
-  // --- a tag cut from a branch nobody merged is not a release of this branch
-  const ref = [branch, `origin/${branch}`].find((candidate) =>
+  // --- a tag cut from a branch nobody merged is not a release of this branch.
+  // The forge's ref is authoritative, so a local branch that is merely behind
+  // does not block a publish - it is the operator's checkout that is stale, and
+  // saying so is more use than refusing on a technicality.
+  const candidates = [branch, `origin/${branch}`].filter((candidate) =>
     succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${candidate}^{commit}`))
   )
-  if (!ref) fail(`cannot resolve ${branch} in this repository`)
-  if (!succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tag}^{commit}`, ref)))
-    fail(`${tag} is not on ${branch} - refusing to publish it`)
+  if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
+
+  const holding = candidates.find((candidate) =>
+    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tag}^{commit}`, candidate))
+  )
+  if (!holding) fail(`${tag} is not on ${branch} - refusing to publish it`)
+  if (holding !== branch)
+    console.log(
+      `note: the local ${branch} does not contain ${tag}, ${holding} does - ` +
+        'this checkout is behind, so fetch before trusting anything built from it'
+    )
 
   // --- stamp the version npm will read, and so make drift impossible
   const before = pkg.version

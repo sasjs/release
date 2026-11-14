@@ -74,7 +74,7 @@ npx @sasjs/release --prepare-publish --sha "$SHA" --branch main --output "$GITHU
 | Question | Answer |
 | --- | --- |
 | which version? | the newest `v*` tag at `--sha`; when there is none, `skip=true` - unless the clone is shallow, which is a failure, because a clone without tags cannot tell "this release cut no tag" from "I cannot see the tags" |
-| may it be published? | the tag has to be an ancestor of `--branch`; a tag cut from a branch nobody merged is refused |
+| may it be published? | the tag has to be an ancestor of `--branch` or `origin/<branch>` - a tag cut from a branch nobody merged is refused, while a local branch that is merely behind is reported and does not block |
 | what version will npm read? | the tag's, written into `package.json` - so the tarball and the release cannot disagree |
 | is it already there? | the registry is asked; an existing version gives `publish=false`, unless `--republish` |
 
