@@ -27,7 +27,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to publish (blank = the tag that triggered it)
+        description: >-
+          Release tag to publish. Required when dispatched; when this runs from
+          the Release workflow, leave it blank and the tag that run created is
+          used. Must be on main.
         required: false
         default: ''
       republish:
@@ -65,12 +68,11 @@ jobs:
         id: tag
         env:
           EVENT: ${{ github.event_name }}
-          RELEASED: ${{ github.event.release.tag_name }}
           REQUESTED: ${{ inputs.tag }}
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          tag="${REQUESTED:-$RELEASED}"
+          tag="$REQUESTED"
 
           if [ -z "$tag" ] && [ "$EVENT" = "workflow_run" ]; then
             # the tag the release run just created, at the commit it released
@@ -83,7 +85,15 @@ jobs:
           fi
 
           if [ -z "$tag" ]; then
-            echo "::error::no tag - dispatch this with one, or run it from the Release workflow"
+            echo "::error::no tag - dispatch this with the tag to publish"
+            exit 1
+          fi
+
+          # a dispatch can name any tag in the repository; only one cut from a
+          # commit on the default branch is a release this pipeline made
+          git fetch --quiet --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          if ! git merge-base --is-ancestor "${tag}^{commit}" refs/remotes/origin/main; then
+            echo "::error::$tag is not on main - refusing to publish it"
             exit 1
           fi
 
