@@ -5,14 +5,14 @@ name: Release
 # is created by the release call itself (target_commitish), so the job needs no
 # git credentials and no push permission.
 #
-# DISPATCH ONLY FOR NOW. The push trigger below is what makes a merge release,
-# and it is deliberately still commented out: switching it on before the npm
-# trusted publisher exists would cut a release whose publish job then fails,
-# which is the half-finished release this tool exists to avoid. Uncomment the
-# two lines once @sasjs/release is configured on npmjs.
+# A merge releases, and the release event runs publish.yml. That ordering needs
+# the npm trusted publisher to exist first: without it a merge cuts a release
+# whose publish job then fails, which is the half-finished release this tool
+# exists to avoid. It is configured for @sasjs/release, so the trigger is on.
 on:
-  # push:
-  #   branches: [main]
+  push:
+    branches: [main]
+  # a manual run releases whatever has been merged since the last tag
   workflow_dispatch:
 
 permissions:
