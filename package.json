@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "bin": {
-    "sasjs-release": "./release.mjs"
+    "sasjs-release": "release.mjs"
   },
   "files": [
     "release.mjs",
