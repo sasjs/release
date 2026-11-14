@@ -521,6 +521,19 @@ async function preparePublish() {
   output({ skip: false, tag, version, publish, exists })
 }
 
+/**
+ * The host creates the tag over the API, so it exists in the forge and not in this
+ * clone. Anything that runs later in the same job - stamping the version, checking
+ * the tag out for the build - reads the clone, so the tag is created here too. It
+ * is lightweight on purpose: an annotated tag needs a committer identity, which a
+ * CI checkout does not always have, and this tag is a local marker, not a claim
+ * that gets pushed anywhere.
+ */
+function tagLocally(cwd, tag, commit) {
+  if (succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `refs/tags/${tag}`))) return false
+  return succeeds(() => git(cwd, 'tag', tag, commit))
+}
+
 /** Does the registry already serve this version? 200 yes, 404 no, anything else stops. */
 async function versionPublished(registry, name, version, token) {
   const url = `${registry}/${name.replace('/', '%2F')}/${version}`
@@ -698,6 +711,8 @@ async function main() {
       commit: head,
       isPrerelease: Boolean(prerelease)
     })
+    if (tagLocally(cwd, tag, head))
+      console.log(`tagged ${tag} locally as well - the tag came from the ${host} API`)
     console.log(`released ${tag} on ${host}`)
   }
 }

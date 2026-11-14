@@ -414,3 +414,23 @@ test('no token is a failure that says which variable to set', () => {
     /no token: set GH_TOKEN/
   )
 })
+
+test('the tag the host creates exists locally afterwards', async (t) => {
+  // the API creates the tag, so the clone has none; anything running later in the
+  // same job - stamping, checking the tag out for the build - reads the clone
+  const stubServer = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { status: 201, json: { id: 1, upload_url: 'http://x/upload{?name,label}' } }
+    return { json: { ok: true } }
+  })
+  t.after(() => stubServer.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  process.env.GH_TOKEN = 'token-123'
+  assert.deepEqual(git(cwd, 'tag', '--list').split('\n').filter(Boolean), ['v1.7.1'])
+
+  await runInParallel(cwd, '--host', 'github', '--release', '--api-url', stubServer.base, '--repo', 'sasjs/app')
+
+  const tags = git(cwd, 'tag', '--list').split('\n').filter(Boolean)
+  assert.deepEqual(tags.sort(), ['v1.7.1', 'v1.8.0'])
+})
