@@ -8,7 +8,10 @@ import { join } from 'node:path'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
 
-const CLI = fileURLToPath(new URL('../release.mjs', import.meta.url))
+// scripts/mutate.mjs runs this suite against a deliberately broken copy, so the
+// entry point is overridable; everything else runs the real one.
+const CLI =
+  process.env.SASJS_RELEASE_ENTRY || fileURLToPath(new URL('../release.mjs', import.meta.url))
 
 const envelope = {
   GIT_AUTHOR_NAME: 'test',
@@ -71,6 +74,16 @@ function failure(cwd, ...argv) {
   }
   assert.fail('expected the run to fail')
 }
+
+/** A failing run that must not block this process: a stub server answers it. */
+const failureInParallel = (cwd, ...argv) =>
+  runAsync('node', [CLI, '--repo-dir', cwd, ...argv], {
+    encoding: 'utf8',
+    env: { ...process.env, ...envelope }
+  }).then(
+    () => assert.fail('expected the run to fail'),
+    (error) => String(error.stderr || error.message)
+  )
 
 const levelOf = (output) => output.match(/^level=(.+)$/m)?.[1]
 const versionOf = (output) => output.match(/^version=(.+)$/m)?.[1]
@@ -273,7 +286,13 @@ test('github: creates the release and uploads each asset to its upload_url', asy
 })
 
 test('gitea: creates the release over the REST API and posts the asset', async (t) => {
-  const replacement = await stub(() => ({ json: { id: 42, body: 'x' } }))
+  // the find-before-create step asks first: a stub that answers every request
+  // with a release makes the tool believe one already exists
+  const replacement = await stub((request) =>
+    request.method === 'GET' && request.url.includes('/releases/tags/')
+      ? { status: 404, json: { message: 'Not Found' } }
+      : { json: { id: 42, body: 'x' } }
+  )
   t.after(() => replacement.stop())
   const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
   const asset = join(cwd, 'frontend.zip')
@@ -338,7 +357,7 @@ test('a release that already exists is finished rather than refused', async (t) 
   const out = await runInParallel(cwd, '--host', 'github', '--release', '--api-url',
     replacement.base, '--repo', 'sasjs/app', '--asset', asset)
 
-  assert.equal(created, 1)
+  assert.equal(created, 0, 'the release is found before a create is attempted')
   assert.match(out, /a release for this tag already exists: finishing it/)
   assert.ok(
     replacement.seen.some((r) => r.url.startsWith('/upload?name=app.zip')),
@@ -370,7 +389,11 @@ test('an asset already attached is not a failure either', async (t) => {
 })
 
 test('a prerelease is created as one, so it does not look like a final release', async (t) => {
-  const replacement = await stub(() => ({ json: { id: 7, upload_url: 'x{?name,label}' } }))
+  const replacement = await stub((request) =>
+    request.url.includes('/releases/tags/')
+      ? { status: 404, json: { message: 'Not Found' } }
+      : { json: { id: 7, upload_url: 'x{?name,label}' } }
+  )
   t.after(() => replacement.stop())
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
 
@@ -382,7 +405,11 @@ test('a prerelease is created as one, so it does not look like a final release',
   assert.equal(payload.tag_name, 'v1.8.0-beta.1')
   assert.equal(payload.prerelease, true)
 
-  const stable = await stub(() => ({ json: { id: 7, upload_url: 'x{?name,label}' } }))
+  const stable = await stub((request) =>
+    request.url.includes('/releases/tags/')
+      ? { status: 404, json: { message: 'Not Found' } }
+      : { json: { id: 7, upload_url: 'x{?name,label}' } }
+  )
   t.after(() => stable.stop())
   await runInParallel(cwd, '--host', 'github', '--release', '--api-url',
     stable.base, '--repo', 'sasjs/app')
@@ -459,4 +486,98 @@ test('an unknown flag is refused rather than ignored', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   const out = failure(cwd, '--host', 'github', '--drafts', '--dry-run')
   assert.match(out, /unknown flag --drafts/)
+})
+
+test('422 with nothing to find is a failure, not a finished release', async (t) => {
+  // the re-runnability branch looks the release up; when the lookup finds nothing
+  // the original refusal has to surface, or a run reports success having created
+  // nothing
+  const replacement = await stub((request) =>
+    request.url.endsWith('/releases')
+      ? { status: 422, json: { message: 'Validation Failed' } }
+      : { status: 404, json: { message: 'Not Found' } }
+  )
+  t.after(() => replacement.stop())
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await failureInParallel(cwd, '--host', 'github', '--release',
+    '--api-url', replacement.base, '--repo', 'sasjs/app')
+  assert.match(out, /422/)
+})
+
+test('--help lists the flags, including the mode that is easy to forget', () => {
+  const cwd = repo()
+  const out = run(cwd, '--help')
+  assert.match(out, /sasjs-release/)
+  for (const flagName of ['--release', '--prepare-publish', '--draft', '--output'])
+    assert.match(out, new RegExp(flagName))
+})
+
+test('a draft release is found by listing, because the by-tag endpoint hides it', async (t) => {
+  // measured against the real API: GET /releases/tags/<tag> answers 404 for a
+  // draft. A run that created a draft and died could then never finish it - 422 on
+  // create, 404 on the lookup, and a draft nobody can attach to.
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { status: 422, json: { message: 'Validation Failed' } }
+    if (request.url.startsWith('/repos/sasjs/app/releases/tags/'))
+      return { status: 404, json: { message: 'Not Found' } }
+    if (request.url.startsWith('/repos/sasjs/app/releases?per_page='))
+      return {
+        json: [
+          { id: 9, tag_name: 'v1.7.2', draft: true, upload_url: `${base}/upload{?name,label}` }
+        ]
+      }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(cwd, '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', asset)
+
+  assert.match(out, /a release for this tag already exists: finishing it/)
+  assert.ok(
+    replacement.seen.some((r) => r.url.startsWith('/repos/sasjs/app/releases?per_page=')),
+    'the list endpoint is what finds a draft'
+  )
+  assert.ok(
+    replacement.seen.some((r) => r.url.startsWith('/upload?name=app.zip')),
+    'and the asset still reaches the draft that was found'
+  )
+})
+
+test('the newest tag wins when two name the same commit', () => {
+  // the state a completed release leaves: the tag just cut sits on the same commit
+  // as the one before it. `git describe` answers with the annotated one and the
+  // next run recomputes a version that already exists - measured against a real
+  // repository in the live check.
+  const cwd = repo({ commits: ['feat: initial'] })
+  git(cwd, 'tag', 'v1.8.0') // lightweight, the shape the forge creates
+  writeFileSync(join(cwd, 'next'), 'x')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: after both tags')
+  assert.equal(versionOf(run(cwd, '--dry-run')), '1.9.0')
+})
+
+test('a tag on an unmerged branch is not the base', () => {
+  const cwd = repo({ commits: ['feat: initial'] })
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'x')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side work')
+  git(cwd, 'tag', '-a', 'v9.0.0', '-m', 'v9.0.0')
+  git(cwd, 'checkout', '-q', 'main')
+  writeFileSync(join(cwd, 'main'), 'x')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: on main')
+  // v9.0.0 exists but is unreachable from main, so v1.7.1 is the base
+  assert.equal(versionOf(run(cwd, '--dry-run')), '1.8.0')
 })

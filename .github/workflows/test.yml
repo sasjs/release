@@ -35,3 +35,28 @@ jobs:
         run: |
           test -s action.yml
           grep -q 'release.mjs' action.yml
+
+  coverage:
+    # lines can be executed without being checked; branches are where every defect
+    # in this tool's history lived (an exact-pin pattern, a 404 treated as
+    # published, a success read from output truthiness, a flag read as absent), so
+    # the floor is on branches and functions as much as on lines
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24 # the coverage thresholds need the newer test runner
+      - run: npm run test:coverage
+
+  mutation:
+    # coverage says a line ran; this says whether anything would have noticed if it
+    # had run differently. Each guard is broken in a copy of release.mjs and the
+    # suite has to fail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm run test:mutate

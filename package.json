@@ -16,6 +16,9 @@
   ],
   "scripts": {
     "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=97 --test-coverage-branches=69 --test-coverage-functions=99",
+    "test:mutate": "node scripts/mutate.mjs",
+    "test:live": "node scripts/live-contract.mjs",
     "prepublishOnly": "node -e \"const v=require('./package.json').version; if (v === '0.0.0') { console.error('refusing to publish 0.0.0: the version is stamped from the tag (npm version <tag> --no-git-tag-version)'); process.exit(1) }\""
   },
   "repository": {

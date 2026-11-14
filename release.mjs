@@ -130,10 +130,24 @@ const succeeds = (fn) => {
 }
 
 /** The commit range to classify: after the newest tag carrying our prefix. */
+/**
+ * The newest tag reachable from HEAD.
+ *
+ * `git describe --abbrev=0` answers with the tag it prefers, and when two tags
+ * name the same commit it can answer with the older one - measured: v0.3.1 and
+ * v0.3.2 both at HEAD, describe said v0.3.1. That is exactly the state a
+ * completed release leaves behind, so the next run would compute a version that
+ * already exists. List the tags that are merged into HEAD and sort them by
+ * version instead: reachability is still respected, and "newest" means newest.
+ */
 const latestTag = (cwd, prefix) =>
-  attempt(() =>
-    git(cwd, 'describe', '--tags', '--abbrev=0', '--match', `${prefix}[0-9]*`)
+  (
+    attempt(() =>
+      git(cwd, 'tag', '--merged', 'HEAD', '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
+    ) || ''
   )
+    .split('\n')
+    .filter(Boolean)[0] || ''
 
 /** Subject and body per commit, newest last. NUL and 0x01 separate the fields. */
 function commits(cwd, from, paths, to = 'HEAD') {
@@ -283,6 +297,28 @@ async function request(url, { method = 'GET', headers = {}, body, json } = {}) {
 }
 
 /**
+ * Find a release by tag, drafts included.
+ *
+ * GitHub's by-tag endpoint answers 404 for a draft release, so a run that created
+ * a draft and died before attaching its assets could never find it again - the
+ * create answers 422, the lookup answers 404, and the run fails having left a
+ * draft nobody can finish. The list endpoint does return drafts, so it is the
+ * fallback that makes a drafted release re-runnable at all.
+ */
+async function findRelease(base, repo, tag, headers) {
+  const byTag = await request(`${base}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
+    headers
+  }).catch((error) => {
+    if (error.status === 404) return null
+    throw error
+  })
+  if (byTag) return byTag
+
+  const releases = await request(`${base}/repos/${repo}/releases?per_page=100`, { headers })
+  return (Array.isArray(releases) ? releases : []).find((release) => release.tag_name === tag) || null
+}
+
+/**
  * A release that already exists is not a failure: the run that created it may
  * have died on the next step, and the whole point of `--release` being
  * idempotent is that re-running finishes the job. The forges disagree on the
@@ -290,12 +326,26 @@ async function request(url, { method = 'GET', headers = {}, body, json } = {}) {
  * be asked for the release they refused to create twice.
  */
 async function createOrFind(url, options, find) {
+  // Look before creating. A forge will happily create a second release for a tag
+  // that already has one - as a draft, invisibly - so recovering from 422 alone
+  // is not enough once drafts are in play: a re-run after publishing produced a
+  // duplicate draft on a real repository.
+  const existing = await find().catch(() => null)
+  // `id` is what makes a response a release: a host that answers 200 with
+  // something else (an empty object, an error body) has not found one
+  if (existing && existing.id) {
+    console.log('a release for this tag already exists: finishing it')
+    return existing
+  }
+
   try {
     return await request(url, options)
   } catch (error) {
     if (error.status !== 422 && error.status !== 409) throw error
-    const existing = await find()
-    if (!existing) throw error
+    // a lookup that fails is not the finding: the refusal to create is, and
+    // reporting the 404 from the lookup sends the reader after the wrong call
+    const existing = await find().catch(() => null)
+    if (!existing || !existing.id) throw error
     console.log(`a release for this tag already exists: finishing it`)
     return existing
   }
@@ -376,7 +426,7 @@ async function publish({
           draft: Boolean(draft)
         }
       },
-      () => request(`${base}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers })
+      () => findRelease(base, repo, tag, headers)
     )
     for (const file of files) {
       const url = String(release.upload_url).replace(/\{.*$/, '')

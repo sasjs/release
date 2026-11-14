@@ -8,7 +8,10 @@ import { join } from 'node:path'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
 
-const CLI = fileURLToPath(new URL('../release.mjs', import.meta.url))
+// scripts/mutate.mjs runs this suite against a deliberately broken copy, so the
+// entry point is overridable; everything else runs the real one.
+const CLI =
+  process.env.SASJS_RELEASE_ENTRY || fileURLToPath(new URL('../release.mjs', import.meta.url))
 
 const envelope = {
   GIT_AUTHOR_NAME: 'test',
@@ -220,4 +223,37 @@ test('publishes from a clone whose local branch is behind origin', async (t) => 
   assert.equal(ok, true, out)
   assert.match(out, /the local main does not contain v1\.2\.3, origin\/main does/)
   assert.match(out, /publish=true/)
+})
+
+test('an unreadable package.json stops the run by name', async (t) => {
+  const reg = await registry(404)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: 'v1.2.3' })
+  writeFileSync(join(cwd, 'package.json'), '{ not json')
+
+  const { ok, out } = await run(cwd, '--registry', reg.url)
+  assert.equal(ok, false, out)
+  assert.match(out, /cannot read .*package\.json/)
+})
+
+test('says so when package.json already states the version, and writes nothing', async (t) => {
+  const reg = await registry(404)
+  t.after(() => reg.stop())
+  const cwd = repo({ version: '1.2.3', tag: 'v1.2.3' })
+  const before = readFileSync(join(cwd, 'package.json'), 'utf8')
+
+  const { ok, out } = await run(cwd, '--registry', reg.url)
+  assert.equal(ok, true, out)
+  assert.match(out, /already states 1\.2\.3/)
+  assert.equal(readFileSync(join(cwd, 'package.json'), 'utf8'), before)
+})
+
+test('a registry answering something unexpected stops the run with the status', async (t) => {
+  const reg = await registry(500)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: 'v1.2.3' })
+
+  const { ok, out } = await run(cwd, '--registry', reg.url)
+  assert.equal(ok, false, out)
+  assert.match(out, /answered 500/)
 })

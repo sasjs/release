@@ -196,7 +196,18 @@ A new host is one function plus an entry in `HOSTS`.
 ## Development
 
 ```bash
-npm test   # node --test: 22 tests, fixture repositories and a stub host
+npm test              # fixtures: real git repositories, and a stub host
+npm run test:coverage # the same suite with a floor: 97% lines, 69% branches
+npm run test:mutate   # breaks each guard and requires the suite to notice
+npm run test:live -- --repo <sandbox>   # the forge itself, creating and deleting
 ```
 
 The fixtures are real git repositories built per test, so the bump rules, the tag prefix, the path filter, prereleases and the re-run path are exercised against git rather than a mock. The host adapters are exercised against a stub HTTP server that records the requests.
+
+Three kinds of test, because they fail differently:
+
+- **Fixtures** prove the logic. They run on every push, on Node 20, 22 and 24 - the versions callers use.
+- **Mutation** proves the fixtures bite. Each entry in `scripts/mutate.mjs` breaks one guard in a copy of `release.mjs` - the shallow-clone refusal, the branch gate, the 404 branch, the draft flag, an unknown flag, the local tag, the breaking-change rule, the stamp, the version check, the find-before-create - and the suite has to fail. A mutant that survives is a property nothing checks.
+- **The live contract** proves the *stubs* are right. It creates a draft release, uploads an asset, publishes it, re-runs to check the re-runnable path, and deletes everything again, against a sandbox repository. It runs weekly rather than per pull request, because it needs a token with `contents: write` on that repository (`SANDPIT_TOKEN`), and it is the only test that notices the forge changing.
+
+The live contract has earned its keep three times over: GitHub's by-tag endpoint does not return **draft** releases (so a drafted release could never be found again), a **draft** does not create its tag until it is published, and `git describe` answers with the wrong tag when two name the same commit - which is exactly the state a finished release leaves.

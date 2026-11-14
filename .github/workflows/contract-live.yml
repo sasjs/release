@@ -1,0 +1,41 @@
+name: Live contract
+
+# Every fixture in this repository answers with a stub, so the suite proves the
+# tool against our belief about the forge: 422 when a tag already has a release,
+# `upload_url` with its `{?name,label}` template, a tag created from
+# `target_commitish`, a draft hidden from the by-tag endpoint. When that belief is
+# wrong the first thing to notice is a release failing in a repository that is
+# publishing something - which is how three defects were found, including a draft
+# that could never be finished and a re-run that created a second release.
+#
+# It creates a release and a tag in the sandbox and deletes them again, so it runs
+# on a schedule rather than on a pull request, and it needs a token with
+# contents: write on that repository.
+on:
+  schedule:
+    - cron: '41 5 * * 1' # Mondays, before the week's work
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: The forge still behaves the way the stubs believe
+        env:
+          # a token with contents: write on the sandbox: the workflow's own token
+          # cannot write to another repository
+          GH_TOKEN: ${{ secrets.SANDPIT_TOKEN }}
+          SANDPIT_REPO: sasjs/sandpit
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::SANDPIT_TOKEN is not set, so the live contract did not run. Add a token with contents: write on $SANDPIT_REPO."
+            exit 1
+          fi
+          node scripts/live-contract.mjs --repo "$SANDPIT_REPO"
