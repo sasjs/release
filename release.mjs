@@ -221,6 +221,13 @@ function authHeaders(host, token, header) {
   return { authorization: host === 'gitea' ? `token ${token}` : `Bearer ${token}` }
 }
 
+class HttpError extends Error {
+  constructor(method, url, status, text) {
+    super(`${method} ${url} answered ${status}: ${text.slice(0, 500)}`)
+    this.status = status
+  }
+}
+
 async function request(url, { method = 'GET', headers = {}, body, json } = {}) {
   headers = { accept: 'application/json', ...headers }
   if (json !== undefined) headers['content-type'] = 'application/json'
@@ -232,9 +239,40 @@ async function request(url, { method = 'GET', headers = {}, body, json } = {}) {
   })
 
   const text = await response.text()
-  if (!response.ok)
-    fail(`${method} ${url} answered ${response.status}: ${text.slice(0, 500)}`)
+  if (!response.ok) throw new HttpError(method, url, response.status, text)
   return text ? JSON.parse(text) : {}
+}
+
+/**
+ * A release that already exists is not a failure: the run that created it may
+ * have died on the next step, and the whole point of `--release` being
+ * idempotent is that re-running finishes the job. The forges disagree on the
+ * status - GitHub says 422, Gitea and GitLab say 409 - and all of them can then
+ * be asked for the release they refused to create twice.
+ */
+async function createOrFind(url, options, find) {
+  try {
+    return await request(url, options)
+  } catch (error) {
+    if (error.status !== 422 && error.status !== 409) throw error
+    const existing = await find()
+    if (!existing) throw error
+    console.log(`a release for this tag already exists: finishing it`)
+    return existing
+  }
+}
+
+/** An asset that is already attached is also not a failure. */
+async function uploadOnce(url, headers, file, field) {
+  try {
+    return await upload(url, headers, file, field)
+  } catch (error) {
+    if (error.status === 422 || error.status === 409) {
+      console.log(`${basename(file)} is already attached`)
+      return {}
+    }
+    throw error
+  }
 }
 
 const HOSTS = {
@@ -259,7 +297,20 @@ const HOSTS = {
  * no asset upload at all - a release carries links, which is why --asset-link
  * exists.
  */
-async function publish({ host, api, token, header, repo, tag, body, title, files, links, commit }) {
+async function publish({
+  host,
+  api,
+  token,
+  header,
+  repo,
+  tag,
+  body,
+  title,
+  files,
+  links,
+  commit,
+  isPrerelease
+}) {
   const headers = authHeaders(host, token, header)
   const encoded = repo.replace('/', '%2F')
 
@@ -268,27 +319,42 @@ async function publish({ host, api, token, header, repo, tag, body, title, files
     // target_commitish is what makes the tag exist at all: the API creates it
     // when tag_name is new, so the job needs no git credentials and never
     // pushes to the repository. Unused when the tag is already there.
-    const release = await request(`${base}/repos/${repo}/releases`, {
-      method: 'POST',
-      headers,
-      json: { tag_name: tag, target_commitish: commit, name: title, body }
-    })
+    const release = await createOrFind(
+      `${base}/repos/${repo}/releases`,
+      {
+        method: 'POST',
+        headers,
+        json: { tag_name: tag, target_commitish: commit, name: title, body, prerelease: isPrerelease }
+      },
+      () => request(`${base}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers })
+    )
     for (const file of files) {
       const url = String(release.upload_url).replace(/\{.*$/, '')
-      await upload(`${url}?name=${encodeURIComponent(basename(file))}`, headers, file, 'file')
+      await uploadOnce(`${url}?name=${encodeURIComponent(basename(file))}`, headers, file, 'file')
     }
     return release
   }
 
   if (host === 'gitea') {
     if (!api) fail('--host gitea needs --api-url (https://your-host/api/v1)')
-    const release = await request(`${api}/repos/${repo}/releases`, {
-      method: 'POST',
-      headers,
-      json: { tag_name: tag, target_commitish: commit, name: title, body, draft: false }
-    })
+    const release = await createOrFind(
+      `${api}/repos/${repo}/releases`,
+      {
+        method: 'POST',
+        headers,
+        json: {
+          tag_name: tag,
+          target_commitish: commit,
+          name: title,
+          body,
+          draft: false,
+          prerelease: isPrerelease
+        }
+      },
+      () => request(`${api}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers })
+    )
     for (const file of files) {
-      await upload(
+      await uploadOnce(
         `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(basename(file))}`,
         headers,
         file,
@@ -309,11 +375,16 @@ async function publish({ host, api, token, header, repo, tag, body, title, files
     const base = api || HOSTS.gitlab.api
     // GitLab is the same shape: `ref` is what creates the tag when tag_name is
     // new, and without it the call fails on a tag that does not exist yet.
-    const release = await request(`${base}/projects/${encoded}/releases`, {
-      method: 'POST',
-      headers,
-      json: { name: title, tag_name: tag, ref: commit, description: body }
-    })
+    const release = await createOrFind(
+      `${base}/projects/${encoded}/releases`,
+      {
+        method: 'POST',
+        headers,
+        json: { name: title, tag_name: tag, ref: commit, description: body }
+      },
+      () =>
+        request(`${base}/projects/${encoded}/releases/${encodeURIComponent(tag)}`, { headers })
+    )
     for (const link of links) {
       await request(`${base}/projects/${encoded}/releases/${encodeURIComponent(tag)}/assets/links`, {
         method: 'POST',
@@ -475,7 +546,8 @@ async function main() {
       title: arg('title', tag),
       files: args('asset'),
       links,
-      commit: head
+      commit: head,
+      isPrerelease: Boolean(prerelease)
     })
     console.log(`released ${tag} on ${host}`)
   }

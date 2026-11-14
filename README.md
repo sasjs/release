@@ -26,7 +26,7 @@ There is no release commit, so **no changelog file is written and `package.json`
 
 Two things it does that the toolchain cannot:
 
-- **A failed release is re-runnable.** If a run dies after the tag is cut - the push rejected, the API down, the runner killed - re-running with the same flags finishes it. The tag is reused instead of refused, and the notes are rebuilt from the commits the tag covers.
+- **A failed release is re-runnable.** If a run dies after the tag is cut - the push rejected, the API down, the runner killed - re-running with the same flags finishes it. The tag is reused instead of refused, the notes are rebuilt from the commits the tag covers, an existing release is found rather than re-created (GitHub answers 422, Gitea and GitLab 409), and an asset that is already attached is reported, not treated as a failure.
 - **Nothing lands on your default branch.** No release commit, no `package.json` bump, no second push for the tag, so no protected-branch or app-token dance.
 
 ## Options
@@ -38,7 +38,7 @@ Two things it does that the toolchain cannot:
 | `--since <ref>` | count commits after this ref (default: newest prefixed tag) |
 | `--paths <a,b>` | only commits touching these paths - monorepos |
 | `--level <l>` | force `patch`, `minor` or `major` instead of classifying |
-| `--prerelease <id>` | cut `<version>-<id>.1`, or continue the last one (`beta.2` -> `beta.3`) |
+| `--prerelease <id>` | cut `<version>-<id>.1`, or continue the last one (`beta.2` -> `beta.3`); the release is marked as a prerelease |
 | `--dry-run` | say what it would do; write nothing, send nothing |
 | `--notes-file <path>` | write the release notes here |
 | `--output <path>` | append `released`, `version`, `tag`, `level` as `key=value` |

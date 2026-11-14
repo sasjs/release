@@ -312,6 +312,84 @@ test('gitlab: creates the release and attaches links, which is all it has', asyn
   assert.deepEqual(JSON.parse(link.body), { name: 'app.zip', url: 'https://example.com/app.zip' })
 })
 
+test('a release that already exists is finished rather than refused', async (t) => {
+  // GitHub answers 422 when the tag already has a release; a run that died
+  // after that point has to be re-runnable, so the release is looked up and the
+  // assets are attached to it
+  let base = ''
+  let created = 0
+  const replacement = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases') {
+      created += 1
+      return { status: 422, json: { message: 'Validation Failed', errors: [{ code: 'already_exists' }] } }
+    }
+    if (request.url === '/repos/sasjs/app/releases/tags/v1.8.0')
+      return { json: { id: 7, upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(cwd, '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', asset)
+
+  assert.equal(created, 1)
+  assert.match(out, /a release for this tag already exists: finishing it/)
+  assert.ok(
+    replacement.seen.some((r) => r.url.startsWith('/upload?name=app.zip')),
+    'the asset is still attached to the release that was found'
+  )
+})
+
+test('an asset already attached is not a failure either', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 7, upload_url: `${base}/upload{?name,label}` } }
+    if (request.url.startsWith('/upload'))
+      return { status: 422, json: { message: 'already_exists' } }
+    return { json: {} }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+
+  const out = await runInParallel(cwd, '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', asset)
+
+  assert.match(out, /app.zip is already attached/)
+  assert.match(out, /released v1\.7\.2 on github/)
+})
+
+test('a prerelease is created as one, so it does not look like a final release', async (t) => {
+  const replacement = await stub(() => ({ json: { id: 7, upload_url: 'x{?name,label}' } }))
+  t.after(() => replacement.stop())
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+
+  await runInParallel(cwd, '--host', 'github', '--release', '--prerelease', 'beta',
+    '--api-url', replacement.base, '--repo', 'sasjs/app')
+
+  const created = replacement.seen.find((r) => r.url === '/repos/sasjs/app/releases')
+  const payload = JSON.parse(created.body)
+  assert.equal(payload.tag_name, 'v1.8.0-beta.1')
+  assert.equal(payload.prerelease, true)
+
+  const stable = await stub(() => ({ json: { id: 7, upload_url: 'x{?name,label}' } }))
+  t.after(() => stable.stop())
+  await runInParallel(cwd, '--host', 'github', '--release', '--api-url',
+    stable.base, '--repo', 'sasjs/app')
+  const finals = stable.seen.find((r) => r.url === '/repos/sasjs/app/releases')
+  assert.equal(JSON.parse(finals.body).prerelease, false)
+})
+
 test('a gitlab job token goes in its own header, so no personal token is needed', async (t) => {
   const replacement = await stub(() => ({ json: { tag_name: 'v1.7.2' } }))
   t.after(() => replacement.stop())
