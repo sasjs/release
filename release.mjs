@@ -59,6 +59,24 @@ const HELP = `sasjs-release - releases from conventional commits
   --help                 this text
 `
 
+// Every flag the tool knows. A typo is otherwise silent: `flag()` is a lookup in
+// argv, so `--drafts` reads as false and the run quietly does something else -
+// which is how a dropped `--draft` would publish a release before its assets
+// exist rather than failing.
+const known = new Set([
+  'api-url', 'asset', 'asset-link', 'branch', 'draft', 'dry-run', 'help', 'host',
+  'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
+  'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
+])
+
+function checkFlags() {
+  for (const token of process.argv.slice(2)) {
+    if (!token.startsWith('--')) continue
+    if (!known.has(token.slice(2))) fail(`unknown flag ${token} - run --help for the list`)
+  }
+}
+
 const flag = (name) => process.argv.includes(`--${name}`)
 
 const arg = (name, fallback = '') => {
@@ -573,6 +591,8 @@ async function main() {
     console.log(HELP)
     return
   }
+
+  checkFlags()
 
   if (flag('prepare-publish')) {
     await preparePublish()

@@ -451,3 +451,12 @@ test('--draft keeps the release out of sight until it is published', async (t) =
   const sent = draftStub.seen.find((r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases')
   assert.match(sent.body, /"draft":true/)
 })
+
+test('an unknown flag is refused rather than ignored', () => {
+  // flag() is a lookup in argv, so a typo reads as false and the run quietly does
+  // something else - `--draft` dropped to `--drafts` would publish a release
+  // before its assets exist
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const out = failure(cwd, '--host', 'github', '--drafts', '--dry-run')
+  assert.match(out, /unknown flag --drafts/)
+})
