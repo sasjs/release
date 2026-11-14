@@ -74,6 +74,21 @@ const mutations = [
     replace: `  if (false) {`
   },
   {
+    name: 'a draft release is not found by listing',
+    find: `  return (Array.isArray(releases) ? releases : []).find((release) => release.tag_name === tag) || null`,
+    replace: `  return null`
+  },
+  {
+    name: 'the oldest tag decides the base rather than the newest',
+    find: `'--merged', 'HEAD', '--list', \`\${prefix}[0-9]*\`, '--sort=-v:refname'`,
+    replace: `'--merged', 'HEAD', '--list', \`\${prefix}[0-9]*\`, '--sort=v:refname'`
+  },
+  {
+    name: 'a release is created without looking for an existing one',
+    find: `  if (existing && existing.id) {`,
+    replace: `  if (false) {`
+  },
+  {
     name: 'a lookup that fails replaces the refusal that caused it',
     find: `    const existing = await find().catch(() => null)`,
     replace: `    const existing = await find()`
