@@ -364,7 +364,7 @@ async function createOrFind(url, options, find) {
  * the label a reader sees. A file the caller names does not exist fails here
  * rather than as a read error after the release has been created.
  */
-function assetOf(path, label, base, source = '--asset') {
+function assetOf(path, label, base, source = '--asset', name) {
   // relative to the repository being released, the same way every other path
   // this tool takes is: a workflow runs from the checkout, but --repo-dir says
   // which directory that is
@@ -372,7 +372,15 @@ function assetOf(path, label, base, source = '--asset') {
 
   if (!existsSync(file)) fail(`${source} names a file that is not there: ${path}`)
 
-  return { name: basename(file), path: file, ...(label ? { label } : {}) }
+  // The name is the download: a release asset is served at
+  // `<repo>/releases/latest/download/<name>`, so a build output named after its
+  // target can be published under the name a page already links to.
+  const published = name || basename(file)
+
+  if (published !== basename(published) || published === '.' || published === '..')
+    fail(`${source} publishes ${path} as ${published}: an asset name is a file name`)
+
+  return { name: published, path: file, ...(label ? { label } : {}) }
 }
 
 /**
@@ -436,7 +444,13 @@ function assetsOf(listed, file, base) {
     if (typeof path !== 'string' || !path)
       fail(`${file} has an asset entry with no path: ${JSON.stringify(entry)}`)
 
-    return assetOf(path, typeof entry === 'string' ? undefined : entry.label, base, file)
+    const label = typeof entry === 'string' ? undefined : entry.label
+    const name = typeof entry === 'string' ? undefined : entry.name
+
+    if (name !== undefined && (typeof name !== 'string' || !name))
+      fail(`${file} has an asset entry with no name: ${JSON.stringify(entry)}`)
+
+    return assetOf(path, label, base, file, name)
   })
 }
 

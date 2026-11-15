@@ -478,6 +478,56 @@ test('--config names the file, which may be a bare array of paths', async (t) =>
   assert.doesNotMatch(upload.url, /label=/)
 })
 
+test('a config entry publishes under the name it gives, not the file name', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  mkdirSync(join(cwd, 'sasjsbuild'), { recursive: true })
+  writeFileSync(join(cwd, 'sasjsbuild', 'server.json.zip'), 'zip')
+  writeProjectConfig(cwd, {
+    release: {
+      assets: [
+        {
+          path: 'sasjsbuild/server.json.zip',
+          name: 'macro-dash-server.json.zip',
+          label: 'SASjs Server App'
+        }
+      ]
+    }
+  })
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  // the download URL is the asset name, so a build output named after its target
+  // is published under the name a page already links to
+  const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name='))
+
+  assert.ok(upload)
+  assert.match(upload.url, /name=macro-dash-server\.json\.zip/)
+  assert.match(upload.url, /label=SASjs%20Server%20App/)
+})
+
+test('an asset name that is a path is refused', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  writeProjectConfig(cwd, {
+    release: { assets: [{ path: 'server.json.zip', name: 'sub/server.zip' }] }
+  })
+
+  const message = failure(cwd, '--host', 'github', '--release')
+
+  assert.match(message, /an asset name is a file name/)
+})
+
 test('a config that names no assets is refused, with the shapes it accepts', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'empty.json'), JSON.stringify({ plugins: [] }))

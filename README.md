@@ -191,18 +191,24 @@ attaches:
 {
   "release": {
     "assets": [
-      { "path": "sasjsbuild/server.json.zip", "label": "SASjs Streamed App" },
-      { "path": "sasjsbuild/sas9.sas", "label": "SAS 9 EBI Deployment Program" }
+      {
+        "path": "sasjsbuild/server.json.zip",
+        "name": "macro-dash-server.json.zip",
+        "label": "SASjs Server App"
+      }
     ]
   }
 }
 ```
 
-`path` is relative to the repository root, `label` is what a reader sees on the
-release page, and the files are attached in the order given. That key sits beside
-the build that produces them, which is why a release job does not need a directory
-of copies: `sasjs cb -t sas9` names its output after the target's
-`deployScriptFilename`, and this says which name the release should carry it under.
+`path` is relative to the repository root and `label` is what a reader sees on the
+release page. `name` is what the file is published as, which matters because an
+asset is served from `<repo>/releases/latest/download/<name>`: a build output named
+after its target (`sasjs cb -t sas9` writes `sasjsbuild/<deployScriptFilename>`) is
+published under the name a page already links to, with no copy to rename it first.
+Without `name` the file keeps its own.
+
+The files are attached in the order given.
 
 `--config <path>` reads the same list from another file, which may also be a bare
 array of paths.
