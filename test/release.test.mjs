@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import http from 'node:http'
@@ -38,6 +38,12 @@ function repo({ tag = 'v1.7.1', commits = ['feat: initial'] } = {}) {
   if (tag) git(cwd, 'tag', '-a', tag, '-m', tag)
   for (const message of pending) commit(cwd, message)
   return cwd
+}
+
+/** A project config, where SASjs keeps it: `sasjs/sasjsconfig.json`. */
+function writeProjectConfig(cwd, config) {
+  mkdirSync(join(cwd, 'sasjs'), { recursive: true })
+  writeFileSync(join(cwd, 'sasjs', 'sasjsconfig.json'), JSON.stringify(config))
 }
 
 function commit(cwd, message) {
@@ -297,16 +303,13 @@ test('sasjsconfig.json\'s release block names the assets, with no flag at all', 
 
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'server.json.zip'), 'zip')
-  writeFileSync(
-    join(cwd, 'sasjsconfig.json'),
-    JSON.stringify({
-      defaultTarget: 'server',
-      targets: [],
-      release: {
-        assets: [{ path: 'server.json.zip', label: 'SASjs Streamed App' }]
-      }
-    })
-  )
+  writeProjectConfig(cwd, {
+    defaultTarget: 'server',
+    targets: [],
+    release: {
+      assets: [{ path: 'server.json.zip', label: 'SASjs Streamed App' }]
+    }
+  })
   process.env.GH_TOKEN = 'token-123'
 
   await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
@@ -331,7 +334,7 @@ test('a sasjsconfig with no release block falls through to the .releaserc beside
 
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'server.json.zip'), 'zip')
-  writeFileSync(join(cwd, 'sasjsconfig.json'), JSON.stringify({ targets: [] }))
+  writeProjectConfig(cwd, { targets: [] })
   writeFileSync(
     join(cwd, '.releaserc'),
     JSON.stringify({ plugins: [['@sasjs/release', { assets: ['server.json.zip'] }]] })
@@ -361,10 +364,7 @@ test('--config wins over both', async (t) => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'in-config.json'), 'in')
   writeFileSync(join(cwd, 'in-file.json'), 'in')
-  writeFileSync(
-    join(cwd, 'sasjsconfig.json'),
-    JSON.stringify({ release: { assets: ['in-config.json'] } })
-  )
+  writeProjectConfig(cwd, { release: { assets: ['in-config.json'] } })
   writeFileSync(join(cwd, 'other.json'), JSON.stringify(['in-file.json']))
   process.env.GH_TOKEN = 'token-123'
 
@@ -486,6 +486,57 @@ test('a config that names no assets is refused, with the shapes it accepts', () 
 
   assert.match(message, /names no assets/)
   assert.match(message, /@sasjs\/release/)
+})
+
+test('a config naming a file that is not there tags nothing', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeProjectConfig(cwd, { release: { assets: ['missing.zip'] } })
+
+  const message = failure(
+    cwd, '--tag', '--push-tag', '--host', 'github', '--release'
+  )
+
+  // named where it came from: the config, not a flag the caller never passed
+  assert.match(message, /sasjs\/sasjsconfig\.json names a file that is not there: missing\.zip/)
+  // and refused before the tag exists, so there is nothing to explain afterwards
+  assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
+test('a dry run reports the same mistake without tagging', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeProjectConfig(cwd, { release: { assets: ['missing.zip'] } })
+
+  const message = failure(cwd, '--host', 'github', '--release', '--dry-run')
+
+  assert.match(message, /names a file that is not there/)
+  assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
+test('a discovered .releaserc naming no assets releases without them', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  // semantic-release's own file, for its own plugins, with no assets entry
+  writeFileSync(
+    join(cwd, '.releaserc'),
+    JSON.stringify({ plugins: ['@semantic-release/commit-analyzer', '@semantic-release/npm'] })
+  )
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  // found by convention is not the same as named: it says nothing about assets, so
+  // the release goes ahead with nothing attached rather than failing a flag nobody
+  // passed
+  assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
 })
 
 test('a config with no assets is not invented from a file that has none', async (t) => {

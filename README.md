@@ -50,7 +50,7 @@ Two things it does that the toolchain cannot:
 | `--api-url <url>` | host API base, for a self-hosted instance |
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
-| `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjsconfig.json` is read by default, then a `.releaserc` |
+| `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
 | `--sha <sha>` | commit to look for a tag at, with `--prepare-publish` (default: `HEAD`) |
@@ -184,7 +184,8 @@ release:
 
 ### Assets
 
-`release.assets` in `sasjsconfig.json` names the files a release attaches:
+`release.assets` in the project's `sasjs/sasjsconfig.json` names the files a release
+attaches:
 
 ```json
 {

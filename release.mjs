@@ -59,7 +59,7 @@ const HELP = `sasjs-release - releases from conventional commits
   --asset <path>         file to upload to the release (repeatable)
   --asset-link <n=url>   link to attach to the release (repeatable)
   --config <path>        config naming the assets to attach. Default: the
-                         release.assets of sasjsconfig.json, then a .releaserc
+                         release.assets of sasjs/sasjsconfig.json, then a .releaserc
                          (a migration path). The list is
                          { "assets": [ { "path": "...", "label": "..." } ] }
   --title <text>         release title (default: the tag)
@@ -364,13 +364,13 @@ async function createOrFind(url, options, find) {
  * the label a reader sees. A file the caller names does not exist fails here
  * rather than as a read error after the release has been created.
  */
-function assetOf(path, label, base) {
+function assetOf(path, label, base, source = '--asset') {
   // relative to the repository being released, the same way every other path
   // this tool takes is: a workflow runs from the checkout, but --repo-dir says
   // which directory that is
   const file = isAbsolute(path) ? path : join(base, path)
 
-  if (!existsSync(file)) fail(`--asset names a file that is not there: ${path}`)
+  if (!existsSync(file)) fail(`${source} names a file that is not there: ${path}`)
 
   return { name: basename(file), path: file, ...(label ? { label } : {}) }
 }
@@ -389,7 +389,7 @@ function assetOf(path, label, base) {
  * so: that is the migration, and naming it is how the reader learns the one edit
  * left to make.
  */
-function assetsFromConfig(file, base) {
+function assetsFromConfig(file, base, { discovered = false } = {}) {
   const parsed = readJson(file, base, '--config')
 
   if (Array.isArray(parsed)) return assetsOf(parsed, file, base)
@@ -419,6 +419,11 @@ function assetsFromConfig(file, base) {
     return assetsOf(theirs[1].assets, file, base)
   }
 
+  // A file the caller named is a mistake when it says nothing about assets. A file
+  // found by convention is not: `.releaserc` is what semantic-release calls its own,
+  // so a repository carrying one for its own reasons releases without assets.
+  if (discovered) return []
+
   return fail(
     `--config ${file} names no assets: expected { "assets": [ ... ] }, a bare array, or a plugins entry named @sasjs/release`
   )
@@ -431,7 +436,7 @@ function assetsOf(listed, file, base) {
     if (typeof path !== 'string' || !path)
       fail(`${file} has an asset entry with no path: ${JSON.stringify(entry)}`)
 
-    return assetOf(path, typeof entry === 'string' ? undefined : entry.label, base)
+    return assetOf(path, typeof entry === 'string' ? undefined : entry.label, base, file)
   })
 }
 
@@ -457,7 +462,7 @@ function configAssets(cwd) {
     // not stop the search - the next candidate may be the file it came from
     if (candidate === DEFAULT_PROJECT_CONFIG && !hasReleaseAssets(at)) continue
 
-    return assetsFromConfig(candidate, cwd)
+    return assetsFromConfig(candidate, cwd, { discovered: true })
   }
 
   return []
@@ -496,8 +501,11 @@ async function uploadOnce(url, headers, file, field) {
   }
 }
 
-/** The project config, where a release's assets belong. */
-const DEFAULT_PROJECT_CONFIG = 'sasjsconfig.json'
+/**
+ * The project config, where a release's assets belong. SASjs keeps it in the
+ * `sasjs` folder of a project, beside the services and macros it describes.
+ */
+const DEFAULT_PROJECT_CONFIG = join('sasjs', 'sasjsconfig.json')
 
 /** Read in this order when no flag names a config: the project's, then the migration's. */
 const DEFAULT_CONFIGS = [DEFAULT_PROJECT_CONFIG, '.releaserc', '.releaserc.json']
@@ -901,6 +909,17 @@ async function main() {
     console.log(`${level} release: ${previous || 'none'} -> ${tag} (${releasable.length} commits)`)
   console.log(body)
 
+  // Resolved here, before a tag exists: a config naming a file that is not there - or
+  // naming nothing when the caller asked for it by name - is a mistake in the
+  // repository, and refusing after the tag has been pushed leaves a release that has
+  // to be explained. It needs no token and no network, so a dry run checks it too.
+  const files = flag('release')
+    ? [
+        ...args('asset').map((path) => assetOf(path, undefined, cwd)),
+        ...configAssets(cwd)
+      ]
+    : []
+
   if (dry) {
     console.log('--dry-run: nothing tagged, nothing sent')
     output({ released: false, version, tag, level })
@@ -947,10 +966,7 @@ async function main() {
       tag,
       body,
       title: arg('title', tag),
-      files: [
-        ...args('asset').map((path) => assetOf(path, undefined, cwd)),
-        ...configAssets(cwd)
-      ],
+      files,
       links,
       commit: head,
       isPrerelease: Boolean(prerelease),
