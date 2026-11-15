@@ -285,6 +285,250 @@ test('github: creates the release and uploads each asset to its upload_url', asy
   assert.match(upload.type, /^multipart\/form-data/)
 })
 
+test('sasjsconfig.json\'s release block names the assets, with no flag at all', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  writeFileSync(
+    join(cwd, 'sasjsconfig.json'),
+    JSON.stringify({
+      defaultTarget: 'server',
+      targets: [],
+      release: {
+        assets: [{ path: 'server.json.zip', label: 'SASjs Streamed App' }]
+      }
+    })
+  )
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  // one config file for the project: the release list lives beside the build
+  const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=server.json.zip'))
+
+  assert.ok(upload)
+  assert.match(upload.url, /label=SASjs%20Streamed%20App/)
+})
+
+test('a sasjsconfig with no release block falls through to the .releaserc beside it', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  writeFileSync(join(cwd, 'sasjsconfig.json'), JSON.stringify({ targets: [] }))
+  writeFileSync(
+    join(cwd, '.releaserc'),
+    JSON.stringify({ plugins: [['@sasjs/release', { assets: ['server.json.zip'] }]] })
+  )
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  // a project config that says nothing about assets is not an answer, and does not
+  // stop the file the list came from being read
+  assert.ok(
+    replacement.seen.find((r) => r.url.startsWith('/upload?name=server.json.zip'))
+  )
+})
+
+test('--config wins over both', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'in-config.json'), 'in')
+  writeFileSync(join(cwd, 'in-file.json'), 'in')
+  writeFileSync(
+    join(cwd, 'sasjsconfig.json'),
+    JSON.stringify({ release: { assets: ['in-config.json'] } })
+  )
+  writeFileSync(join(cwd, 'other.json'), JSON.stringify(['in-file.json']))
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--config', 'other.json')
+
+  assert.ok(replacement.seen.find((r) => r.url.startsWith('/upload?name=in-file.json')))
+  assert.equal(
+    replacement.seen.filter((r) => r.url.startsWith('/upload?name=in-config.json')).length,
+    0
+  )
+})
+
+test('the repository\'s .releaserc names the assets, with their labels', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  writeFileSync(join(cwd, 'sas9.sas'), 'sas')
+  writeFileSync(
+    join(cwd, '.releaserc'),
+    JSON.stringify({
+      plugins: [
+        '@semantic-release/commit-analyzer',
+        [
+          '@sasjs/release',
+          {
+            assets: [
+              { path: 'server.json.zip', label: 'SASjs Streamed App' },
+              { path: 'sas9.sas', label: 'SAS 9 EBI Deployment Program' }
+            ]
+          }
+        ]
+      ]
+    })
+  )
+  process.env.GH_TOKEN = 'token-123'
+
+  // no flag: the file the repository already has is the config
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  const app = replacement.seen.find((r) => r.url.startsWith('/upload?name=server.json.zip'))
+  const sas9 = replacement.seen.find((r) => r.url.startsWith('/upload?name=sas9.sas'))
+
+  assert.ok(app, 'server.json.zip is attached')
+  assert.match(app.url, /label=SASjs%20Streamed%20App/)
+  assert.ok(sas9, 'sas9.sas is attached')
+  assert.match(sas9.url, /label=SAS%209%20EBI%20Deployment%20Program/)
+})
+
+test('an entry still named for semantic-release is read, and the run says to rename it', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  writeFileSync(
+    join(cwd, '.releaserc'),
+    JSON.stringify({
+      plugins: [['@semantic-release/github', { assets: ['server.json.zip'] }]]
+    })
+  )
+  process.env.GH_TOKEN = 'token-123'
+
+  const stdout = await runInParallel(cwd, '--tag', '--host', 'github', '--release',
+    '--api-url', replacement.base, '--repo', 'sasjs/app')
+
+  const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=server.json.zip'))
+
+  // reading the old name is the migration: the asset is attached, and the one
+  // edit left to make is named in the output
+  assert.ok(upload)
+  assert.match(stdout, /rename that entry to @sasjs\/release/)
+})
+
+test('--config names the file, which may be a bare array of paths', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'app.zip'), 'zip')
+  writeFileSync(join(cwd, 'assets.json'), JSON.stringify(['app.zip']))
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--config', 'assets.json')
+
+  const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=app.zip'))
+
+  assert.ok(upload)
+  assert.doesNotMatch(upload.url, /label=/)
+})
+
+test('a config that names no assets is refused, with the shapes it accepts', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'empty.json'), JSON.stringify({ plugins: [] }))
+
+  const message = failure(cwd, '--host', 'github', '--release', '--config', 'empty.json')
+
+  assert.match(message, /names no assets/)
+  assert.match(message, /@sasjs\/release/)
+})
+
+test('a config with no assets is not invented from a file that has none', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'app.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  // no config anywhere: the release is made with nothing attached, which is what
+  // a repository that only uses --asset has always had
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
+})
+
+test('a file that is not there is refused before the release is created', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'assets.json'), JSON.stringify(['missing.zip']))
+
+  const message = failure(cwd, '--host', 'github', '--release', '--config', 'assets.json')
+
+  assert.match(message, /not there: missing\.zip/)
+})
+
+test('gitlab refuses assets rather than releasing without them', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'app.zip'), 'zip')
+  process.env.GITLAB_TOKEN = 'token-123'
+
+  const message = failure(cwd, '--host', 'gitlab', '--release', '--asset', 'app.zip')
+
+  assert.match(message, /gitlab has no asset upload/)
+})
+
 test('gitea: creates the release over the REST API and posts the asset', async (t) => {
   // the find-before-create step asks first: a stub that answers every request
   // with a release makes the tool believe one already exists

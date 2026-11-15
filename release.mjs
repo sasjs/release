@@ -21,8 +21,8 @@
  * before the tag step, and the tag alone exists when it is returned after.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync, writeFileSync, appendFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { basename, isAbsolute, join } from 'node:path'
 
 const LEVELS = { major: 3, minor: 2, patch: 1 }
 
@@ -58,6 +58,10 @@ const HELP = `sasjs-release - releases from conventional commits
   --token-header <h>     which header carries it (default: per host)
   --asset <path>         file to upload to the release (repeatable)
   --asset-link <n=url>   link to attach to the release (repeatable)
+  --config <path>        config naming the assets to attach. Default: the
+                         release.assets of sasjsconfig.json, then a .releaserc
+                         (a migration path). The list is
+                         { "assets": [ { "path": "...", "label": "..." } ] }
   --title <text>         release title (default: the tag)
   --help                 this text
 `
@@ -67,7 +71,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // which is how a dropped `--draft` would publish a release before its assets
 // exist rather than failing.
 const known = new Set([
-  'api-url', 'asset', 'asset-link', 'branch', 'draft', 'dry-run', 'help', 'host',
+  'api-url', 'asset', 'asset-link', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
@@ -355,6 +359,130 @@ async function createOrFind(url, options, find) {
   }
 }
 
+/**
+ * One `--asset` argument: the file on disk, the name it is published under, and
+ * the label a reader sees. A file the caller names does not exist fails here
+ * rather than as a read error after the release has been created.
+ */
+function assetOf(path, label, base) {
+  // relative to the repository being released, the same way every other path
+  // this tool takes is: a workflow runs from the checkout, but --repo-dir says
+  // which directory that is
+  const file = isAbsolute(path) ? path : join(base, path)
+
+  if (!existsSync(file)) fail(`--asset names a file that is not there: ${path}`)
+
+  return { name: basename(file), path: file, ...(label ? { label } : {}) }
+}
+
+/**
+ * The assets a repository's config names.
+ *
+ * One file, because a release job has one list of things to attach and a second
+ * file to hold it is a second place for it to be wrong. The list is `assets` at the
+ * root, or `assets` inside a `plugins` entry named `@sasjs/release` - the shape a
+ * repository already has if it came from semantic-release, with one string renamed:
+ *
+ *     { "plugins": [ ["@sasjs/release", { "assets": [ ... ] }] ] }
+ *
+ * An entry still named `@semantic-release/github` is read as well, and the run says
+ * so: that is the migration, and naming it is how the reader learns the one edit
+ * left to make.
+ */
+function assetsFromConfig(file, base) {
+  const parsed = readJson(file, base, '--config')
+
+  if (Array.isArray(parsed)) return assetsOf(parsed, file, base)
+  if (Array.isArray(parsed?.assets)) return assetsOf(parsed.assets, file, base)
+
+  // `sasjsconfig.json`, where a project's release lives: the same list, under the
+  // key the schema documents, so a repository has one config file rather than two
+  if (Array.isArray(parsed?.release?.assets))
+    return assetsOf(parsed.release.assets, file, base)
+
+  const plugins = Array.isArray(parsed?.plugins) ? parsed.plugins : []
+
+  const entry = (pattern) =>
+    plugins.find((plugin) => Array.isArray(plugin) && pattern.test(String(plugin[0])))
+
+  const ours = entry(/^@sasjs\/release$/)
+
+  if (Array.isArray(ours?.[1]?.assets)) return assetsOf(ours[1].assets, file, base)
+
+  const theirs = entry(/@semantic-release\/github$/)
+
+  if (Array.isArray(theirs?.[1]?.assets)) {
+    console.log(
+      `@semantic-release/github is read from ${file}: rename that entry to @sasjs/release and this note goes away`
+    )
+
+    return assetsOf(theirs[1].assets, file, base)
+  }
+
+  return fail(
+    `--config ${file} names no assets: expected { "assets": [ ... ] }, a bare array, or a plugins entry named @sasjs/release`
+  )
+}
+
+/** The entries themselves: a path, or `{ path, label }`. */
+function assetsOf(listed, file, base) {
+  return listed.map((entry) => {
+    const path = typeof entry === 'string' ? entry : entry?.path
+    if (typeof path !== 'string' || !path)
+      fail(`${file} has an asset entry with no path: ${JSON.stringify(entry)}`)
+
+    return assetOf(path, typeof entry === 'string' ? undefined : entry.label, base)
+  })
+}
+
+/**
+ * The assets to attach, from the config the caller named or the one the repository
+ * has.
+ *
+ * `.releaserc` first: it is the name a repository coming from semantic-release
+ * already carries, and the migration is a string inside it rather than a new file
+ * beside it.
+ */
+function configAssets(cwd) {
+  const named = arg('config')
+
+  if (named) return assetsFromConfig(named, cwd)
+
+  for (const candidate of DEFAULT_CONFIGS) {
+    const at = join(cwd, candidate)
+
+    if (!existsSync(at)) continue
+
+    // a sasjsconfig with no `release` block says nothing about assets, so it does
+    // not stop the search - the next candidate may be the file it came from
+    if (candidate === DEFAULT_PROJECT_CONFIG && !hasReleaseAssets(at)) continue
+
+    return assetsFromConfig(candidate, cwd)
+  }
+
+  return []
+}
+
+/** Whether a config names release assets at all, without reporting on one that does not. */
+function hasReleaseAssets(file) {
+  try {
+    return Array.isArray(JSON.parse(readFileSync(file, 'utf8'))?.release?.assets)
+  } catch (_) {
+    return false
+  }
+}
+
+/** A JSON file the caller named, read from the repository, with its own reason when it cannot be. */
+function readJson(file, base, flag) {
+  const at = isAbsolute(file) ? file : join(base, file)
+
+  try {
+    return JSON.parse(readFileSync(at, 'utf8'))
+  } catch (error) {
+    return fail(`${flag} ${file} could not be read: ${error.message}`)
+  }
+}
+
 /** An asset that is already attached is also not a failure. */
 async function uploadOnce(url, headers, file, field) {
   try {
@@ -367,6 +495,12 @@ async function uploadOnce(url, headers, file, field) {
     throw error
   }
 }
+
+/** The project config, where a release's assets belong. */
+const DEFAULT_PROJECT_CONFIG = 'sasjsconfig.json'
+
+/** Read in this order when no flag names a config: the project's, then the migration's. */
+const DEFAULT_CONFIGS = [DEFAULT_PROJECT_CONFIG, '.releaserc', '.releaserc.json']
 
 const HOSTS = {
   github: {
@@ -434,7 +568,10 @@ async function publish({
     )
     for (const file of files) {
       const url = String(release.upload_url).replace(/\{.*$/, '')
-      await uploadOnce(`${url}?name=${encodeURIComponent(basename(file))}`, headers, file, 'file')
+      const named = `?name=${encodeURIComponent(file.name)}${
+        file.label ? `&label=${encodeURIComponent(file.label)}` : ''
+      }`
+      await uploadOnce(`${url}${named}`, headers, file.path, 'file')
     }
     return release
   }
@@ -459,9 +596,9 @@ async function publish({
     )
     for (const file of files) {
       await uploadOnce(
-        `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(basename(file))}`,
+        `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(file.name)}`,
         headers,
-        file,
+        file.path,
         'attachment'
       )
     }
@@ -476,6 +613,11 @@ async function publish({
   }
 
   if (host === 'gitlab') {
+    // GitLab releases carry links, not uploaded files; accepting assets here and
+    // attaching none would be a release that looks complete and is not.
+    if (files.length)
+      fail('--host gitlab has no asset upload: attach the build with --asset-link name=url instead')
+
     const base = api || HOSTS.gitlab.api
     // GitLab is the same shape: `ref` is what creates the tag when tag_name is
     // new, and without it the call fails on a tag that does not exist yet.
@@ -805,7 +947,10 @@ async function main() {
       tag,
       body,
       title: arg('title', tag),
-      files: args('asset'),
+      files: [
+        ...args('asset').map((path) => assetOf(path, undefined, cwd)),
+        ...configAssets(cwd)
+      ],
       links,
       commit: head,
       isPrerelease: Boolean(prerelease),
