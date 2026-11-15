@@ -51,6 +51,7 @@ Two things it does that the toolchain cannot:
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
 | `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
+| `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
 | `--sha <sha>` | commit to look for a tag at, with `--prepare-publish` (default: `HEAD`) |
@@ -212,6 +213,22 @@ The files are attached in the order given.
 
 `--config <path>` reads the same list from another file, which may also be a bare
 array of paths.
+
+### Attaching after the release
+
+An artefact sometimes cannot exist when the release is cut - macro-dash stamps the
+version into the streamed page, so its files are built from the tag that was just
+made. `--attach` is the other half for that shape: no commits are read, nothing is
+tagged, and the same `release.assets` list goes to the release that exists.
+
+```yaml
+- run: npx sasjs-release --attach "$TAG" --host github
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+`--dry-run` names the files without sending them, and a tag with no release is
+refused by name rather than reported as an empty upload.
 
 ### Coming from `semantic-release`
 

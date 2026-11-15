@@ -528,6 +528,294 @@ test('an asset name that is a path is refused', () => {
   assert.match(message, /an asset name is a file name/)
 })
 
+test('--attach uploads the configured assets to a release that already exists', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
+      return { json: { upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  mkdirSync(join(cwd, 'artefacts'), { recursive: true })
+  writeFileSync(join(cwd, 'artefacts', 'server.json.zip'), 'zip')
+  writeProjectConfig(cwd, {
+    release: {
+      assets: [
+        {
+          path: 'artefacts/server.json.zip',
+          name: 'macro-dash-server.json.zip',
+          label: 'SASjs Server App'
+        }
+      ]
+    }
+  })
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app'
+  )
+
+  // the artefacts of a release are built after the tag, with the version stamped
+  // into them, so attaching is a run of its own
+  const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name='))
+
+  assert.ok(upload)
+  assert.match(upload.url, /name=macro-dash-server\.json\.zip/)
+  // and it cuts nothing: no tag is made or asked for
+  assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
+test('--attach with no release for the tag is refused, naming it', async (t) => {
+  const replacement = await stub(() => ({ status: 404, json: { message: 'Not Found' } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v9.9.9', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /no release for v9\.9\.9 in sasjs\/app/)
+})
+
+test('gitea: --attach posts the asset to the release for the tag', async (t) => {
+  const replacement = await stub(() => ({ json: { id: 42 } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITEA_TOKEN = 'gitea-token'
+
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'gitea', '--api-url',
+    replacement.base, '--repo', 'dc/dc', '--asset', 'frontend.zip')
+
+  const looked = replacement.seen.find((r) => r.url === '/repos/dc/dc/releases/tags/v1.8.0')
+  assert.equal(looked.method, 'GET')
+  const posted = replacement.seen.find((r) => r.url.startsWith('/repos/dc/dc/releases/42/assets'))
+  assert.match(posted.url, /name=frontend\.zip/)
+  assert.equal(posted.auth, 'token gitea-token')
+})
+
+test('gitea: --attach says so when the tag has no release', async (t) => {
+  const replacement = await stub(() => ({ status: 404, json: { message: 'Not Found' } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITEA_TOKEN = 'gitea-token'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v9.9.9', '--host', 'gitea', '--api-url', replacement.base,
+    '--repo', 'dc/dc', '--asset', 'frontend.zip'
+  )
+
+  assert.match(message, /no release for v9\.9\.9 in dc\/dc/)
+})
+
+test('gitlab: --attach is refused, since it has no upload to attach with', async (t) => {
+  const replacement = await stub(() => ({ json: {} }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITLAB_TOKEN = 'gitlab-token'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'gitlab', '--api-url', replacement.base,
+    '--repo', 'grp/app', '--asset', 'frontend.zip'
+  )
+
+  assert.match(message, /gitlab has no asset upload/)
+})
+
+test('--attach does not read a failed lookup as "no such release"', async (t) => {
+  // a token without access answers 404 as readily as a missing tag, and treating a
+  // server error as an answer would report a tag that has a release as having none
+  const replacement = await stub((request) =>
+    request.url.includes('/releases/tags/')
+      ? { status: 404, json: { message: 'Not Found' } }
+      : { status: 500, json: { message: 'boom' } }
+  )
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /500/)
+  assert.doesNotMatch(message, /no release for/)
+})
+
+test('--attach reports a failed tag lookup too, without dressing it as absence', async (t) => {
+  const replacement = await stub(() => ({ status: 500, json: { message: 'boom' } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /500/)
+  assert.doesNotMatch(message, /no release for/)
+})
+
+test('gitea: --attach reports a failed lookup rather than a missing release', async (t) => {
+  const replacement = await stub(() => ({ status: 500, json: { message: 'boom' } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITEA_TOKEN = 'gitea-token'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'gitea', '--api-url', replacement.base,
+    '--repo', 'dc/dc', '--asset', 'frontend.zip'
+  )
+
+  assert.match(message, /500/)
+  assert.doesNotMatch(message, /no release for/)
+})
+
+test('--attach with nothing to attach is refused', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = failure(cwd, '--attach', 'v1.8.0', '--host', 'github', '--repo', 'sasjs/app')
+
+  assert.match(message, /--attach names no assets/)
+})
+
+test('--attach --dry-run names the files and sends nothing', async (t) => {
+  const replacement = await stub(() => ({ json: { ok: true } }))
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = run(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip', '--dry-run'
+  )
+
+  assert.match(out, /would attach server\.json\.zip to v1\.8\.0/)
+  assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
+})
+
+test('a sasjsconfig that will not parse is a file with no release block', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${base}/upload{?name,label}` } }
+      : { json: { ok: true } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  mkdirSync(join(cwd, 'sasjs'), { recursive: true })
+  writeFileSync(join(cwd, 'sasjs', 'sasjsconfig.json'), '{ not json')
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--tag', '--host', 'github', '--release', '--api-url',
+    replacement.base, '--repo', 'sasjs/app')
+
+  // discovery asks whether it names assets; a file it cannot read is not a reason
+  // to fail a release that asked for none
+  assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
+})
+
+test('a config the caller named that will not parse is refused, quoting it', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'broken.json'), '{ not json')
+
+  const message = failure(cwd, '--host', 'github', '--release', '--config', 'broken.json')
+
+  assert.match(message, /broken\.json could not be read/)
+})
+
+test('an upload that fails for another reason is not swallowed', async (t) => {
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/')
+      ? { json: { upload_url: `${request.headers.host ? `http://${request.headers.host}` : ''}/upload{?name,label}` } }
+      : { status: 500, json: { message: 'boom' } }
+  )
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  // a 422 means the asset is attached already; a 500 means the release is not what
+  // the run believes it is, and saying "already attached" would hide that
+  assert.match(message, /500/)
+  assert.doesNotMatch(message, /already attached/)
+})
+
+test('a prerelease continues the one before it', () => {
+  const cwd = repo({ tag: 'v1.8.0-beta.1', commits: ['feat: initial', 'fix: one'] })
+
+  const out = run(cwd, '--prerelease', 'beta', '--dry-run')
+
+  // beta.2, not a second beta.1 and not 1.8.1-beta.1: the tag names a version that
+  // has not shipped, so it moves along rather than being replaced
+  assert.match(out, /v1\.8\.0-beta\.2/)
+})
+
+test('a prerelease that starts a new base names its first one', () => {
+  const cwd = repo({ tag: 'v1.7.1', commits: ['feat: initial', 'feat: one'] })
+
+  const out = run(cwd, '--prerelease', 'beta', '--dry-run')
+
+  // the base moves because a feature landed, so this is the first prerelease of it
+  assert.match(out, /v1\.8\.0-beta\.1/)
+})
+
+test('a create that is refused, with the lookup after it failing, reports the refusal', async (t) => {
+  let calls = 0
+  const replacement = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { status: 422, json: { message: 'already_exists' } }
+    calls += 1
+    // both lookups fail: the first is tolerated, the second must not turn the
+    // refusal to create into a 404 from a lookup
+    return { status: 500, json: { message: 'boom' } }
+  })
+  t.after(() => replacement.stop())
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--api-url', replacement.base,
+    '--repo', 'sasjs/app'
+  )
+
+  assert.match(message, /already_exists|422/)
+  assert.ok(calls >= 1)
+})
+
 test('a config that names no assets is refused, with the shapes it accepts', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'empty.json'), JSON.stringify({ plugins: [] }))
