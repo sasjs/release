@@ -50,6 +50,7 @@ Two things it does that the toolchain cannot:
 | `--api-url <url>` | host API base, for a self-hosted instance |
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
+| `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
 | `--sha <sha>` | commit to look for a tag at, with `--prepare-publish` (default: `HEAD`) |
@@ -180,6 +181,50 @@ release:
   variables:
     GIT_DEPTH: '0' # GitLab clones 20 commits deep by default
 ```
+
+### Assets
+
+`release.assets` in the project's `sasjs/sasjsconfig.json` names the files a release
+attaches:
+
+```json
+{
+  "release": {
+    "assets": [
+      { "path": "sasjsbuild/server.json.zip", "label": "SASjs Streamed App" },
+      { "path": "sasjsbuild/sas9.sas", "label": "SAS 9 EBI Deployment Program" }
+    ]
+  }
+}
+```
+
+`path` is relative to the repository root, `label` is what a reader sees on the
+release page, and the files are attached in the order given. That key sits beside
+the build that produces them, which is why a release job does not need a directory
+of copies: `sasjs cb -t sas9` names its output after the target's
+`deployScriptFilename`, and this says which name the release should carry it under.
+
+`--config <path>` reads the same list from another file, which may also be a bare
+array of paths.
+
+### Coming from `semantic-release`
+
+A `.releaserc` is still read - after `sasjsconfig.json`, never instead of it - so a
+repository can migrate one release at a time. The list is the same `{ path, label }`
+pairs, under a `plugins` entry:
+
+```json
+{ "plugins": [ ["@sasjs/release", { "assets": [ ... ] }] ] }
+```
+
+An entry still named `@semantic-release/github` is read too, and the run says to
+rename it. Moving the list into `sasjsconfig.json` is the end of the migration:
+after that the `.releaserc` is gone, and `semantic-release` plus its plugins can
+come out of `devDependencies`.
+
+What this will not do is write `CHANGELOG.md`: the release page is the changelog,
+generated from the commits the tag covers, so a repository that wants the file keeps
+generating it from the release notes.
 
 GitLab releases carry links rather than uploaded files, which is what `--asset-link` is for; the usual link is the job artifact of the build that just ran. GitLab does not accept `Authorization: Bearer`, so the token goes in `PRIVATE-TOKEN`, or in `JOB-TOKEN` when it is `$CI_JOB_TOKEN` - which needs no personal token at all. `--token-header` overrides the choice.
 
