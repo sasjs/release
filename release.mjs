@@ -852,6 +852,19 @@ async function publish({
         'attachment'
       )
     }
+    // the same read-back GitHub's cut does, for the same reason: an upload that
+    // answered 200 is not a release that holds the file, and a cut is the path that
+    // publishes without anyone looking
+    if (files.length)
+      await confirmAssets(
+        `${api}/repos/${repo}/releases/${release.id}/assets`,
+        { headers },
+        files,
+        (list) =>
+          new Map(
+            (Array.isArray(list) ? list : []).map((asset) => [asset.name, asset.size])
+          )
+      )
     if (body !== release.body) {
       await request(`${api}/repos/${repo}/releases/${release.id}`, {
         method: 'PATCH',

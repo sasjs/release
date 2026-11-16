@@ -1258,11 +1258,15 @@ test('gitlab refuses assets rather than releasing without them', () => {
 test('gitea: creates the release over the REST API and posts the asset', async (t) => {
   // the find-before-create step asks first: a stub that answers every request
   // with a release makes the tool believe one already exists
-  const replacement = await stub((request) =>
-    request.method === 'GET' && request.url.includes('/releases/tags/')
-      ? { status: 404, json: { message: 'Not Found' } }
-      : { json: { id: 42, body: 'x' } }
-  )
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && request.url.includes('/releases/tags/'))
+      return { status: 404, json: { message: 'Not Found' } }
+    // what the host holds after the upload: the cut reads it back before it is
+    // published, so the stub has to be a host rather than an echo
+    if (request.method === 'GET' && request.url === '/repos/dc/dc/releases/42/assets')
+      return { json: [{ name: 'frontend.zip', size: 3 }] }
+    return { json: { id: 42, body: 'x' } }
+  })
   t.after(() => replacement.stop())
   const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
   const asset = join(cwd, 'frontend.zip')
@@ -1280,6 +1284,29 @@ test('gitea: creates the release over the REST API and posts the asset', async (
   assert.match(posted.type, /^multipart\/form-data/)
   // the body is patched after creation, because gitea returns the body it stored
   assert.ok(replacement.seen.some((r) => r.method === 'PATCH'))
+})
+
+test('a gitea cut refuses a release that stored something other than the build', async (t) => {
+  // the gitea cut verified nothing either, and the reason confirmAssets exists is
+  // host-neutral: a release published with nothing attached
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && request.url.includes('/releases/tags/'))
+      return { status: 404, json: { message: 'Not Found' } }
+    if (request.method === 'GET' && request.url === '/repos/dc/dc/releases/42/assets')
+      return { json: [{ name: 'frontend.zip', size: 900 }] }
+    return { json: { id: 42, body: 'x' } }
+  })
+  t.after(() => replacement.stop())
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITEA_TOKEN = 'gitea-token'
+
+  const message = await failureInParallel(
+    cwd, '--host', 'gitea', '--release', '--api-url', replacement.base,
+    '--repo', 'dc/dc', '--asset', 'frontend.zip'
+  )
+
+  assert.match(message, /holds "frontend\.zip" at 900 bytes, where the file is 3 bytes/)
 })
 
 test('gitlab: creates the release and attaches links, which is all it has', async (t) => {
