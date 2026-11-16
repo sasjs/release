@@ -13,13 +13,20 @@ import { fileURLToPath } from 'node:url'
 const CLI =
   process.env.SASJS_RELEASE_ENTRY || fileURLToPath(new URL('../release.mjs', import.meta.url))
 
+// a CI runner sets these, and the tool reads them to decide where it is: cleared so a
+// case can opt in rather than inherit the build's own forge
+const CI_VARS = ['GITHUB_ACTIONS', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY', 'GITLAB_CI', 'CI_API_V4_URL']
+
 const envelope = {
   GIT_AUTHOR_NAME: 'test',
   GIT_AUTHOR_EMAIL: 'test@example.com',
   GIT_COMMITTER_NAME: 'test',
   GIT_COMMITTER_EMAIL: 'test@example.com',
   GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_SYSTEM: '/dev/null'
+  GIT_CONFIG_SYSTEM: '/dev/null',
+  // empty rather than deleted: execFile casts every value to a string, so an
+  // undefined would arrive as the word "undefined" and read as set
+  ...Object.fromEntries(CI_VARS.map((name) => [name, '']))
 }
 
 function git(cwd, ...argv) {
@@ -771,6 +778,72 @@ test('--attach fails when the release does not hold what the config names', asyn
   )
 
   assert.match(message, /holds 0 file\(s\) and is missing: server\.json\.zip/)
+})
+
+test('an explicit --host wins over what the environment says', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+
+  const out = execFileSync(
+    'node',
+    [CLI, '--repo-dir', cwd, '--show-context', '--host', 'gitea', '--api-url', 'https://elsewhere/api/v1'],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ...envelope,
+        GITHUB_ACTIONS: 'true',
+        GITHUB_SERVER_URL: 'https://github.com',
+        GITHUB_REPOSITORY: 'sasjs/macro-dash'
+      }
+    }
+  )
+
+  assert.match(out, /host=gitea api=https:\/\/elsewhere\/api\/v1/)
+})
+
+test('GITHUB_ACTIONS on github.com means github, with its own API', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+
+  const out = execFileSync('node', [CLI, '--repo-dir', cwd, '--show-context'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...envelope,
+      GITHUB_ACTIONS: 'true',
+      GITHUB_SERVER_URL: 'https://github.com',
+      GITHUB_REPOSITORY: 'sasjs/macro-dash'
+    }
+  })
+
+  assert.match(out, /host=github api=https:\/\/api\.github\.com repo=sasjs\/macro-dash/)
+})
+
+test('GITHUB_ACTIONS elsewhere means gitea, at that server', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+
+  const out = execFileSync('node', [CLI, '--repo-dir', cwd, '--show-context'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...envelope,
+      GITHUB_ACTIONS: 'true',
+      GITHUB_SERVER_URL: 'https://gitea.4gl.io',
+      GITHUB_REPOSITORY: '4gl/infra'
+    }
+  })
+
+  assert.match(out, /host=gitea api=https:\/\/gitea\.4gl\.io\/api\/v1 repo=4gl\/infra/)
+})
+
+test('GITLAB_CI means gitlab', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+
+  const out = execFileSync('node', [CLI, '--repo-dir', cwd, '--show-context'], {
+    encoding: 'utf8',
+    env: { ...process.env, ...envelope, GITLAB_CI: 'true', CI_API_V4_URL: 'https://gitlab.example/api/v4' }
+  })
+
+  assert.match(out, /host=gitlab api=https:\/\/gitlab\.example\/api\/v4/)
 })
 
 test('--attach with nothing to attach is refused', () => {
