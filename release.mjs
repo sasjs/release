@@ -696,6 +696,15 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
  * name at the wrong size, which is why the size is compared as well: every
  * artefact of a release is uploaded whole, so a difference means the download is
  * not the build.
+ *
+ * The local size is measured once per file, before the comparison: measuring it
+ * again inside the failure message would let a file removed mid-run throw ENOENT
+ * out of the error path instead of the sentence that path exists to write.
+ *
+ * A host that lists an asset without a size can only be checked by name, and that
+ * is said out loud rather than passed over: the size check is the guard against a
+ * body stored as the file, and a guard that decides to do nothing has to be
+ * visible or it is not a guard.
  */
 async function confirmAssets(url, options, files, heldOf) {
   const held = heldOf(await request(url, options))
@@ -707,18 +716,30 @@ async function confirmAssets(url, options, files, heldOf) {
         `it names ${files.map((file) => file.name).join(', ')}`
     )
 
-  const mislaid = files
-    .map((file) => ({ file, size: held.get(file.name) }))
-    .filter(({ file, size }) => typeof size === 'number' && size !== statSync(file.path).size)
+  const measured = files.map((file) => ({
+    file,
+    local: statSync(file.path).size,
+    reported: held.get(file.name)
+  }))
+
+  const unreported = measured.filter(({ reported }) => typeof reported !== 'number')
+
+  if (unreported.length)
+    console.log(
+      `the release states no size for: ${unreported.map(({ file }) => file.name).join(', ')} - ` +
+        `checked by name only, so a stored body would pass`
+    )
+
+  const mislaid = measured.filter(
+    ({ reported, local }) => typeof reported === 'number' && reported !== local
+  )
 
   if (mislaid.length)
     fail(
       mislaid
         .map(
-          ({ file, size }) =>
-            `the release holds "${file.name}" at ${size} bytes, where the file is ${
-              statSync(file.path).size
-            } bytes - the upload stored something other than the build`
+          ({ file, reported, local }) =>
+            `the release holds "${file.name}" at ${reported} bytes, where the file is ${local} bytes - the upload stored something other than the build`
         )
         .join('; ')
     )

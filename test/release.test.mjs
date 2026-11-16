@@ -673,6 +673,33 @@ test('a cut refuses a release that stored something other than the build', async
   assert.match(message, /holds "app\.zip" at 412 bytes, where the file is 3 bytes/)
 })
 
+test('--attach says so when the host reports no size, rather than trusting the name', async (t) => {
+  // a host that lists an asset without a size can only be checked by name, and a
+  // silent pass would be a guard that does nothing
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
+      return { json: { id: 9, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip' }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const output = await runInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(output, /the release states no size for: server\.json\.zip/)
+  assert.match(output, /1 file\(s\) on the release/)
+})
+
 test('--attach with no release for the tag is refused, naming it', async (t) => {
   const replacement = await stub(() => ({ status: 404, json: { message: 'Not Found' } }))
   t.after(() => replacement.stop())

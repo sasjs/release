@@ -109,6 +109,11 @@ const mutations = [
     name: 'an asset that holds something other than the build passes',
     find: `  if (mislaid.length)`,
     replace: `  if (false)`
+  },
+  {
+    name: 'an asset the host reports no size for is trusted silently',
+    find: `  if (unreported.length)`,
+    replace: `  if (false)`
   }
 ]
 
