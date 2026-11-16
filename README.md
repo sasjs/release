@@ -52,6 +52,7 @@ Two things it does that the toolchain cannot:
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
 | `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
+| `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
@@ -234,6 +235,11 @@ refused by name rather than reported as an empty upload.
 The cut is told which kind of release it is: `--no-assets` publishes the release with
 nothing attached, so a config naming files that do not exist yet is expected rather
 than a mistake. Without it, the same config refuses before anything is tagged.
+
+Cut that release with `--draft` and it takes neither its files nor its visibility
+until they exist: `--attach` uploads the list and then publishes the draft, so a
+release that fails to attach stays invisible instead of advertising a version whose
+downloads answer 404. `--keep-draft` leaves it drafted for a later step to publish.
 
 ### Coming from `semantic-release`
 
