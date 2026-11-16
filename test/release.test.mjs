@@ -532,7 +532,9 @@ test('--attach uploads the configured assets to a release that already exists', 
   let base = ''
   const replacement = await stub((request) => {
     if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
-      return { json: { upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+      return { json: { id: 9, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'macro-dash-server.json.zip' }] } }
     return { json: { ok: true } }
   })
   t.after(() => replacement.stop())
@@ -586,7 +588,11 @@ test('--attach with no release for the tag is refused, naming it', async (t) => 
 })
 
 test('gitea: --attach posts the asset to the release for the tag', async (t) => {
-  const replacement = await stub(() => ({ json: { id: 42 } }))
+  const replacement = await stub((request) =>
+    request.method === 'GET' && request.url === '/repos/dc/dc/releases/42/assets'
+      ? { json: [{ name: 'frontend.zip' }] }
+      : { json: { id: 42 } }
+  )
   t.after(() => replacement.stop())
 
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
@@ -690,6 +696,81 @@ test('gitea: --attach reports a failed lookup rather than a missing release', as
 
   assert.match(message, /500/)
   assert.doesNotMatch(message, /no release for/)
+})
+
+test('--attach publishes a draft once every file is on it', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/'))
+      return { json: { id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip' }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', 'server.json.zip')
+
+  // a drafted release is invisible, which is what keeps releases/latest/download
+  // from answering 404 while the artefacts are built - so attaching publishes it
+  const patched = replacement.seen.find((r) => r.method === 'PATCH' && r.url === '/repos/sasjs/app/releases/9')
+
+  assert.ok(patched)
+  assert.equal(JSON.parse(patched.body).draft, false)
+})
+
+test('--keep-draft leaves a drafted release alone', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/'))
+      return { json: { id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip' }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', 'server.json.zip', '--keep-draft')
+
+  assert.equal(replacement.seen.filter((r) => r.method === 'PATCH').length, 0)
+})
+
+test('--attach fails when the release does not hold what the config names', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/'))
+      return { json: { id: 9, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      // the upload answered success, and the release still holds nothing: this is
+      // the shape a release published with no files arrives in
+      return { json: { id: 9, assets: [] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /holds 0 file\(s\) and is missing: server\.json\.zip/)
 })
 
 test('--attach with nothing to attach is refused', () => {
@@ -826,6 +907,18 @@ test('a config that names no assets is refused, with the shapes it accepts', () 
   assert.match(message, /@sasjs\/release/)
 })
 
+test('--no-assets without --draft is refused, since the release would be public and empty', () => {
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  writeProjectConfig(cwd, { release: { assets: ['sasjsbuild/viya/viya.sas'] } })
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = failure(cwd, '--tag', '--host', 'github', '--release', '--no-assets')
+
+  assert.match(message, /--no-assets needs --draft/)
+  // and nothing was tagged on the way to finding out
+  assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
 test('--no-assets cuts the release with files that do not exist yet', async (t) => {
   let base = ''
   const replacement = await stub((request) =>
@@ -842,12 +935,13 @@ test('--no-assets cuts the release with files that do not exist yet', async (t) 
   process.env.GH_TOKEN = 'token-123'
 
   const out = await runInParallel(
-    cwd, '--tag', '--host', 'github', '--release', '--no-assets', '--api-url',
+    cwd, '--tag', '--host', 'github', '--release', '--no-assets', '--draft', '--api-url',
     replacement.base, '--repo', 'sasjs/app'
   )
 
-  // the release exists and nothing was attached: --attach is the run that uploads
-  assert.match(out, /--no-assets: publishing the release with no files/)
+  // the release exists as a draft and nothing was attached: --attach uploads the
+  // files and then publishes it
+  assert.match(out, /released=true/)
   assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
 })
 

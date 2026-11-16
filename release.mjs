@@ -32,6 +32,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --tag-prefix <p>       prefix before the version in the tag (default: v)
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
+  --keep-draft           leave the release a draft after attaching, instead of
+                         publishing it
   --no-assets            cut the release without attaching anything: the files are
                          built from the tag and attached afterwards with --attach
   --attach <tag>         upload the configured assets to a release that already
@@ -78,7 +80,7 @@ const HELP = `sasjs-release - releases from conventional commits
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
-  'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'keep-draft', 'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
 ])
@@ -580,7 +582,14 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       }`
       await uploadOnce(`${url}${named}`, headers, file.path, 'file')
     }
-    return release
+    const published = await publishDraft(base, repo, release, headers)
+    await confirmAssets(
+      `${base}/repos/${repo}/releases/${release.id}`,
+      { headers },
+      files,
+      (body) => (body.assets || []).map((asset) => asset.name)
+    )
+    return published
   }
 
   if (host === 'gitea') {
@@ -600,12 +609,57 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
         'attachment'
       )
     }
-    return release
+    const published = await publishDraft(`${api}/repos/${repo}/releases`, '', release, headers)
+    await confirmAssets(
+      `${api}/repos/${repo}/releases/${release.id}/assets`,
+      { headers },
+      files,
+      (list) => (Array.isArray(list) ? list : []).map((asset) => asset.name)
+    )
+    return published
   }
 
   return fail(
     '--host gitlab has no asset upload: attach the build with --asset-link name=url instead'
   )
+}
+
+/**
+ * Read the release back and check it carries what the config names.
+ *
+ * An upload that returned success is not the same as a release that has the file:
+ * the name is a query parameter, the response is not inspected, and a release was
+ * published with nothing attached because the process looking for the files was
+ * pointed at a folder they were not in. The forge holds the answer, so ask it.
+ */
+async function confirmAssets(url, options, files, namesOf) {
+  const body = await request(url, options)
+  const held = new Set(namesOf(body))
+  const missing = files.filter((file) => !held.has(file.name)).map((file) => file.name)
+
+  if (missing.length)
+    fail(
+      `the release holds ${held.size} file(s) and is missing: ${missing.join(', ')} - ` +
+        `it names ${files.map((file) => file.name).join(', ')}`
+    )
+
+  console.log(`${files.length} file(s) on the release: ${files.map((f) => f.name).join(', ')}`)
+}
+
+/**
+ * Make a drafted release visible once everything it names is on it.
+ *
+ * A release cut with `--draft` is invisible until something publishes it, which is
+ * what keeps `releases/latest/download/<file>` from answering 404 for as long as the
+ * attach takes - or forever, if the attach fails. Attaching is what completes that
+ * shape, so attaching publishes, unless the caller says to leave it drafted.
+ */
+async function publishDraft(base, repo, release, headers) {
+  if (!release?.draft || flag('keep-draft')) return release
+
+  const url = repo ? `${base}/repos/${repo}/releases/${release.id}` : `${base}/${release.id}`
+  console.log(`publishing ${release.tag_name}: every file it names is attached`)
+  return request(url, { method: 'PATCH', headers, json: { draft: false } })
 }
 
 async function publish({
@@ -1040,8 +1094,14 @@ async function main() {
       ]
     : []
 
-  if (flag('no-assets') && flag('release'))
-    console.log('--no-assets: publishing the release with no files, to be attached later')
+  // A release that names files and is published before they exist is one whose
+  // download links answer 404 until - or unless - an attach finishes. That is only
+  // survivable as a draft, which is invisible until the attach publishes it.
+  if (flag('no-assets') && flag('release') && !flag('draft'))
+    fail(
+      '--no-assets needs --draft: a release published before its files exist is one ' +
+        'whose download links answer 404 until an attach finishes'
+    )
 
   if (dry) {
     console.log('--dry-run: nothing tagged, nothing sent')
