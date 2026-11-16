@@ -97,6 +97,23 @@ const mutations = [
     name: 'a lookup that fails replaces the refusal that caused it',
     find: `    const existing = await find().catch(() => null)`,
     replace: `    const existing = await find()`
+  },
+  {
+    name: 'the github upload sends the envelope again',
+    find: `  if (!field)
+    return request(url, {`,
+    replace: `  if (false)
+    return request(url, {`
+  },
+  {
+    name: 'an asset that holds something other than the build passes',
+    find: `  if (mislaid.length)`,
+    replace: `  if (false)`
+  },
+  {
+    name: 'an asset the host reports no size for is trusted silently',
+    find: `  if (unreported.length)`,
+    replace: `  if (false)`
   }
 ]
 

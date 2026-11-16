@@ -229,10 +229,17 @@ test('--dry-run writes no tag and no file', () => {
 /** A server that records what was sent, so the adapter shape is asserted. */
 async function stub(respond) {
   const seen = []
+  // what a real host holds after an upload: an asset under the name in the query,
+  // as long as the bytes it was sent. A raw-body upload IS the file, so its length
+  // is the asset's size - which is what the read-back compares.
+  const held = new Map()
+
   const server = http.createServer((request, response) => {
     const chunks = []
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
+      const body = Buffer.concat(chunks)
+
       seen.push({
         method: request.method,
         url: request.url,
@@ -240,9 +247,38 @@ async function stub(respond) {
         privateToken: request.headers['private-token'],
         jobToken: request.headers['job-token'],
         type: request.headers['content-type'],
-        body: Buffer.concat(chunks).toString()
+        body: body.toString()
       })
-      const { status = 200, json = {} } = respond(request) || {}
+
+      if (
+        request.method === 'POST' &&
+        /^\/upload\?name=/.test(request.url) &&
+        request.headers['content-type'] === 'application/octet-stream'
+      )
+        held.set(decodeURIComponent(request.url.slice('/upload?name='.length).split('&')[0]), body.length)
+
+      // a release read answers with what this host was sent, the way a real one
+      // does - unless the test says what it holds, which is how a host that
+      // stored something other than the file is simulated
+      const releaseRead =
+        request.method === 'GET' &&
+        /\/releases\/(?!tags\/)[^/]+$/.test(request.url) &&
+        !/\/assets$/.test(request.url)
+
+      const answered = respond(request) || {}
+
+      const holdsNothing = !('assets' in (answered.json || {}))
+
+      const { status = 200, json = {} } =
+        releaseRead && held.size && holdsNothing
+          ? {
+              json: {
+                id: 1,
+                assets: [...held].map(([name, size]) => ({ name, size }))
+              }
+            }
+          : answered
+
       // no keep-alive: the suite has to end when the last test does, and a
       // socket left open by a client makes node:test wait for it
       response.writeHead(status, {
@@ -295,7 +331,11 @@ test('github: creates the release and uploads each asset to its upload_url', asy
 
   // the {?name,label} template must be stripped before it is used
   const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=app.zip'))
-  assert.match(upload.type, /^multipart\/form-data/)
+  // GitHub reads the asset itself as the request body. A multipart body is stored
+  // verbatim, which is how a release came to carry files beginning
+  // `------formdata-undici-...` instead of the builds they were named for.
+  assert.match(upload.type, /^application\/octet-stream/)
+  assert.equal(upload.body, 'zip')
 })
 
 test('sasjsconfig.json\'s release block names the assets, with no flag at all', async (t) => {
@@ -576,6 +616,88 @@ test('--attach uploads the configured assets to a release that already exists', 
   assert.match(upload.url, /name=macro-dash-server\.json\.zip/)
   // and it cuts nothing: no tag is made or asked for
   assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
+test('--attach refuses a release that holds the right name at the wrong size', async (t) => {
+  // what a host stores when it was sent the envelope rather than the file: the
+  // asset is listed under the build's name, at the envelope's length - so the
+  // name check passes and every download of the build is corrupt
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
+      return { json: { id: 9, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip', size: 63_850 }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /holds "server\.json\.zip" at 63850 bytes, where the file is 3 bytes/)
+  assert.match(message, /stored something other than the build/)
+})
+
+test('a cut refuses a release that stored something other than the build', async (t) => {
+  // the cut is the path that published such releases: every upload answered 201,
+  // and nothing read the release back afterwards
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 7, upload_url: `${base}/upload{?name,label}` } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/7')
+      return { json: { id: 7, assets: [{ name: 'app.zip', size: 412 }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', asset
+  )
+
+  assert.match(message, /holds "app\.zip" at 412 bytes, where the file is 3 bytes/)
+})
+
+test('--attach says so when the host reports no size, rather than trusting the name', async (t) => {
+  // a host that lists an asset without a size can only be checked by name, and a
+  // silent pass would be a guard that does nothing
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
+      return { json: { id: 9, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip' }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const output = await runInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(output, /the release states no size for: server\.json\.zip/)
+  assert.match(output, /1 file\(s\) on the release/)
 })
 
 test('--attach with no release for the tag is refused, naming it', async (t) => {
@@ -1136,11 +1258,15 @@ test('gitlab refuses assets rather than releasing without them', () => {
 test('gitea: creates the release over the REST API and posts the asset', async (t) => {
   // the find-before-create step asks first: a stub that answers every request
   // with a release makes the tool believe one already exists
-  const replacement = await stub((request) =>
-    request.method === 'GET' && request.url.includes('/releases/tags/')
-      ? { status: 404, json: { message: 'Not Found' } }
-      : { json: { id: 42, body: 'x' } }
-  )
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && request.url.includes('/releases/tags/'))
+      return { status: 404, json: { message: 'Not Found' } }
+    // what the host holds after the upload: the cut reads it back before it is
+    // published, so the stub has to be a host rather than an echo
+    if (request.method === 'GET' && request.url === '/repos/dc/dc/releases/42/assets')
+      return { json: [{ name: 'frontend.zip', size: 3 }] }
+    return { json: { id: 42, body: 'x' } }
+  })
   t.after(() => replacement.stop())
   const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
   const asset = join(cwd, 'frontend.zip')
@@ -1158,6 +1284,29 @@ test('gitea: creates the release over the REST API and posts the asset', async (
   assert.match(posted.type, /^multipart\/form-data/)
   // the body is patched after creation, because gitea returns the body it stored
   assert.ok(replacement.seen.some((r) => r.method === 'PATCH'))
+})
+
+test('a gitea cut refuses a release that stored something other than the build', async (t) => {
+  // the gitea cut verified nothing either, and the reason confirmAssets exists is
+  // host-neutral: a release published with nothing attached
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && request.url.includes('/releases/tags/'))
+      return { status: 404, json: { message: 'Not Found' } }
+    if (request.method === 'GET' && request.url === '/repos/dc/dc/releases/42/assets')
+      return { json: [{ name: 'frontend.zip', size: 900 }] }
+    return { json: { id: 42, body: 'x' } }
+  })
+  t.after(() => replacement.stop())
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  writeFileSync(join(cwd, 'frontend.zip'), 'zip')
+  process.env.GITEA_TOKEN = 'gitea-token'
+
+  const message = await failureInParallel(
+    cwd, '--host', 'gitea', '--release', '--api-url', replacement.base,
+    '--repo', 'dc/dc', '--asset', 'frontend.zip'
+  )
+
+  assert.match(message, /holds "frontend\.zip" at 900 bytes, where the file is 3 bytes/)
 })
 
 test('gitlab: creates the release and attaches links, which is all it has', async (t) => {
