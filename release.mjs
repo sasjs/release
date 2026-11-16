@@ -32,6 +32,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --tag-prefix <p>       prefix before the version in the tag (default: v)
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
+  --keep-draft           leave the release a draft after attaching, instead of
+                         publishing it
   --no-assets            cut the release without attaching anything: the files are
                          built from the tag and attached afterwards with --attach
   --attach <tag>         upload the configured assets to a release that already
@@ -78,7 +80,7 @@ const HELP = `sasjs-release - releases from conventional commits
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
-  'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'keep-draft', 'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
 ])
@@ -580,7 +582,7 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       }`
       await uploadOnce(`${url}${named}`, headers, file.path, 'file')
     }
-    return release
+    return publishDraft(base, repo, release, headers)
   }
 
   if (host === 'gitea') {
@@ -600,12 +602,28 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
         'attachment'
       )
     }
-    return release
+    return publishDraft(`${api}/repos/${repo}/releases`, '', release, headers)
   }
 
   return fail(
     '--host gitlab has no asset upload: attach the build with --asset-link name=url instead'
   )
+}
+
+/**
+ * Make a drafted release visible once everything it names is on it.
+ *
+ * A release cut with `--draft` is invisible until something publishes it, which is
+ * what keeps `releases/latest/download/<file>` from answering 404 for as long as the
+ * attach takes - or forever, if the attach fails. Attaching is what completes that
+ * shape, so attaching publishes, unless the caller says to leave it drafted.
+ */
+async function publishDraft(base, repo, release, headers) {
+  if (!release?.draft || flag('keep-draft')) return release
+
+  const url = repo ? `${base}/repos/${repo}/releases/${release.id}` : `${base}/${release.id}`
+  console.log(`publishing ${release.tag_name}: every file it names is attached`)
+  return request(url, { method: 'PATCH', headers, json: { draft: false } })
 }
 
 async function publish({

@@ -692,6 +692,51 @@ test('gitea: --attach reports a failed lookup rather than a missing release', as
   assert.doesNotMatch(message, /no release for/)
 })
 
+test('--attach publishes a draft once every file is on it', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/'))
+      return { json: { id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', 'server.json.zip')
+
+  // a drafted release is invisible, which is what keeps releases/latest/download
+  // from answering 404 while the artefacts are built - so attaching publishes it
+  const patched = replacement.seen.find((r) => r.method === 'PATCH' && r.url === '/repos/sasjs/app/releases/9')
+
+  assert.ok(patched)
+  assert.equal(JSON.parse(patched.body).draft, false)
+})
+
+test('--keep-draft leaves a drafted release alone', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/'))
+      return { json: { id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url',
+    replacement.base, '--repo', 'sasjs/app', '--asset', 'server.json.zip', '--keep-draft')
+
+  assert.equal(replacement.seen.filter((r) => r.method === 'PATCH').length, 0)
+})
+
 test('--attach with nothing to attach is refused', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   process.env.GH_TOKEN = 'token-123'
