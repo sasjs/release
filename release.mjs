@@ -32,6 +32,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --tag-prefix <p>       prefix before the version in the tag (default: v)
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
+  --no-assets            cut the release without attaching anything: the files are
+                         built from the tag and attached afterwards with --attach
   --attach <tag>         upload the configured assets to a release that already
                          exists, and nothing else: for artefacts built after the
                          tag, with the version stamped into them
@@ -76,7 +78,7 @@ const HELP = `sasjs-release - releases from conventional commits
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
-  'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
 ])
@@ -1026,12 +1028,20 @@ async function main() {
   // naming nothing when the caller asked for it by name - is a mistake in the
   // repository, and refusing after the tag has been pushed leaves a release that has
   // to be explained. It needs no token and no network, so a dry run checks it too.
+  // The config's list says what a release publishes, not necessarily what exists
+  // now: an artefact built from the tag cannot be uploaded at the moment the tag is
+  // made, and `--attach` is the run that uploads it. `--no-assets` is the caller
+  // saying which kind of release this is, so an absent file is expected rather than
+  // a mistake.
   const files = flag('release')
     ? [
         ...args('asset').map((path) => assetOf(path, undefined, cwd)),
-        ...configAssets(cwd)
+        ...(flag('no-assets') ? [] : configAssets(cwd))
       ]
     : []
+
+  if (flag('no-assets') && flag('release'))
+    console.log('--no-assets: publishing the release with no files, to be attached later')
 
   if (dry) {
     console.log('--dry-run: nothing tagged, nothing sent')

@@ -51,6 +51,7 @@ Two things it does that the toolchain cannot:
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
 | `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
+| `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
@@ -229,6 +230,10 @@ tagged, and the same `release.assets` list goes to the release that exists.
 
 `--dry-run` names the files without sending them, and a tag with no release is
 refused by name rather than reported as an empty upload.
+
+The cut is told which kind of release it is: `--no-assets` publishes the release with
+nothing attached, so a config naming files that do not exist yet is expected rather
+than a mistake. Without it, the same config refuses before anything is tagged.
 
 ### Coming from `semantic-release`
 
