@@ -232,14 +232,16 @@ tagged, and the same `release.assets` list goes to the release that exists.
 `--dry-run` names the files without sending them, and a tag with no release is
 refused by name rather than reported as an empty upload.
 
-The cut is told which kind of release it is: `--no-assets` publishes the release with
-nothing attached, so a config naming files that do not exist yet is expected rather
-than a mistake. Without it, the same config refuses before anything is tagged.
+The cut is told which kind of release it is: `--no-assets` cuts one whose files are not
+on disk yet, so a config naming them is expected rather than a mistake. Without it,
+the same config refuses before anything is tagged. `--no-assets` requires `--draft`,
+because a release published before its files exist is one whose download links answer
+404 until an attach finishes.
 
-Cut that release with `--draft` and it takes neither its files nor its visibility
-until they exist: `--attach` uploads the list and then publishes the draft, so a
-release that fails to attach stays invisible instead of advertising a version whose
-downloads answer 404. `--keep-draft` leaves it drafted for a later step to publish.
+`--attach` uploads the list, reads the release back to check it holds what the config
+names, and then publishes the draft - so a release that fails to attach stays
+invisible instead of advertising downloads that answer 404. `--keep-draft` leaves it
+drafted for a later step to publish.
 
 ### Coming from `semantic-release`
 

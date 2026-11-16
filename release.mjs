@@ -582,6 +582,15 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       }`
       await uploadOnce(`${url}${named}`, headers, file.path, 'file')
     }
+    // Verified before it is published: a release that is visible because an upload
+    // returned 200, but does not hold the files it names, is the failure this checks
+    // for - so the check comes first and the draft stays invisible if it fails.
+    await confirmAssets(
+      `${base}/repos/${repo}/releases/${release.id}`,
+      { headers },
+      files,
+      (body) => (body.assets || []).map((asset) => asset.name)
+    )
     return publishDraft(base, repo, release, headers)
   }
 
@@ -602,12 +611,40 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
         'attachment'
       )
     }
+    await confirmAssets(
+      `${api}/repos/${repo}/releases/${release.id}/assets`,
+      { headers },
+      files,
+      (list) => (Array.isArray(list) ? list : []).map((asset) => asset.name)
+    )
     return publishDraft(`${api}/repos/${repo}/releases`, '', release, headers)
   }
 
   return fail(
     '--host gitlab has no asset upload: attach the build with --asset-link name=url instead'
   )
+}
+
+/**
+ * Read the release back and check it carries what the config names.
+ *
+ * An upload that returned success is not the same as a release that has the file:
+ * the name is a query parameter, the response is not inspected, and a release was
+ * published with nothing attached because the process looking for the files was
+ * pointed at a folder they were not in. The forge holds the answer, so ask it.
+ */
+async function confirmAssets(url, options, files, namesOf) {
+  const body = await request(url, options)
+  const held = new Set(namesOf(body))
+  const missing = files.filter((file) => !held.has(file.name)).map((file) => file.name)
+
+  if (missing.length)
+    fail(
+      `the release holds ${held.size} file(s) and is missing: ${missing.join(', ')} - ` +
+        `it names ${files.map((file) => file.name).join(', ')}`
+    )
+
+  console.log(`${files.length} file(s) on the release: ${files.map((f) => f.name).join(', ')}`)
 }
 
 /**
@@ -1058,8 +1095,14 @@ async function main() {
       ]
     : []
 
-  if (flag('no-assets') && flag('release'))
-    console.log('--no-assets: publishing the release with no files, to be attached later')
+  // A release that names files and is published before they exist is one whose
+  // download links answer 404 until - or unless - an attach finishes. That is only
+  // survivable as a draft, which is invisible until the attach publishes it.
+  if (flag('no-assets') && flag('release') && !flag('draft'))
+    fail(
+      '--no-assets needs --draft: a release published before its files exist is one ' +
+        'whose download links answer 404 until an attach finishes'
+    )
 
   if (dry) {
     console.log('--dry-run: nothing tagged, nothing sent')
