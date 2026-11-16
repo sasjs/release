@@ -32,6 +32,9 @@ const HELP = `sasjs-release - releases from conventional commits
   --tag-prefix <p>       prefix before the version in the tag (default: v)
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
+  --attach <tag>         upload the configured assets to a release that already
+                         exists, and nothing else: for artefacts built after the
+                         tag, with the version stamped into them
   --level <l>            force patch|minor|major instead of classifying
   --prepare-publish      resolve and gate a publish, stamp the version, ask the
                          registry; writes no tag and creates no release
@@ -71,7 +74,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // which is how a dropped `--draft` would publish a release before its assets
 // exist rather than failing.
 const known = new Set([
-  'api-url', 'asset', 'asset-link', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
+  'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
@@ -322,7 +325,14 @@ async function findRelease(base, repo, tag, headers) {
   })
   if (byTag) return byTag
 
-  const releases = await request(`${base}/repos/${repo}/releases?per_page=100`, { headers })
+  // a repository with releases disabled answers 404 to the listing as well, and
+  // that is still "no release for this tag" rather than a failure to ask
+  const releases = await request(`${base}/repos/${repo}/releases?per_page=100`, {
+    headers
+  }).catch((error) => {
+    if (error.status === 404) return []
+    throw error
+  })
   return (Array.isArray(releases) ? releases : []).find((release) => release.tag_name === tag) || null
 }
 
@@ -546,6 +556,56 @@ const HOSTS = {
  * no asset upload at all - a release carries links, which is why --asset-link
  * exists.
  */
+/**
+ * Attach the configured assets to a release that already exists.
+ *
+ * The artefacts of a release are sometimes built after the tag - a version
+ * stamped into them, so they cannot be passed at the moment the release is cut -
+ * and this is the second half of that: the same list, uploaded to the tag that
+ * has already been made.
+ */
+async function attachAssets({ host, api, token, header, repo, tag, files }) {
+  const headers = authHeaders(host, token, header)
+
+  if (host === 'github') {
+    const base = api || HOSTS.github.api
+    const release = await findRelease(base, repo, tag, headers)
+    if (!release) fail(`no release for ${tag} in ${repo}`)
+    const url = String(release.upload_url).replace(/\{.*$/, '')
+    for (const file of files) {
+      const named = `?name=${encodeURIComponent(file.name)}${
+        file.label ? `&label=${encodeURIComponent(file.label)}` : ''
+      }`
+      await uploadOnce(`${url}${named}`, headers, file.path, 'file')
+    }
+    return release
+  }
+
+  if (host === 'gitea') {
+    if (!api) fail('--host gitea needs --api-url (https://your-host/api/v1)')
+    const release = await request(
+      `${api}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`,
+      { headers }
+    ).catch((error) => {
+      if (error.status === 404) fail(`no release for ${tag} in ${repo}`)
+      throw error
+    })
+    for (const file of files) {
+      await uploadOnce(
+        `${api}/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(file.name)}`,
+        headers,
+        file.path,
+        'attachment'
+      )
+    }
+    return release
+  }
+
+  return fail(
+    '--host gitlab has no asset upload: attach the build with --asset-link name=url instead'
+  )
+}
+
 async function publish({
   host,
   api,
@@ -839,6 +899,45 @@ async function main() {
 
   if (forcedLevel && !(forcedLevel in LEVELS)) fail('--level must be patch, minor or major')
   if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
+
+  // Attaching says nothing about commits: the tag exists, the files exist, and the
+  // run has no business classifying or cutting anything.
+  const attachTag = arg('attach')
+
+  if (attachTag) {
+    if (host === 'none') fail('--attach needs --host')
+    const tokenEnv = arg('token-env', HOSTS[host].token)
+    const token = process.env[tokenEnv]
+    if (!token) fail(`no token: set ${tokenEnv}`)
+
+    const remote = remoteUrl(cwd)
+    const repo = arg('repo') || (remote.match(/https:\/\/[^/]+\/(.+)$/) || [])[1] || ''
+    const files = [
+      ...args('asset').map((path) => assetOf(path, undefined, cwd)),
+      ...configAssets(cwd)
+    ]
+
+    if (!files.length)
+      fail('--attach names no assets: give --asset, or a release block in the config')
+
+    if (dry) {
+      for (const file of files) console.log(`would attach ${file.name} to ${attachTag}`)
+      output({ released: false, tag: attachTag })
+      return
+    }
+
+    await attachAssets({
+      host,
+      api: arg('api-url'),
+      token,
+      header: arg('token-header'),
+      repo,
+      tag: attachTag,
+      files
+    })
+    output({ released: true, tag: attachTag, version: stable(attachTag.replace(new RegExp(`^${arg('tag-prefix', 'v')}`), '')) })
+    return
+  }
 
   const since = arg('since')
   // an unresolvable --since used to read as "nothing to release", which is the
