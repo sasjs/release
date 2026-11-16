@@ -1112,6 +1112,16 @@ async function main() {
 
   const notesFile = arg('notes-file')
   if (notesFile) writeFileSync(notesFile, `${body}\n`)
+
+  // Checked before anything claims a release happened: `released=true` in the output
+  // file is what the calling workflow believes, and a run that then dies on a missing
+  // `--host` has told it the opposite of the truth.
+  if (flag('release')) {
+    if (host === 'none') fail('--release needs --host')
+    const tokenEnv = arg('token-env', HOSTS[host].token)
+    if (!process.env[tokenEnv]) fail(`no token: set ${tokenEnv}`)
+  }
+
   output({ released: true, version, tag, level })
 
   if (flag('tag')) {
@@ -1133,9 +1143,7 @@ async function main() {
   if (flag('push-tag')) git(cwd, 'push', 'origin', tag)
 
   if (flag('release')) {
-    if (host === 'none') fail('--release needs --host')
     const token = process.env[arg('token-env', HOSTS[host].token)]
-    if (!token) fail(`no token: set ${arg('token-env', HOSTS[host].token)}`)
     const links = args('asset-link').map((pair) => {
       const at = pair.indexOf('=')
       if (at === -1) fail('--asset-link needs name=url')
