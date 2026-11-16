@@ -216,6 +216,20 @@ The files are attached in the order given.
 `--config <path>` reads the same list from another file, which may also be a bare
 array of paths.
 
+### Where a run is publishing
+
+A release in CI does not have to be told which forge it is on. `GITLAB_CI`, or
+`GITHUB_ACTIONS` together with `GITHUB_SERVER_URL`, names it - and `GITHUB_REPOSITORY`
+names the repository, so `--host` and `--repo` are only for a run outside CI, or for
+overriding what the environment says.
+
+    $ GITHUB_ACTIONS=true GITHUB_REPOSITORY=sasjs/macro-dash sasjs-release --show-context
+    host=github api=https://api.github.com repo=sasjs/macro-dash
+
+A `GITHUB_SERVER_URL` that is not github.com means gitea, at `<server>/api/v1`. The
+token is the variable named for the host (`GH_TOKEN` for github), falling back to
+`GITHUB_TOKEN`, which every Actions run already has.
+
 ### Attaching after the release
 
 An artefact sometimes cannot exist when the release is cut - macro-dash stamps the

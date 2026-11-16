@@ -32,6 +32,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --tag-prefix <p>       prefix before the version in the tag (default: v)
   --since <ref>          count commits after this ref (default: newest prefixed tag)
   --paths <a,b>          only commits touching these paths (monorepos)
+  --show-context         print the host, API and repository this run would use, and
+                         stop - useful when the environment decides them
   --keep-draft           leave the release a draft after attaching, instead of
                          publishing it
   --no-assets            cut the release without attaching anything: the files are
@@ -80,7 +82,7 @@ const HELP = `sasjs-release - releases from conventional commits
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
-  'keep-draft', 'no-assets', 'push-tag', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
+  'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
 ])
@@ -538,6 +540,43 @@ const DEFAULT_PROJECT_CONFIG = join('sasjs', 'sasjsconfig.json')
 /** Read in this order when no flag names a config: the project's, then the migration's. */
 const DEFAULT_CONFIGS = [DEFAULT_PROJECT_CONFIG, '.releaserc', '.releaserc.json']
 
+/**
+ * Where this run is, when the environment already knows.
+ *
+ * A release in CI has no business asking which forge it is on: GITLAB_CI, or
+ * GITHUB_ACTIONS with the server URL it was given, names it - along with the
+ * repository and the token that are already in the environment. Asking a workflow to
+ * repeat them is how a cut ends up dying on `--release needs --host` while the answer
+ * was two variables away.
+ */
+function detectContext() {
+  if (process.env.GITLAB_CI) return { host: 'gitlab', api: process.env.CI_API_V4_URL }
+
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    const server = (process.env.GITHUB_SERVER_URL || 'https://github.com').replace(/\/$/, '')
+
+    // gitea runs Actions too, and says so with its own server URL
+    return server === 'https://github.com'
+      ? { host: 'github', api: 'https://api.github.com' }
+      : { host: 'gitea', api: `${server}/api/v1` }
+  }
+
+  return { host: 'none' }
+}
+
+/**
+ * The token for a host: the variable named for it, or the one every Actions run
+ * already has. GH_TOKEN is the convention here, but a workflow that forgets it still
+ * carries GITHUB_TOKEN, and refusing on that would be pedantry.
+ */
+function tokenFor(host, name) {
+  const env = name || HOSTS[host].token
+  return process.env[env] || (host === 'github' ? process.env.GITHUB_TOKEN || '' : '')
+}
+
+/** The repository the run is releasing, when CI names it. */
+const detectRepo = () => process.env.GITHUB_REPOSITORY || ''
+
 const HOSTS = {
   github: {
     api: 'https://api.github.com',
@@ -949,13 +988,23 @@ async function main() {
   const cwd = arg('repo-dir', process.cwd())
   const prefix = arg('tag-prefix', 'v')
   const dry = flag('dry-run')
-  const host = arg('host', 'none')
+  const context = detectContext()
+  const api = arg('api-url', context.api || '')
+  const inferredHost = Boolean(arg('host')) === false && context.host !== 'none'
+  const host = arg('host', context.host)
   const prerelease = arg('prerelease')
   const forcedLevel = arg('level')
   const paths = arg('paths') ? arg('paths').split(',').filter(Boolean) : []
 
   if (forcedLevel && !(forcedLevel in LEVELS)) fail('--level must be patch, minor or major')
   if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
+  if (inferredHost) console.log(`host: ${host}, from the environment`)
+  if (flag('show-context')) {
+    console.log(
+      `host=${host} api=${arg('api-url', context.api || '')} repo=${arg('repo', detectRepo()) || '(from the remote)'}`
+    )
+    return
+  }
 
   // Attaching says nothing about commits: the tag exists, the files exist, and the
   // run has no business classifying or cutting anything.
@@ -963,12 +1012,11 @@ async function main() {
 
   if (attachTag) {
     if (host === 'none') fail('--attach needs --host')
-    const tokenEnv = arg('token-env', HOSTS[host].token)
-    const token = process.env[tokenEnv]
-    if (!token) fail(`no token: set ${tokenEnv}`)
+    const token = tokenFor(host, arg('token-env'))
+    if (!token) fail(`no token: set ${arg('token-env', HOSTS[host].token)}`)
 
     const remote = remoteUrl(cwd)
-    const repo = arg('repo') || (remote.match(/https:\/\/[^/]+\/(.+)$/) || [])[1] || ''
+    const repo = arg('repo') || detectRepo() || (remote.match(/https:\/\/[^/]+\/(.+)$/) || [])[1] || ''
     const files = [
       ...args('asset').map((path) => assetOf(path, undefined, cwd)),
       ...configAssets(cwd)
@@ -985,7 +1033,7 @@ async function main() {
 
     await attachAssets({
       host,
-      api: arg('api-url'),
+      api,
       token,
       header: arg('token-header'),
       repo,
@@ -1119,7 +1167,7 @@ async function main() {
   if (flag('release')) {
     if (host === 'none') fail('--release needs --host')
     const tokenEnv = arg('token-env', HOSTS[host].token)
-    if (!process.env[tokenEnv]) fail(`no token: set ${tokenEnv}`)
+    if (!tokenFor(host, tokenEnv)) fail(`no token: set ${tokenEnv}`)
   }
 
   output({ released: true, version, tag, level })
@@ -1143,7 +1191,9 @@ async function main() {
   if (flag('push-tag')) git(cwd, 'push', 'origin', tag)
 
   if (flag('release')) {
-    const token = process.env[arg('token-env', HOSTS[host].token)]
+    // host and token were checked before the output claimed a release, so this only
+    // needs the value
+    const token = tokenFor(host, arg('token-env'))
     const links = args('asset-link').map((pair) => {
       const at = pair.indexOf('=')
       if (at === -1) fail('--asset-link needs name=url')
@@ -1151,7 +1201,7 @@ async function main() {
     })
     await publish({
       host,
-      api: arg('api-url'),
+      api,
       token,
       header: arg('token-header'),
       repo,
