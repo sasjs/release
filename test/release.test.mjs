@@ -229,10 +229,17 @@ test('--dry-run writes no tag and no file', () => {
 /** A server that records what was sent, so the adapter shape is asserted. */
 async function stub(respond) {
   const seen = []
+  // what a real host holds after an upload: an asset under the name in the query,
+  // as long as the bytes it was sent. A raw-body upload IS the file, so its length
+  // is the asset's size - which is what the read-back compares.
+  const held = new Map()
+
   const server = http.createServer((request, response) => {
     const chunks = []
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
+      const body = Buffer.concat(chunks)
+
       seen.push({
         method: request.method,
         url: request.url,
@@ -240,9 +247,38 @@ async function stub(respond) {
         privateToken: request.headers['private-token'],
         jobToken: request.headers['job-token'],
         type: request.headers['content-type'],
-        body: Buffer.concat(chunks).toString()
+        body: body.toString()
       })
-      const { status = 200, json = {} } = respond(request) || {}
+
+      if (
+        request.method === 'POST' &&
+        /^\/upload\?name=/.test(request.url) &&
+        request.headers['content-type'] === 'application/octet-stream'
+      )
+        held.set(decodeURIComponent(request.url.slice('/upload?name='.length).split('&')[0]), body.length)
+
+      // a release read answers with what this host was sent, the way a real one
+      // does - unless the test says what it holds, which is how a host that
+      // stored something other than the file is simulated
+      const releaseRead =
+        request.method === 'GET' &&
+        /\/releases\/(?!tags\/)[^/]+$/.test(request.url) &&
+        !/\/assets$/.test(request.url)
+
+      const answered = respond(request) || {}
+
+      const holdsNothing = !('assets' in (answered.json || {}))
+
+      const { status = 200, json = {} } =
+        releaseRead && held.size && holdsNothing
+          ? {
+              json: {
+                id: 1,
+                assets: [...held].map(([name, size]) => ({ name, size }))
+              }
+            }
+          : answered
+
       // no keep-alive: the suite has to end when the last test does, and a
       // socket left open by a client makes node:test wait for it
       response.writeHead(status, {
@@ -608,6 +644,33 @@ test('--attach refuses a release that holds the right name at the wrong size', a
 
   assert.match(message, /holds "server\.json\.zip" at 63850 bytes, where the file is 3 bytes/)
   assert.match(message, /stored something other than the build/)
+})
+
+test('a cut refuses a release that stored something other than the build', async (t) => {
+  // the cut is the path that published such releases: every upload answered 201,
+  // and nothing read the release back afterwards
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 7, upload_url: `${base}/upload{?name,label}` } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/7')
+      return { json: { id: 7, assets: [{ name: 'app.zip', size: 412 }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', asset
+  )
+
+  assert.match(message, /holds "app\.zip" at 412 bytes, where the file is 3 bytes/)
 })
 
 test('--attach with no release for the tag is refused, naming it', async (t) => {

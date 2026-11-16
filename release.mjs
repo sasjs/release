@@ -792,6 +792,16 @@ async function publish({
       // no part name: GitHub reads the file itself as the body
       await uploadOnce(`${url}${named}`, headers, file.path)
     }
+    // the same read-back the attach path does, before the release is visible: this
+    // is the path that published assets holding the request body instead of the
+    // build, and it answered every upload with 201
+    if (files.length)
+      await confirmAssets(
+        `${base}/repos/${repo}/releases/${release.id}`,
+        { headers },
+        files,
+        (body) => new Map((body.assets || []).map((asset) => [asset.name, asset.size]))
+      )
     return release
   }
 
