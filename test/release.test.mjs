@@ -295,7 +295,11 @@ test('github: creates the release and uploads each asset to its upload_url', asy
 
   // the {?name,label} template must be stripped before it is used
   const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name=app.zip'))
-  assert.match(upload.type, /^multipart\/form-data/)
+  // GitHub reads the asset itself as the request body. A multipart body is stored
+  // verbatim, which is how a release came to carry files beginning
+  // `------formdata-undici-...` instead of the builds they were named for.
+  assert.match(upload.type, /^application\/octet-stream/)
+  assert.equal(upload.body, 'zip')
 })
 
 test('sasjsconfig.json\'s release block names the assets, with no flag at all', async (t) => {
@@ -576,6 +580,34 @@ test('--attach uploads the configured assets to a release that already exists', 
   assert.match(upload.url, /name=macro-dash-server\.json\.zip/)
   // and it cuts nothing: no tag is made or asked for
   assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
+test('--attach refuses a release that holds the right name at the wrong size', async (t) => {
+  // what a host stores when it was sent the envelope rather than the file: the
+  // asset is listed under the build's name, at the envelope's length - so the
+  // name check passes and every download of the build is corrupt
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url.startsWith('/repos/') && request.url.includes('/releases/tags/'))
+      return { json: { id: 9, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+    if (request.method === 'GET' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'server.json.zip', size: 63_850 }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeFileSync(join(cwd, 'server.json.zip'), 'zip')
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', replacement.base,
+    '--repo', 'sasjs/app', '--asset', 'server.json.zip'
+  )
+
+  assert.match(message, /holds "server\.json\.zip" at 63850 bytes, where the file is 3 bytes/)
+  assert.match(message, /stored something other than the build/)
 })
 
 test('--attach with no release for the tag is refused, naming it', async (t) => {

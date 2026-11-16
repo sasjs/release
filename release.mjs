@@ -21,7 +21,7 @@
  * before the tag step, and the tag alone exists when it is returned after.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { basename, isAbsolute, join } from 'node:path'
 
 const LEVELS = { major: 3, minor: 2, patch: 1 }
@@ -267,15 +267,30 @@ function notes(version, parsed, previous, repo, date) {
 }
 
 /**
- * Multipart without dependencies: node's own FormData and Blob, so an asset
- * upload needs no curl on the runner and no library in the tree.
+ * Attaches a file to a release, in the shape the host parses.
+ *
+ * GitHub takes the file AS the request body: `POST .../releases/{id}/assets?name=`
+ * reads the raw bytes, and a multipart body sent to it is stored verbatim - so a
+ * release cut that way carries a file beginning `------formdata-undici-...`
+ * instead of the build, and every download from it is corrupt while the upload
+ * itself answered 201. Gitea parses multipart and takes the part it names, so the
+ * part name decides which of the two a call gets.
+ *
+ * Node's own FormData and Blob keep this dependency-free for the multipart case.
  */
 async function upload(url, headers, file, field) {
-  const body = new FormData()
   const bytes = readFileSync(file)
+
+  if (!field)
+    return request(url, {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/octet-stream' },
+      body: bytes
+    })
+
+  const body = new FormData()
   body.append(field, new Blob([bytes]), basename(file))
-  const response = await request(url, { method: 'POST', headers, body })
-  return response
+  return request(url, { method: 'POST', headers, body })
 }
 
 /**
@@ -619,7 +634,8 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       const named = `?name=${encodeURIComponent(file.name)}${
         file.label ? `&label=${encodeURIComponent(file.label)}` : ''
       }`
-      await uploadOnce(`${url}${named}`, headers, file.path, 'file')
+      // no part name: GitHub reads the file itself as the body
+      await uploadOnce(`${url}${named}`, headers, file.path)
     }
     // Verified before it is published: a release that is visible because an upload
     // returned 200, but does not hold the files it names, is the failure this checks
@@ -628,7 +644,7 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       `${base}/repos/${repo}/releases/${release.id}`,
       { headers },
       files,
-      (body) => (body.assets || []).map((asset) => asset.name)
+      (body) => new Map((body.assets || []).map((asset) => [asset.name, asset.size]))
     )
     return publishDraft(base, repo, release, headers)
   }
@@ -654,7 +670,10 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
       `${api}/repos/${repo}/releases/${release.id}/assets`,
       { headers },
       files,
-      (list) => (Array.isArray(list) ? list : []).map((asset) => asset.name)
+      (list) =>
+        new Map(
+          (Array.isArray(list) ? list : []).map((asset) => [asset.name, asset.size])
+        )
     )
     return publishDraft(`${api}/repos/${repo}/releases`, '', release, headers)
   }
@@ -671,16 +690,37 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
  * the name is a query parameter, the response is not inspected, and a release was
  * published with nothing attached because the process looking for the files was
  * pointed at a folder they were not in. The forge holds the answer, so ask it.
+ *
+ * A name is not the file either. A host that stored something OTHER than what was
+ * sent - the multipart envelope around it, say - lists the asset under the right
+ * name at the wrong size, which is why the size is compared as well: every
+ * artefact of a release is uploaded whole, so a difference means the download is
+ * not the build.
  */
-async function confirmAssets(url, options, files, namesOf) {
-  const body = await request(url, options)
-  const held = new Set(namesOf(body))
+async function confirmAssets(url, options, files, heldOf) {
+  const held = heldOf(await request(url, options))
   const missing = files.filter((file) => !held.has(file.name)).map((file) => file.name)
 
   if (missing.length)
     fail(
       `the release holds ${held.size} file(s) and is missing: ${missing.join(', ')} - ` +
         `it names ${files.map((file) => file.name).join(', ')}`
+    )
+
+  const mislaid = files
+    .map((file) => ({ file, size: held.get(file.name) }))
+    .filter(({ file, size }) => typeof size === 'number' && size !== statSync(file.path).size)
+
+  if (mislaid.length)
+    fail(
+      mislaid
+        .map(
+          ({ file, size }) =>
+            `the release holds "${file.name}" at ${size} bytes, where the file is ${
+              statSync(file.path).size
+            } bytes - the upload stored something other than the build`
+        )
+        .join('; ')
     )
 
   console.log(`${files.length} file(s) on the release: ${files.map((f) => f.name).join(', ')}`)
@@ -749,7 +789,8 @@ async function publish({
       const named = `?name=${encodeURIComponent(file.name)}${
         file.label ? `&label=${encodeURIComponent(file.label)}` : ''
       }`
-      await uploadOnce(`${url}${named}`, headers, file.path, 'file')
+      // no part name: GitHub reads the file itself as the body
+      await uploadOnce(`${url}${named}`, headers, file.path)
     }
     return release
   }
