@@ -897,6 +897,19 @@ test('a create that is refused, with the lookup after it failing, reports the re
   assert.ok(calls >= 1)
 })
 
+test('a run that cannot publish writes no output claiming it did', () => {
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  const out = `/tmp/sasjs-release-out-${process.pid}.txt`
+  writeFileSync(out, '')
+
+  const message = failure(cwd, '--release', '--output', out)
+
+  // `released=true` is what a calling workflow reads as "the release happened", so it
+  // is written only once the run knows it can publish at all
+  assert.match(message, /--release needs --host/)
+  assert.doesNotMatch(readFileSync(out, 'utf8'), /released=true/)
+})
+
 test('a config that names no assets is refused, with the shapes it accepts', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeFileSync(join(cwd, 'empty.json'), JSON.stringify({ plugins: [] }))
