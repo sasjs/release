@@ -826,6 +826,41 @@ test('a config that names no assets is refused, with the shapes it accepts', () 
   assert.match(message, /@sasjs\/release/)
 })
 
+test('--no-assets cuts the release with files that do not exist yet', async (t) => {
+  let base = ''
+  const replacement = await stub((request) =>
+    request.url.startsWith('/repos/') && request.method === 'POST'
+      ? { json: { id: 7, upload_url: `${base}/upload{?name,label}`, tag_name: 'v1.8.0' } }
+      : { status: 404, json: { message: 'Not Found' } }
+  )
+  t.after(() => replacement.stop())
+  base = replacement.base
+
+  const cwd = repo({ commits: ['feat: initial', 'fix: one'] })
+  // the artefacts are built from the tag, so at cut time they are not on disk
+  writeProjectConfig(cwd, { release: { assets: ['sasjsrelease/viya/viya.sas'] } })
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--no-assets', '--api-url',
+    replacement.base, '--repo', 'sasjs/app'
+  )
+
+  // the release exists and nothing was attached: --attach is the run that uploads
+  assert.match(out, /--no-assets: publishing the release with no files/)
+  assert.equal(replacement.seen.filter((r) => r.url.startsWith('/upload')).length, 0)
+})
+
+test('without --no-assets the same config still refuses before the tag', () => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  writeProjectConfig(cwd, { release: { assets: ['sasjsrelease/viya/viya.sas'] } })
+
+  const message = failure(cwd, '--tag', '--host', 'github', '--release')
+
+  assert.match(message, /names a file that is not there/)
+  assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
+})
+
 test('a config naming a file that is not there tags nothing', () => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   writeProjectConfig(cwd, { release: { assets: ['missing.zip'] } })
