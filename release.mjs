@@ -655,7 +655,7 @@ const HOSTS = {
 async function strictRequest(url, options = {}) {
   const response = await fetch(url, {
     method: options.method || 'GET',
-    headers: { accept: 'application/vnd.github+json', ...options.headers,
+    headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', ...options.headers,
       ...(options.json === undefined ? {} : { 'content-type': 'application/json' }) },
     body: options.json === undefined ? options.body : JSON.stringify(options.json),
     redirect: 'error'

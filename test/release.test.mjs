@@ -247,6 +247,7 @@ async function stub(respond) {
         auth: request.headers.authorization,
         privateToken: request.headers['private-token'],
         jobToken: request.headers['job-token'],
+        apiVersion: request.headers['x-github-api-version'],
         type: request.headers['content-type'],
         body: body.toString()
       })
@@ -615,6 +616,7 @@ test('--attach uploads the configured assets to a release that already exists', 
   const upload = replacement.seen.find((r) => r.url.startsWith('/upload?name='))
 
   assert.ok(upload)
+  assert.equal(upload.apiVersion, undefined)
   assert.match(upload.url, /name=macro-dash-server\.json\.zip/)
   // and it cuts nothing: no tag is made or asked for
   assert.equal(git(cwd, 'tag').trim(), 'v1.7.1')
@@ -898,6 +900,8 @@ test('verified attach uploads missing assets and publishes only after digest ver
     '--api-url', base, '--repo', 'sasjs/app', '--asset', 'app.zip')
   assert.deepEqual(replacement.seen.filter((r) => r.method !== 'GET').map((r) => r.method), ['POST', 'PATCH'])
   assert.equal(replacement.seen.find((r) => r.method === 'POST').body, 'new')
+  assert.ok(replacement.seen.length > 0)
+  assert.ok(replacement.seen.every((r) => r.apiVersion === '2022-11-28'))
 })
 
 test('verified attach refuses dry-run rather than claiming unperformed verification', () => {
