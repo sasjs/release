@@ -62,7 +62,7 @@ Two things it does that the toolchain cannot:
 | `--branch <ref>` | the branch a publishable tag must be on (default: `HEAD`) |
 | `--registry <url>` | registry to ask whether the version exists (default: the public npm registry) |
 | `--republish` | publish even when the registry already serves that version |
-| `--draft` | create the release as a draft: the tag exists, the release does not, until something publishes it (`gh release edit <tag> --draft=false`) |
+| `--draft` | create the release as a draft: the release is invisible. On GitHub the tag is created when the draft is published, not now; Gitea and GitLab create it with the release |
 
 Exit codes: `0` released or nothing to release, `2` usage, git or host error.
 
@@ -241,6 +241,50 @@ tagged, and the same `release.assets` list goes to the release that exists.
 
 `--dry-run` names the files without sending them, and a tag with no release is
 refused by name rather than reported as an empty upload.
+
+### What a draft names, and what is reused
+
+On GitHub, a draft release creates **no tag**: the tag is created from
+`target_commitish` when the draft is published. That is what makes "cut first,
+build second" safe there - a run that dies after the cut burns no version, and
+the next run re-classifies the same commits to the same one. (Gitea and GitLab
+create the tag with the release, so a draft there already names one.)
+
+On GitHub, a release that already exists for a tag is reused only when it names
+the commit being released - compared as a sha, so a shallow checkout is enough
+to tell. A `target_commitish` that is not a sha (the branch name a release made
+in the web UI stores) cannot be compared with what the release held, so it is
+reused as before. Gitea and GitLab reuse an existing release as they always
+have: the identity check is GitHub-only, where these draft semantics were
+measured.
+
+- **same commit** - it is the previous run's draft, and this run finishes it
+  (`a release for this tag already exists: finishing it`);
+- **another commit, still a draft** - it is abandoned work: its notes describe a
+  range nobody published, and finishing it would attach this build to a tag
+  created at the other commit. The release is re-read immediately before the
+  delete and the run refuses if it has been published in the meantime, so a live
+  release is never removed; otherwise the draft is deleted and the release cut
+  again at this commit, and the run says so (`discarded a stale draft for vX: it
+  named <the old commit>, and this run releases <this one>`);
+- **another commit and published** - the tag is taken. The run refuses
+  (`a published release for vX already names <sha>, and this run releases <sha> -
+  refusing to attach this build to it`) rather than attaching today's files to
+  yesterday's release.
+
+On GitHub, and only there, the tag itself is checked before anything is created:
+GitHub ignores `target_commitish` once the tag exists, so a release created for a
+tag that already names another commit would point at that commit while the run
+said it released this one. The run asks for the tag ref (peeling an annotated
+tag to the commit it holds) and refuses by name when that names a different
+commit. The ref endpoint is the one asked because a missing ref is a plain 404
+there, while `/commits/<ref>` answers 422 for the same thing - the state every
+release starts in, since the create is what makes the tag.
+
+Gitea and GitLab are not checked: neither passes an identity, and their `ref` is
+documented as used only when the tag does not exist, so the tag-already-exists
+case - and the silent attachment to an older commit it allows - is still open on
+those hosts.
 
 The cut is told which kind of release it is: `--no-assets` cuts one whose files are not
 on disk yet, so a config naming them is expected rather than a mistake. Without it,
