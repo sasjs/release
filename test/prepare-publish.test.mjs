@@ -152,8 +152,75 @@ test('discovery uses the explicit tag ref for ancestry of manual and SHA-selecte
   for (const selector of [['--tag', 'v1.2.3'], ['--sha', sha]]) {
     const result = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', ...selector], { encoding: 'utf8', env })
     assert.match(result.stdout, /tag=v1\.2\.3/)
-    assert.deepEqual(readFileSync(trace, 'utf8').trim().split('\n'), ['merge-base', '--is-ancestor', 'refs/tags/v1.2.3^{commit}', 'HEAD'])
+    assert.deepEqual(readFileSync(trace, 'utf8').trim().split('\n'), ['merge-base', '--is-ancestor', 'refs/tags/v1.2.3^{commit}', sha])
   }
+})
+
+test('a same-named tag cannot stand in for the target branch during discovery', async () => {
+  const cwd = repo({ tag: null })
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'tag', 'main')
+  git(cwd, 'checkout', '-q', 'main')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', 'main'], { env: { ...process.env, ...envelope } }), /not on main/)
+})
+
+test('a same-named tag cannot stand in for the target branch during preparation', async () => {
+  const cwd = repo({ tag: null })
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'tag', 'main')
+  git(cwd, 'checkout', '-q', 'main')
+  const result = await run(cwd, '--tag', 'v2.0.0', '--branch', 'main', '--no-registry-lookup')
+  assert.equal(result.ok, false, result.out)
+  assert.match(result.out, /not on main/)
+  assert.equal(JSON.parse(readFileSync(join(cwd, 'package.json'))).version, '0.0.0')
+})
+
+test('preparation checks the real tag even when a same-named branch is on main', async () => {
+  const cwd = repo({ tag: null })
+  git(cwd, 'branch', 'v2.0.0')
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'checkout', '-q', 'main')
+  const result = await run(cwd, '--tag', 'v2.0.0', '--branch', 'main', '--no-registry-lookup')
+  assert.equal(result.ok, false, result.out)
+  assert.match(result.out, /not on main/)
+})
+
+test('branch targets distinguish local, tracking and explicit remote refs', async () => {
+  const cwd = repo({ tag: null })
+  const main = git(cwd, 'rev-parse', 'HEAD')
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  const side = git(cwd, 'rev-parse', 'HEAD')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'update-ref', 'refs/remotes/origin/main', side)
+  git(cwd, 'update-ref', 'refs/remotes/upstream/main', side)
+  git(cwd, 'tag', 'origin/main', main)
+  for (const branch of ['main', 'origin/main', 'refs/remotes/origin/main', 'refs/remotes/upstream/main']) {
+    const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', branch], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+    assert.match(stdout, /tag=v2\.0\.0/)
+  }
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', 'refs/heads/main'], { env: { ...process.env, ...envelope } }), /not on/)
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', 'refs/heads/main~0'], { env: { ...process.env, ...envelope } }), /not on/)
+})
+
+test('a missing branch is not satisfied by a same-named tag', async () => {
+  const cwd = repo()
+  git(cwd, 'tag', 'missing')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--branch', 'missing'], { env: { ...process.env, ...envelope } }), /cannot resolve/)
 })
 
 test('prepare-publish keeps accepting a legacy branch as its tag argument', async () => {
@@ -225,6 +292,12 @@ test('discovery refuses equal-precedence tags rather than picking an arbitrary b
   await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { env: { ...process.env, ...envelope } }), /equal version precedence/)
 })
 
+test('workflow-run discovery rejects a malformed prefixed tag rather than skipping', async () => {
+  const cwd = repo({ tag: 'vbad' })
+  const sha = git(cwd, 'rev-parse', 'HEAD')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--sha', sha], { env: { ...process.env, ...envelope } }), /vbad does not carry a version/)
+})
+
 test('discovery rejects malformed version-shaped tags, even beside valid ones', async () => {
   for (const tag of ['v1.2', 'v1.2.3.4', 'v1.2.3-01']) {
     for (const valid of [false, true]) {
@@ -240,6 +313,28 @@ test('discovery ignores unrelated tags on an untagged release', async () => {
   const cwd = repo({ tag: 'zzz-docs' })
   const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
   assert.match(stdout, /skip=true/)
+})
+
+test('unrelated tags do not block a valid version tag', async () => {
+  const cwd = repo({ tag: 'v1.2.3' })
+  git(cwd, 'tag', 'vdocs')
+  git(cwd, 'tag', 'docs')
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /tag=v1\.2\.3/)
+})
+
+test('an empty tag prefix does not treat every unrelated tag as a release', async () => {
+  const cwd = repo({ tag: 'docs' })
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag-prefix', ''], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /skip=true/)
+})
+
+test('a literal custom prefix does not use git glob semantics', async () => {
+  const cwd = repo({ tag: 'release-docs' })
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag-prefix', 'release+' ], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /skip=true/)
+  git(cwd, 'tag', 'release+bad')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag-prefix', 'release+'], { env: { ...process.env, ...envelope } }), /does not carry a version/)
 })
 
 test('discovery rejects an unresolvable branch before checking for a tag', async () => {
