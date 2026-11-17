@@ -26,6 +26,16 @@ const source = join(root, 'release.mjs')
 /** { name, find, replace } - find must match exactly once. */
 const mutations = [
   {
+    name: 'branch candidates may resolve a same-named tag',
+    find: "      : [`refs/heads/${base}${suffix}`, `refs/remotes/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]",
+    replace: "      : [branch, `origin/${branch}`]"
+  },
+  {
+    name: 'a malformed prefixed tag can silently skip',
+    find: '      if (!versionShaped.length && prefix) {',
+    replace: '      if (false) {'
+  },
+  {
     name: 'the shallow clone is allowed to skip',
     find: `      if (git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')`,
     replace: `      if (false)`

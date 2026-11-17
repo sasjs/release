@@ -1062,11 +1062,23 @@ async function preparePublish() {
   const prefix = arg('tag-prefix', 'v')
   const dry = flag('dry-run')
   const branch = arg('branch', 'HEAD')
+  // Unqualified branch names must not be resolved by Git's ambiguous refname
+  // search (which prefers tags). Explicit refs, HEAD and revision expressions
+  // retain their meaning; a short branch name can also use origin's tracking ref.
+  const refParts = /^([^~^]+)(.*)$/.exec(branch)
+  const base = refParts?.[1] || branch
+  const suffix = refParts?.[2] || ''
+  const branchRefs = base === 'HEAD' || base.startsWith('refs/') || /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(base)
+    ? [branch]
+    : base.startsWith('origin/')
+      ? [`refs/remotes/${base}${suffix}`]
+      : [`refs/heads/${base}${suffix}`, `refs/remotes/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]
+  const resolveBranches = () => branchRefs.map((ref) => ({ ref, commit: attempt(() =>
+    git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)
+  ) })).filter(({ commit }) => commit)
   let candidates
   if (flag('discover-publish')) {
-    candidates = [branch, `origin/${branch}`].filter((candidate) =>
-      succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${candidate}^{commit}`))
-    )
+    candidates = resolveBranches()
     if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
   }
   if (flag('discover-publish') && git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
@@ -1099,11 +1111,20 @@ async function preparePublish() {
       fail(`--sha ${sha || '(empty)'} is not a valid commit SHA in this repository`)
     const found = (
       attempt(() =>
-        git(cwd, 'tag', '--points-at', sha, '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
+        git(cwd, 'tag', '--points-at', sha, '--list', flag('discover-publish') ? '*' : `${prefix}[0-9]*`, '--sort=-v:refname')
       ) || ''
     ).split('\n').filter(Boolean)
     if (flag('discover-publish')) {
-      const parsed = found.map((value) => ({ tag: value, version: parseVersion(value.slice(prefix.length)) }))
+      const versionShaped = found.filter((value) => value.startsWith(prefix) && /^\d/.test(value.slice(prefix.length)))
+      // A prefixed nonnumeric tag is ambiguous (it may be unrelated). Do not
+      // reject it beside version-shaped tags, but refuse a false-green skip if
+      // it is the only possible release tag. An empty prefix matches everything,
+      // so nonnumeric tags remain unrelated in that configuration.
+      if (!versionShaped.length && prefix) {
+        const ambiguous = found.find((value) => value.startsWith(prefix))
+        if (ambiguous) fail(`${ambiguous} does not carry a version after the ${prefix} prefix`)
+      }
+      const parsed = versionShaped.map((value) => ({ tag: value, version: parseVersion(value.slice(prefix.length)) }))
       const invalid = parsed.find((entry) => entry.tag.startsWith(prefix) && !entry.version)
       if (invalid) fail(`${invalid.tag} does not carry a version after the ${prefix} prefix`)
       const valid = parsed.filter((entry) => entry.tag.startsWith(prefix) && entry.version)
@@ -1140,18 +1161,16 @@ async function preparePublish() {
   // The forge's ref is authoritative, so a local branch that is merely behind
   // does not block a publish - it is the operator's checkout that is stale, and
   // saying so is more use than refusing on a technicality.
-  candidates ||= [branch, `origin/${branch}`].filter((candidate) =>
-    succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${candidate}^{commit}`))
-  )
+  candidates ||= resolveBranches()
   if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
 
-  const holding = candidates.find((candidate) =>
-    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tagRef(tag)}^{commit}`, candidate))
+  const holding = candidates.find(({ commit }) =>
+    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tagRef(tag)}^{commit}`, commit))
   )
   if (!holding) fail(`${tag} is not on ${branch} - refusing to publish it`)
-  if (holding !== branch)
+  if (holding !== candidates[0])
     console.log(
-      `note: the local ${branch} does not contain ${tag}, ${holding} does - ` +
+      `note: the local ${branch} does not contain ${tag}, ${holding.ref.replace(/^refs\/remotes\//, '')} does - ` +
         'this checkout is behind, so fetch before trusting anything built from it'
     )
 
