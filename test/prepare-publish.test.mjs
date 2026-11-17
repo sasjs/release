@@ -112,11 +112,12 @@ test('workflow discovery fails closed on invalid run SHA and dispatch input', as
   const block = yaml.split('      - name: Resolve the tag\n')[1].split('      - name: Check out the tag\n')[0]
   const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
   const cwd = repo({ tag: null })
+  git(cwd, 'tag', 'zzz-docs')
   const output = join(cwd, 'output')
-  const call = (event, sha, requested) => execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, EVENT: event, SHA: sha, REQUESTED: requested, GITHUB_OUTPUT: output } })
+  const call = (event, sha, requested) => execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, EVENT: event, SHA: sha, REQUESTED: requested, GITHUB_OUTPUT: output, GITHUB_WORKSPACE: fileURLToPath(new URL('..', import.meta.url)) } })
   await assert.rejects(call('workflow_run', '', ''), /invalid or missing workflow run SHA/)
   await assert.rejects(call('workflow_dispatch', '', ''), /no tag/)
-  await assert.rejects(call('workflow_dispatch', '', 'main'), /invalid release tag/)
+  await assert.rejects(call('workflow_dispatch', '', 'main'), /not in this repository|does not carry a version/)
   const sha = git(cwd, 'rev-parse', 'HEAD')
   await call('workflow_run', sha, '')
   assert.match(readFileSync(output, 'utf8'), /skip=true/)
@@ -134,7 +135,7 @@ test('publish workflow runs the checked-out tag CLI to prepare, then updates the
   const publish = workflow.indexOf('- name: Publish', prepare)
   assert.ok(checkout >= 0 && checkout < suite && suite < prepare && prepare < stamp && stamp < publish)
   assert.match(workflow.slice(prepare, publish), /node release\.mjs/)
-  assert.doesNotMatch(workflow, /--discover-publish/)
+  assert.match(workflow, /--discover-publish/)
 })
 
 test('discovery uses the explicit tag ref for ancestry of manual and SHA-selected tags', async () => {
@@ -190,6 +191,104 @@ test('discovery returns no-tag skip for a valid commit and selects manual tags o
   git(cwd, 'tag', 'v9.0.0')
   git(cwd, 'checkout', '-q', 'main')
   await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v9.0.0'], { env: { ...process.env, ...envelope } }), /not on HEAD/)
+})
+
+test('discovery rejects invalid semver numeric prereleases', async () => {
+  const cwd = repo({ tag: 'v1.2.3-01' })
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v1.2.3-01'], { env: { ...process.env, ...envelope } }), { code: 2 })
+})
+
+test('discovery selects the highest semver instead of git version ordering', async () => {
+  const cwd = repo({ tag: 'v1.2.3' })
+  git(cwd, 'tag', 'v1.2.3-rc.1')
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /tag=v1\.2\.3\n/)
+})
+
+test('discovery implements semver prerelease and numeric precedence', async () => {
+  for (const [tags, expected] of [
+    [['v1.2.3-alpha.2', 'v1.2.3-alpha.10'], 'v1.2.3-alpha.10'],
+    [['v1.2.3-alpha.9', 'v1.2.3-alpha.beta'], 'v1.2.3-alpha.beta'],
+    [['v1.2.3-alpha', 'v1.2.3-alpha.1'], 'v1.2.3-alpha.1'],
+    [['v9.0.0', 'v10.0.0'], 'v10.0.0']
+  ]) {
+    const cwd = repo({ tag: tags[0] })
+    git(cwd, 'tag', tags[1])
+    const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+    assert.ok(stdout.includes(`tag=${expected}\n`), stdout)
+  }
+})
+
+test('discovery refuses equal-precedence tags rather than picking an arbitrary build', async () => {
+  const cwd = repo({ tag: 'v1.2.3+one' })
+  git(cwd, 'tag', 'v1.2.3+two')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { env: { ...process.env, ...envelope } }), /equal version precedence/)
+})
+
+test('discovery ignores unrelated and invalid tags on an untagged release', async () => {
+  const cwd = repo({ tag: 'v1.2.3-01' })
+  git(cwd, 'tag', 'zzz-docs')
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /skip=true/)
+})
+
+test('discovery rejects an unresolvable branch before checking for a tag', async () => {
+  const cwd = repo({ tag: null })
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--branch', 'no-such-branch'], { env: { ...process.env, ...envelope } }), /cannot resolve/)
+})
+
+test('workflow selects the highest valid semver ignoring unrelated tags and rejects invalid dispatch', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Resolve the tag\n')[1].split('      - name: Check out the tag\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: 'v1.2.3' })
+  git(cwd, 'tag', 'v1.2.3-rc.1')
+  git(cwd, 'tag', 'v1.2.3-01')
+  git(cwd, 'tag', 'zzz-docs')
+  const sha = git(cwd, 'rev-parse', 'HEAD')
+  const output = join(cwd, 'output')
+  const env = { ...process.env, ...envelope, GITHUB_WORKSPACE: fileURLToPath(new URL('..', import.meta.url)), GITHUB_OUTPUT: output }
+  await execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_run', SHA: sha, REQUESTED: '' } })
+  assert.match(readFileSync(output, 'utf8'), /tag=v1\.2\.3\n/)
+  await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_dispatch', SHA: '', REQUESTED: 'v1.2.3-01' } }), /does not carry a version/)
+  git(cwd, 'tag', 'v2.0.0+build.1')
+  await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_dispatch', SHA: '', REQUESTED: 'v2.0.0+build.1' } }), /npm cannot preserve build metadata/)
+})
+
+test('workflow accepts the tagged CLI prepare contract and rejects malformed or contradictory output', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: null })
+  const output = join(cwd, 'output')
+  const env = { ...process.env, ...envelope, TMPDIR: process.env.TMPDIR || tmpdir(), TAG: 'v1.2.3', VERSION: '1.2.3', REPUBLISH: 'false', GITHUB_OUTPUT: output }
+  const reg = await registry(404)
+  try {
+    writeFileSync(join(cwd, 'release.mjs'), readFileSync(CLI))
+    git(cwd, 'tag', 'v1.2.3')
+    // Override only the fixture registry at the CLI boundary.
+    const bin = mkdtempSync(join(tmpdir(), 'workflow-node-'))
+    const node = execFileSync('which', ['node'], { encoding: 'utf8' }).trim()
+    writeFileSync(join(bin, 'node'), '#!/bin/sh\nif [ "$1" = release.mjs ]; then exec "$REAL_NODE" "$@" --registry "$REGISTRY"; fi\nexec "$REAL_NODE" "$@"\n')
+    chmodSync(join(bin, 'node'), 0o755)
+    await execFileAsync('bash', ['-c', script], { cwd, env: { ...env, PATH: `${bin}:${process.env.PATH}`, REAL_NODE: node, REGISTRY: reg.url } })
+    assert.match(readFileSync(output, 'utf8'), /^publish=true\n$/)
+    for (const content of ['skip=false\ntag=v1.2.3\nversion=1.2.3\npublish=maybe\nexists=false\n', 'skip=false\ntag=v1.2.3\nversion=9.0.0\npublish=true\nexists=false\n', 'skip=false\ntag=v1.2.3\nversion=1.2.3\npublish=true\nexists=false\npublish=false\n']) {
+      writeFileSync(join(cwd, 'release.mjs'), `import { appendFileSync } from 'node:fs'; appendFileSync(process.argv[process.argv.indexOf('--output')+1], ${JSON.stringify(content)});`)
+      await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env }), /invalid prepare publish output/)
+    }
+  } finally { reg.stop() }
+})
+
+test('workflow refuses historical tagged CLI that silently omits prepare outputs', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: null })
+  writeFileSync(join(cwd, 'release.mjs'), readFileSync(fileURLToPath(new URL('./fixtures/release-v0.1.0.txt', import.meta.url))))
+  const output = join(cwd, 'output')
+  writeFileSync(output, '')
+  await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, TAG: 'v0.1.0', VERSION: '0.1.0', REPUBLISH: 'false', GITHUB_OUTPUT: output } }), /prepare.*output/i)
 })
 
 test('discovery rejects an explicitly empty tag rather than falling back to HEAD', async () => {

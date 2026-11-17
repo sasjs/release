@@ -86,30 +86,9 @@ npx @sasjs/release --prepare-publish --sha "$SHA" --branch main --output "$GITHU
 
 It prints, and emits with `--output`: `skip`, `tag`, `version`, `publish`, `exists`.
 
-For a pipeline that must check out the tag **before** changing the package, `--discover-publish` does just the Git decision. It emits `skip`, `tag`, and `version`, does not read or stamp `package.json`, and never contacts a registry. Supply either `--tag` (an actual prefixed version tag) or `--sha` (a full 40- or 64-character commit object ID); otherwise it uses HEAD. A shallow checkout fails even when it has a tag, because the checkout may omit another tag at the same commit. An explicit tag must be reachable from `--branch` or `origin/<branch>`. Do not treat discovery as permission to publish: run `--prepare-publish` on the checked-out tag, then use its `publish` output. Discovery is available only once a release containing it has been published; the package's own workflow retains its shell discovery until then.
+For a pipeline that must check out the tag **before** changing the package, `--discover-publish` does just the Git decision. It emits `skip`, `tag`, and `version`, does not read or stamp `package.json`, and never contacts a registry. Supply either `--tag` (an actual prefixed SemVer tag) or `--sha` (a full 40- or 64-character commit object ID); otherwise it uses HEAD. Discovery ignores non-version tags, selects by SemVer precedence, and rejects equal-precedence ties rather than choosing arbitrarily. A shallow checkout fails even when it has a tag, because the checkout may omit another tag at the same commit. The branch must resolve, and the tag must be reachable from `--branch` or `origin/<branch>`. Do not treat discovery as permission to publish: run `--prepare-publish` on the checked-out tag, validate its complete output, then use its `publish` output. The repository's own workflow runs discovery from trusted main and preparation from the tag; an old tagged CLI that cannot prepare must fail rather than silently skip publication. Its npm workflow rejects build metadata because `npm version` strips it.
 
-It does not run `npm publish` - that stays in the publishing workflow, which is the identity npm trusts for provenance - and it does not create the tag or the release; that is what the rest of this tool is for. A publish workflow therefore reads:
-
-```yaml
-# Use an already-installed version of @sasjs/release that supports discovery.
-- uses: actions/checkout@<sha>
-  with: { ref: main, fetch-depth: 0, persist-credentials: false }
-- name: Discover
-  id: discover
-  env: { SHA: '${{ github.event.workflow_run.head_sha }}' }
-  run: npx @sasjs/release --discover-publish --sha "$SHA" --branch HEAD --output "$GITHUB_OUTPUT"
-- name: Check out the tag
-  if: steps.discover.outputs.skip != 'true'
-  env: { TAG: '${{ steps.discover.outputs.tag }}' }
-  run: git checkout -q "refs/tags/$TAG"
-- name: Prepare the tagged source
-  id: prepare
-  if: steps.discover.outputs.skip != 'true'
-  env: { TAG: '${{ steps.discover.outputs.tag }}' }
-  run: npx @sasjs/release --prepare-publish --tag "$TAG" --branch HEAD --output "$GITHUB_OUTPUT"
-- run: npm publish --provenance
-  if: steps.prepare.outputs.publish == 'true'
-```
+It does not run `npm publish` - that stays in the publishing workflow, which is the identity npm trusts for provenance - and it does not create the tag or the release. See [the publish workflow](.github/workflows/publish.yml) for the complete sequence, including validation of the tagged CLI's outputs before using them.
 
 If the project has a lockfile, synchronize it after preparation and before publishing (for example, `npm version "$VERSION" --no-git-tag-version --allow-same-version`). `--prepare-publish` updates `package.json` only.
 

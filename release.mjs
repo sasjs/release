@@ -147,6 +147,32 @@ const succeeds = (fn) => {
   }
 }
 
+// SemVer precedence ignores build metadata; ties are rejected rather than choosing
+// between distinct tags that name the same precedence arbitrarily.
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
+function parseVersion(version) {
+  const match = SEMVER.exec(version)
+  if (!match || (match[4] && match[4].split('.').some((part) => /^\d+$/.test(part) && part.length > 1 && part[0] === '0'))) return null
+  return { core: match.slice(1, 4), pre: match[4]?.split('.') }
+}
+function compareVersion(a, b) {
+  const numeric = (x, y) => x.length - y.length || (x < y ? -1 : x > y ? 1 : 0)
+  for (let i = 0; i < 3; i++) {
+    const diff = numeric(a.core[i], b.core[i])
+    if (diff) return diff
+  }
+  if (!a.pre || !b.pre) return a.pre ? -1 : b.pre ? 1 : 0
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+    if (a.pre[i] === undefined) return -1
+    if (b.pre[i] === undefined) return 1
+    const x = a.pre[i], y = b.pre[i]
+    const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y)
+    const diff = xn && yn ? numeric(x, y) : xn ? -1 : yn ? 1 : x < y ? -1 : x > y ? 1 : 0
+    if (diff) return diff
+  }
+  return 0
+}
+
 /** The commit range to classify: after the newest tag carrying our prefix. */
 /**
  * The newest tag reachable from HEAD.
@@ -925,6 +951,13 @@ async function preparePublish() {
   const prefix = arg('tag-prefix', 'v')
   const dry = flag('dry-run')
   const branch = arg('branch', 'HEAD')
+  let candidates
+  if (flag('discover-publish')) {
+    candidates = [branch, `origin/${branch}`].filter((candidate) =>
+      succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${candidate}^{commit}`))
+    )
+    if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
+  }
   if (flag('discover-publish') && git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
     fail('this checkout is shallow; fetch a full history and tags (fetch-depth: 0)')
 
@@ -953,13 +986,19 @@ async function preparePublish() {
         ((flag('sha') && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) ||
          !succeeds(() => git(cwd, 'rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`))))
       fail(`--sha ${sha || '(empty)'} is not a valid commit SHA in this repository`)
-    tag = (
+    const found = (
       attempt(() =>
         git(cwd, 'tag', '--points-at', sha, '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
       ) || ''
-    )
-      .split('\n')
-      .filter(Boolean)[0]
+    ).split('\n').filter(Boolean)
+    if (flag('discover-publish')) {
+      const parsed = found.map((value) => ({ tag: value, version: parseVersion(value.slice(prefix.length)) }))
+      const valid = parsed.filter((entry) => entry.tag.startsWith(prefix) && entry.version)
+        .sort((a, b) => compareVersion(b.version, a.version))
+      if (valid.length > 1 && compareVersion(valid[0].version, valid[1].version) === 0)
+        fail(`multiple tags have equal version precedence: ${valid[0].tag}, ${valid[1].tag}`)
+      tag = valid[0]?.tag
+    } else tag = found[0]
 
     if (!tag) {
       // A shallow clone has no tags, so it cannot tell "this release cut no tag"
@@ -980,7 +1019,7 @@ async function preparePublish() {
 
   const version = tag.slice(prefix.length)
   if (flag('discover-publish')
-    ? !tag.startsWith(prefix) || !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version)
+    ? !tag.startsWith(prefix) || !parseVersion(version)
     : !/^\d+\.\d+\.\d+/.test(version))
     fail(`${tag} does not carry a version after the ${prefix} prefix`)
 
@@ -988,7 +1027,7 @@ async function preparePublish() {
   // The forge's ref is authoritative, so a local branch that is merely behind
   // does not block a publish - it is the operator's checkout that is stale, and
   // saying so is more use than refusing on a technicality.
-  const candidates = [branch, `origin/${branch}`].filter((candidate) =>
+  candidates ||= [branch, `origin/${branch}`].filter((candidate) =>
     succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${candidate}^{commit}`))
   )
   if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)

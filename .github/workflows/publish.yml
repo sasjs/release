@@ -77,57 +77,29 @@ jobs:
           SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          tag="$REQUESTED"
-
-          if [ -z "$tag" ] && [ "$EVENT" = "workflow_run" ]; then
-            if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]] || ! git cat-file -e "${SHA}^{commit}"; then
+          if [ "$EVENT" = "workflow_run" ]; then
+            if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
               echo "::error::invalid or missing workflow run SHA"
               exit 1
             fi
-            # the tag the release run just created, at the commit it released
-            tag="$(git tag --points-at "$SHA" --sort=-v:refname | head -1)"
-            if [ -z "$tag" ]; then
-              # A shallow clone carries no tags, and the branch below would then
-              # report a green publish that published nothing. Only a checkout
-              # with the tags in it can say "that release cut no tag".
-              if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-                echo "::error::this checkout is shallow, so the tag the release created cannot be seen - the job needs fetch-depth: 0"
-                exit 1
-              fi
-              echo "::notice::no tag at $SHA - that release had nothing to publish"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
+            args=(--sha "$SHA")
+          else
+            if [ -z "$REQUESTED" ]; then
+              echo "::error::no tag - dispatch this with the tag to publish"
+              exit 1
             fi
+            args=(--tag "$REQUESTED")
           fi
-
-          if [ -z "$tag" ]; then
-            echo "::error::no tag - dispatch this with the tag to publish"
+          # Run the trusted default-branch discovery before checking out the tag.
+          # It resolves SemVer precedence, validates the exact tag ref and ancestry,
+          # and never reads package.json or contacts the registry.
+          node "$GITHUB_WORKSPACE/release.mjs" --repo-dir "$PWD" --discover-publish --branch HEAD --output "$GITHUB_OUTPUT" "${args[@]}"
+          # npm version strips SemVer build metadata. Never publish a tag under a
+          # different version than the one discovered.
+          if grep -Eq '^version=.*\+' "$GITHUB_OUTPUT"; then
+            echo "::error::npm cannot preserve build metadata in a release version"
             exit 1
           fi
-
-          # Resolve only real release tag refs, never a revision expression or a
-          # branch supplied by a dispatcher. The tag's own CLI runs below.
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
-             ! git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
-            echo "::error::invalid release tag"
-            exit 1
-          fi
-
-          # A dispatch can name any tag in the repository; only one cut from a
-          # commit on the default branch is a release this pipeline made. The
-          # checkout above pins main, so HEAD *is* the default branch here - the
-          # tag is checked out further down - and this needs no fetch: the
-          # checkout runs with persist-credentials: false, and asking origin for
-          # refs would lean on the repository being public.
-          if ! git merge-base --is-ancestor "refs/tags/${tag}^{commit}" HEAD; then
-            echo "::error::$tag is not on the default branch - refusing to publish it"
-            exit 1
-          fi
-
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "publishing $tag (version ${tag#v})"
 
       - name: Check out the tag
         if: steps.tag.outputs.skip != 'true'
@@ -162,19 +134,42 @@ jobs:
         if: steps.tag.outputs.skip != 'true'
         run: node --test
 
-      # This runs the implementation in the tag, not code from a newer main.
-      # Discovery above remains shell until the new discovery mode is released.
+      # Discovery runs on trusted main before checkout; preparation runs the tag's
+      # own implementation and must prove that it returned the expected contract.
       - name: Prepare publish
         id: prepare
         if: steps.tag.outputs.skip != 'true'
         env:
           TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
           REPUBLISH: ${{ inputs.republish }}
         run: |
           set -euo pipefail
-          args=(--prepare-publish --tag "$TAG" --branch HEAD --output "$GITHUB_OUTPUT")
+          prepare_output="$(mktemp)"
+          trap 'rm -f "$prepare_output"' EXIT
+          args=(--prepare-publish --tag "$TAG" --branch HEAD --output "$prepare_output")
           if [ "${REPUBLISH:-false}" = "true" ]; then args+=(--republish); fi
           node release.mjs "${args[@]}"
+          # A historical CLI can silently ignore this mode and exit zero. Do not
+          # trust the exit code or let it inject unrelated GitHub output commands.
+          node - "$prepare_output" "$TAG" "$VERSION" <<'NODE'
+          const fs = require('node:fs')
+          const [path, tag, version] = process.argv.slice(2)
+          const lines = fs.readFileSync(path, 'utf8').trimEnd().split('\n')
+          const expected = ['skip', 'tag', 'version', 'publish', 'exists']
+          const pairs = lines.map((line) => {
+            const i = line.indexOf('=')
+            return i < 0 ? [line, ''] : [line.slice(0, i), line.slice(i + 1)]
+          })
+          const data = Object.fromEntries(pairs)
+          if (pairs.length !== expected.length || expected.some((key) => pairs.filter(([k]) => k === key).length !== 1) ||
+              data.skip !== 'false' || data.tag !== tag || data.version !== version ||
+              !['true', 'false'].includes(data.publish) || !['true', 'false'].includes(data.exists)) {
+            console.error('::error::invalid prepare publish output from tagged CLI')
+            process.exit(1)
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `publish=${data.publish}\n`)
+          NODE
 
       # prepare-publish stamps package.json; npm also updates a lockfile when
       # one exists. Do this only after checking out the tag and preparing it.
