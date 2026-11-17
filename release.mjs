@@ -928,6 +928,16 @@ async function preparePublish() {
   if (flag('discover-publish') && git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
     fail('this checkout is shallow; fetch a full history and tags (fetch-depth: 0)')
 
+  const packagePath = join(cwd, 'package.json')
+  let pkg
+  if (!flag('discover-publish')) {
+    try {
+      pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
+    } catch (error) {
+      fail(`cannot read ${packagePath}: ${error.message}`)
+    }
+  }
+
   // --- which tag is this run for?
   let tag = arg('tag')
   if (flag('discover-publish') && flag('tag') && !tag) fail('--tag needs a non-empty tag')
@@ -937,7 +947,7 @@ async function preparePublish() {
     if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)))
       fail(`--tag ${tag} is not in this repository`)
   } else {
-    const sha = arg('sha', 'HEAD')
+    const sha = flag('discover-publish') ? arg('sha', 'HEAD') : (arg('sha') || git(cwd, 'rev-parse', 'HEAD'))
     if (flag('discover-publish') &&
         ((flag('sha') && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) ||
          !succeeds(() => git(cwd, 'rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`))))
@@ -997,13 +1007,6 @@ async function preparePublish() {
     return
   }
 
-  const packagePath = join(cwd, 'package.json')
-  let pkg
-  try {
-    pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
-  } catch (error) {
-    fail(`cannot read ${packagePath}: ${error.message}`)
-  }
 
   // --- stamp the version npm will read, and so make drift impossible
   const before = pkg.version

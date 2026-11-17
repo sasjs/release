@@ -76,6 +76,14 @@ async function registry(status = 404) {
   }
 }
 
+test('prepare-publish still rejects an unreadable package even when there is no tag', async () => {
+  const cwd = repo({ tag: null })
+  writeFileSync(join(cwd, 'package.json'), '{ broken')
+  const result = await run(cwd)
+  assert.equal(result.ok, false)
+  assert.match(result.out, /cannot read .*package\.json/)
+})
+
 test('tagged source prepares before npm synchronizes the checked-out lockfile', async (t) => {
   const reg = await registry(404)
   t.after(() => reg.stop())
