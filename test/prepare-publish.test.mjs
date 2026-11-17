@@ -217,6 +217,21 @@ test('branch targets distinguish local, tracking and explicit remote refs', asyn
   await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', 'refs/heads/main~0'], { env: { ...process.env, ...envelope } }), /not on/)
 })
 
+test('a non-origin remote shorthand resolves its tracking ref without tag ambiguity', async () => {
+  const cwd = repo({ tag: null })
+  const main = git(cwd, 'rev-parse', 'HEAD')
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  const side = git(cwd, 'rev-parse', 'HEAD')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'update-ref', 'refs/remotes/upstream/main', side)
+  git(cwd, 'tag', 'upstream/main', main)
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0', '--branch', 'upstream/main'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(stdout, /tag=v2\.0\.0/)
+})
+
 test('a missing branch is not satisfied by a same-named tag', async () => {
   const cwd = repo()
   git(cwd, 'tag', 'missing')

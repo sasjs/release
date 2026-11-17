@@ -27,7 +27,7 @@ const source = join(root, 'release.mjs')
 const mutations = [
   {
     name: 'branch candidates may resolve a same-named tag',
-    find: "      : [`refs/heads/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]",
+    find: "      : [`refs/heads/${base}${suffix}`, `refs/remotes/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]",
     replace: "      : [branch, `origin/${branch}`]"
   },
   {

@@ -1072,7 +1072,7 @@ async function preparePublish() {
     ? [branch]
     : base.startsWith('origin/')
       ? [`refs/remotes/${base}${suffix}`]
-      : [`refs/heads/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]
+      : [`refs/heads/${base}${suffix}`, `refs/remotes/${base}${suffix}`, `refs/remotes/origin/${base}${suffix}`]
   const resolveBranches = () => branchRefs.map((ref) => ({ ref, commit: attempt(() =>
     git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)
   ) })).filter(({ commit }) => commit)
