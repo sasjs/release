@@ -993,6 +993,8 @@ async function preparePublish() {
     ).split('\n').filter(Boolean)
     if (flag('discover-publish')) {
       const parsed = found.map((value) => ({ tag: value, version: parseVersion(value.slice(prefix.length)) }))
+      const invalid = parsed.find((entry) => entry.tag.startsWith(prefix) && !entry.version)
+      if (invalid) fail(`${invalid.tag} does not carry a version after the ${prefix} prefix`)
       const valid = parsed.filter((entry) => entry.tag.startsWith(prefix) && entry.version)
         .sort((a, b) => compareVersion(b.version, a.version))
       if (valid.length > 1 && compareVersion(valid[0].version, valid[1].version) === 0)

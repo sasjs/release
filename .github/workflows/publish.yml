@@ -152,9 +152,9 @@ jobs:
           node release.mjs "${args[@]}"
           # A historical CLI can silently ignore this mode and exit zero. Do not
           # trust the exit code or let it inject unrelated GitHub output commands.
-          node - "$prepare_output" "$TAG" "$VERSION" <<'NODE'
+          node - "$prepare_output" "$TAG" "$VERSION" "${REPUBLISH:-false}" <<'NODE'
           const fs = require('node:fs')
-          const [path, tag, version] = process.argv.slice(2)
+          const [path, tag, version, republish] = process.argv.slice(2)
           const lines = fs.readFileSync(path, 'utf8').trimEnd().split('\n')
           const expected = ['skip', 'tag', 'version', 'publish', 'exists']
           const pairs = lines.map((line) => {
@@ -164,7 +164,8 @@ jobs:
           const data = Object.fromEntries(pairs)
           if (pairs.length !== expected.length || expected.some((key) => pairs.filter(([k]) => k === key).length !== 1) ||
               data.skip !== 'false' || data.tag !== tag || data.version !== version ||
-              !['true', 'false'].includes(data.publish) || !['true', 'false'].includes(data.exists)) {
+              !['true', 'false'].includes(data.publish) || !['true', 'false'].includes(data.exists) ||
+              !['true', 'false'].includes(republish) || (data.publish === 'true') !== (data.exists === 'false' || republish === 'true')) {
             console.error('::error::invalid prepare publish output from tagged CLI')
             process.exit(1)
           }
