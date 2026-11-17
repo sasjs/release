@@ -105,8 +105,23 @@ const mutations = [
   },
   {
     name: 'a lookup that fails replaces the refusal that caused it',
-    find: `    const existing = await find().catch(() => null)`,
-    replace: `    const existing = await find()`
+    find: `    const refused = await find().catch(() => null)`,
+    replace: `    const refused = await find()`
+  },
+  {
+    name: 'a draft published while the run looked at it is deleted anyway',
+    find: `          if (current?.draft !== true)`,
+    replace: `          if (false)`
+  },
+  {
+    name: 'a tag on another commit does not stop the create',
+    find: `          if (named && named !== commit)`,
+    replace: `          if (false)`
+  },
+  {
+    name: 'a release for another commit is finished anyway',
+    find: `    if (!commit || !named || named === commit) {`,
+    replace: `    if (true) {`
   },
   {
     name: 'the github upload sends the envelope again',

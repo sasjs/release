@@ -394,29 +394,79 @@ async function findRelease(base, repo, tag, headers) {
  * status - GitHub says 422, Gitea and GitLab say 409 - and all of them can then
  * be asked for the release they refused to create twice.
  */
-async function createOrFind(url, options, find) {
+async function createOrFind(url, options, find, identity) {
   // Look before creating. A forge will happily create a second release for a tag
   // that already has one - as a draft, invisibly - so recovering from 422 alone
   // is not enough once drafts are in play: a re-run after publishing produced a
   // duplicate draft on a real repository.
+  //
+  // An existing release is reused only when it names the commit this run is
+  // releasing. It usually does not: a draft creates no tag (the tag appears when
+  // the draft is published, so a run that dies after the cut burns nothing), and
+  // the next run re-classifies the same commits to the same version - so the
+  // release it finds was cut for an EARLIER commit. Finishing that one would
+  // attach today's build to a tag created at yesterday's commit.
+  const reuse = async (existing) => {
+    // A sha is compared as a STRING, not resolved through the clone: a release
+    // job's checkout may be shallow, and the commit a stale draft names is
+    // exactly the object such a checkout does not carry - so resolving it would
+    // fail, and reading that failure as "names this commit" finishes the stale
+    // draft the comparison exists to catch. Anything that is not a sha - the
+    // branch name a release made in the web UI stores, a short sha - cannot be
+    // compared without guessing what it pointed at when the release was cut, so
+    // it is reused as before.
+    const sha = (value) =>
+      typeof value === 'string' && /^[0-9a-f]{40,64}$/i.test(value)
+        ? value.toLowerCase()
+        : undefined
+    const named = sha(existing.target_commitish)
+    const commit = sha(identity?.commit)
+
+    if (!commit || !named || named === commit) {
+      console.log('a release for this tag already exists: finishing it')
+      return existing
+    }
+
+    if (existing.draft !== true)
+      fail(
+        `a published release for ${identity.tag} already names ${named}, and this run releases ${identity.commit} - refusing to attach this build to it`
+      )
+
+    await identity.discard(existing)
+    console.log(
+      `discarded a stale draft for ${identity.tag}: it named ${named}, and this run releases ${identity.commit}`
+    )
+    return null
+  }
+
+  // Anything the host will not check for us has to be checked before the create:
+  // see the tag check the GitHub path passes as beforeCreate.
+  const create = async () => {
+    await identity?.beforeCreate?.()
+    return request(url, options)
+  }
+
   const existing = await find().catch(() => null)
   // `id` is what makes a response a release: a host that answers 200 with
   // something else (an empty object, an error body) has not found one
   if (existing && existing.id) {
-    console.log('a release for this tag already exists: finishing it')
-    return existing
+    const reused = await reuse(existing)
+    if (reused) return reused
   }
 
   try {
-    return await request(url, options)
+    return await create()
   } catch (error) {
     if (error.status !== 422 && error.status !== 409) throw error
     // a lookup that fails is not the finding: the refusal to create is, and
     // reporting the 404 from the lookup sends the reader after the wrong call
-    const existing = await find().catch(() => null)
-    if (!existing || !existing.id) throw error
-    console.log(`a release for this tag already exists: finishing it`)
-    return existing
+    const refused = await find().catch(() => null)
+    if (!refused || !refused.id) throw error
+    const reused = await reuse(refused)
+    if (reused) return reused
+    // the stale draft is gone, so the same create is now a create rather than a
+    // refusal - which is what a second attempt means here
+    return await create()
   }
 }
 
@@ -921,9 +971,11 @@ async function publish({
 
   if (host === 'github') {
     const base = api || HOSTS.github.api
-    // target_commitish is what makes the tag exist at all: the API creates it
-    // when tag_name is new, so the job needs no git credentials and never
-    // pushes to the repository. Unused when the tag is already there.
+    // target_commitish is what binds the release to a commit, so the job needs no
+    // git credentials and never pushes to the repository. A DRAFT creates no tag:
+    // the tag appears when the draft is published, which is what makes cutting
+    // first safe - a run that dies after the cut burns no version, and the next
+    // run re-classifies the same commits to the same one.
     const release = await createOrFind(
       `${base}/repos/${repo}/releases`,
       {
@@ -936,12 +988,66 @@ async function publish({
           body,
           prerelease: isPrerelease,
           // a draft keeps the release out of sight until the thing it names is
-          // actually installable: the tag is created either way, but a release
-          // advertising a version that failed to publish is worse than no release
+          // actually installable, and keeps its tag unpublished until then
           draft: Boolean(draft)
         }
       },
-      () => findRelease(base, repo, tag, headers)
+      () => findRelease(base, repo, tag, headers),
+      {
+        tag,
+        commit,
+        // Re-read before deleting: the lookup that found this release is seconds
+        // old, and a draft can be published in between - by a human, by
+        // `gh release edit --draft=false`, by another run. Deleting it then
+        // destroys a live release and its assets, so the state that justifies the
+        // delete is read again here and the run refuses rather than mutates.
+        discard: async (release) => {
+          const current = await request(
+            `${base}/repos/${repo}/releases/${release.id}`,
+            { headers }
+          )
+          if (current?.draft !== true)
+            fail(
+              `the release for ${tag} was published while this run was looking at it, so it is not a stale draft to discard - refusing to delete a live release`
+            )
+          await request(`${base}/repos/${repo}/releases/${release.id}`, {
+            method: 'DELETE',
+            headers
+          })
+        },
+        // GitHub ignores target_commitish when the tag already exists, so a
+        // release created for a tag that is already on another commit would point
+        // at that commit while this run says it released this one. Ask the host
+        // for the tag before creating anything.
+        //
+        // The ref endpoint, because it is the one with an unambiguous "absent":
+        // a missing ref is 404 there, while `/commits/<ref>` answers 422 for the
+        // same thing - the state every release starts in, since the create is what
+        // makes the tag. An annotated tag names a tag object rather than a commit,
+        // so that is peeled before the comparison.
+        beforeCreate: async () => {
+          const ref = await request(
+            `${base}/repos/${repo}/git/ref/tags/${encodeURIComponent(tag)}`,
+            { headers }
+          ).catch((error) => {
+            if (error.status === 404) return null
+            throw error
+          })
+
+          if (!ref) return
+
+          const named =
+            ref.object?.type === 'tag'
+              ? (await request(`${base}/repos/${repo}/git/tags/${ref.object.sha}`, { headers }))
+                  .object?.sha
+              : ref.object?.sha
+
+          if (named && named !== commit)
+            fail(
+              `tag ${tag} already names ${named}, and this run releases ${commit} - refusing to create a release that would point at the older commit`
+            )
+        }
+      }
     )
     for (const file of files) {
       const url = String(release.upload_url).replace(/\{.*$/, '')

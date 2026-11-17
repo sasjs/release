@@ -1437,6 +1437,10 @@ test('a create that is refused, with the lookup after it failing, reports the re
   const replacement = await stub((request) => {
     if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
       return { status: 422, json: { message: 'already_exists' } }
+    // the tag check before the create: no tag at this name, which is the normal
+    // case and not what this case is about. A missing ref is 404 on this endpoint.
+    if (request.method === 'GET' && /\/git\/ref\/tags\//.test(request.url))
+      return { status: 404, json: { message: 'Not Found' } }
     calls += 1
     // both lookups fail: the first is tolerated, the second must not turn the
     // refusal to create into a 404 from a lookup
@@ -1941,4 +1945,360 @@ test('a tag on an unmerged branch is not the base', () => {
   git(cwd, 'commit', '-m', 'feat: on main')
   // v9.0.0 exists but is unreachable from main, so v1.7.1 is the base
   assert.equal(versionOf(run(cwd, '--dry-run')), '1.8.0')
+})
+
+/**
+ * A release that exists for the tag but names ANOTHER commit is the shape a run
+ * leaves when it dies after the cut: a draft creates no tag, so the next run
+ * re-classifies the same commits to the same version and finds this draft
+ * waiting. Finishing it would attach today's build to a tag created at
+ * yesterday's commit, so the draft is discarded and the release cut again.
+ */
+test('a draft that names another commit is discarded, and the release cut at this one', async (t) => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const head = git(cwd, 'rev-parse', 'HEAD')
+  const earlier = git(cwd, 'rev-parse', 'HEAD~1')
+  let base = ''
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url))
+      return { json: [{ id: 7, tag_name: 'v1.8.0', draft: true, target_commitish: earlier }] }
+    // the discard re-reads the release immediately before deleting it
+    if (request.method === 'GET' && /\/releases\/7$/.test(request.url))
+      return { json: { id: 7, tag_name: 'v1.8.0', draft: true, assets: [] } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return {
+        json: {
+          id: 8,
+          tag_name: 'v1.8.0',
+          draft: true,
+          target_commitish: head,
+          upload_url: `${base}/upload{?name,label}`
+        }
+      }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(out, /discarded a stale draft for v1\.8\.0/)
+  const deleted = replacement.seen.find((r) => r.method === 'DELETE')
+  assert.equal(deleted.url, '/repos/sasjs/app/releases/7')
+
+  const created = replacement.seen.find(
+    (r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'
+  )
+  const payload = JSON.parse(created.body)
+  assert.equal(payload.target_commitish, head, 'the new draft names this commit')
+  assert.equal(payload.draft, true)
+  // the discard happens before the create, or the create answers 422 for a tag
+  // that is still held by the draft it just deleted
+  assert.ok(
+    replacement.seen.indexOf(deleted) < replacement.seen.indexOf(created),
+    'the stale draft is deleted before the release is created again'
+  )
+})
+
+test('a draft that names this commit is finished, not discarded', async (t) => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const head = git(cwd, 'rev-parse', 'HEAD')
+  let base = ''
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url))
+      return { json: [{ id: 9, tag_name: 'v1.8.0', draft: true, target_commitish: head }] }
+    if (request.method === 'GET' && /\/releases\/9$/.test(request.url))
+      return { json: { id: 9, tag_name: 'v1.8.0', draft: true, assets: [] } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 10, upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(out, /a release for this tag already exists: finishing it/)
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+  assert.equal(
+    replacement.seen.some((r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'),
+    false,
+    'the existing draft is reused rather than created again'
+  )
+})
+
+test('a published release naming another commit is refused rather than attached to', async (t) => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const earlier = git(cwd, 'rev-parse', 'HEAD~1')
+  const asset = join(cwd, 'app.zip')
+  writeFileSync(asset, 'zip')
+  let base = ''
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return {
+        json: { id: 11, tag_name: 'v1.8.0', draft: false, target_commitish: earlier, assets: [] }
+      }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 12, upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', asset
+  )
+
+  assert.match(message, /a published release for v1\.8\.0 already names/)
+  assert.match(message, /refusing to attach this build to it/)
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+  assert.equal(
+    replacement.seen.some((r) => String(r.url).startsWith('/upload')),
+    false,
+    'no asset is uploaded to a release that names another commit'
+  )
+})
+
+test('a stale draft naming a commit the checkout does not carry is still discarded', async (t) => {
+  // A release job's checkout can be shallow, and the commit a stale draft names
+  // is exactly the object it will not have - so the sha is compared as a string
+  // rather than resolved through git, or this case would reuse the draft.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const head = git(cwd, 'rev-parse', 'HEAD')
+  const absent = 'a'.repeat(40)
+  let base = ''
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url))
+      return { json: [{ id: 21, tag_name: 'v1.8.0', draft: true, target_commitish: absent }] }
+    if (request.method === 'GET' && /\/releases\/21$/.test(request.url))
+      return { json: { id: 21, tag_name: 'v1.8.0', draft: true, assets: [] } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return {
+        json: {
+          id: 22,
+          tag_name: 'v1.8.0',
+          draft: true,
+          target_commitish: head,
+          upload_url: `${base}/upload{?name,label}`
+        }
+      }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(out, /discarded a stale draft for v1\.8\.0/)
+  assert.equal(replacement.seen.find((r) => r.method === 'DELETE').url, '/repos/sasjs/app/releases/21')
+  const created = replacement.seen.find(
+    (r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'
+  )
+  assert.equal(JSON.parse(created.body).target_commitish, head)
+})
+
+test('a release naming a branch is reused, because a branch cannot be compared', async (t) => {
+  // A release made in the web UI stores the default branch name, and resolving
+  // that would name the branch's tip today - not the commit the release holds.
+  // Unverifiable is reused as before, and the run must not claim it "already
+  // names" a commit it never said.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  let base = ''
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { json: { id: 31, tag_name: 'v1.8.0', draft: false, target_commitish: 'main', assets: [] } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
+      return { json: { id: 32, upload_url: `${base}/upload{?name,label}` } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  process.env.GH_TOKEN = 'token-123'
+
+  const out = await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(out, /a release for this tag already exists: finishing it/)
+  assert.doesNotMatch(out, /already names/)
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+})
+
+test('a draft published while the run was looking at it is not deleted', async (t) => {
+  // The lookup that finds the draft is seconds old. If it has been published in
+  // between, deleting it destroys a live release and its assets - so the state is
+  // re-read immediately before the delete and the run refuses, as the published
+  // branch does.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const earlier = git(cwd, 'rev-parse', 'HEAD~1')
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url))
+      return { json: [{ id: 7, tag_name: 'v1.8.0', draft: true, target_commitish: earlier }] }
+    // published by the time the delete would happen
+    if (request.method === 'GET' && /\/releases\/7$/.test(request.url))
+      return { json: { id: 7, tag_name: 'v1.8.0', draft: false, assets: [] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(message, /was published while this run was looking at it/)
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+})
+
+test('a tag already on another commit refuses the create', async (t) => {
+  // GitHub ignores target_commitish once the tag exists, so a release created
+  // here would point at that other commit while the run reports this one.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const elsewhere = 'b'.repeat(40)
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url)) return { json: [] }
+    if (request.method === 'GET' && /\/git\/ref\/tags\/v1\.8\.0$/.test(request.url))
+      return { json: { ref: 'refs/tags/v1.8.0', object: { type: 'commit', sha: elsewhere } } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.match(message, new RegExp(`tag v1\\.8\\.0 already names ${elsewhere}`))
+  assert.match(message, /refusing to create a release that would point at the older commit/)
+  assert.equal(
+    replacement.seen.some((r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'),
+    false,
+    'nothing is created for a tag that names another commit'
+  )
+})
+
+test('an annotated tag naming another commit is peeled before the comparison', async (t) => {
+  // Our own tags are annotated, so the ref names a tag object rather than a
+  // commit: comparing the tag object's sha with the commit would always differ,
+  // and refusing on that would block every release of an existing tag.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const elsewhere = 'd'.repeat(40)
+  const tagObject = 'e'.repeat(40)
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url)) return { json: [] }
+    if (request.method === 'GET' && /\/git\/ref\/tags\/v1\.8\.0$/.test(request.url))
+      return { json: { ref: 'refs/tags/v1.8.0', object: { type: 'tag', sha: tagObject } } }
+    if (request.method === 'GET' && new RegExp(`/git/tags/${tagObject}$`).test(request.url))
+      return { json: { tag: 'v1.8.0', object: { type: 'commit', sha: elsewhere } } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  // refused on the commit the tag holds, not on the tag object
+  assert.match(message, new RegExp(`tag v1\\.8\\.0 already names ${elsewhere}`))
+  assert.equal(message.includes(tagObject), false)
+})
+
+test('an annotated tag naming this commit does not stop the create', async (t) => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const head = git(cwd, 'rev-parse', 'HEAD')
+  const tagObject = 'f'.repeat(40)
+  let created = 0
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url)) return { json: [] }
+    if (request.method === 'GET' && /\/git\/ref\/tags\/v1\.8\.0$/.test(request.url))
+      return { json: { ref: 'refs/tags/v1.8.0', object: { type: 'tag', sha: tagObject } } }
+    if (request.method === 'GET' && new RegExp(`/git/tags/${tagObject}$`).test(request.url))
+      return { json: { tag: 'v1.8.0', object: { type: 'commit', sha: head } } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases') {
+      created += 1
+      return { json: { id: 9, tag_name: 'v1.8.0', draft: true, upload_url: '' } }
+    }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.equal(created, 1)
+})
+
+test('no tag yet is the normal path, and the create proceeds', async (t) => {
+  // The state every release starts in, since the create is what makes the tag.
+  // A missing ref answers 404 on this endpoint; a 422 from a `/commits/<ref>`
+  // lookup for the same thing is why the ref endpoint is the one asked.
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  let created = 0
+
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url)) return { json: [] }
+    if (request.method === 'GET' && /\/git\/ref\/tags\//.test(request.url))
+      return { status: 404, json: { message: 'Not Found', documentation_url: '...' } }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases') {
+      created += 1
+      return { json: { id: 11, tag_name: 'v1.8.0', draft: true, upload_url: '' } }
+    }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  await runInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+
+  assert.equal(created, 1)
 })
