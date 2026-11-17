@@ -76,6 +76,137 @@ async function registry(status = 404) {
   }
 }
 
+test('tagged source prepares before npm synchronizes the checked-out lockfile', async (t) => {
+  const reg = await registry(404)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: null })
+  writeFileSync(join(cwd, 'release.mjs'), readFileSync(CLI))
+  writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify({ name: '@fixture/pkg', version: '0.0.0', lockfileVersion: 3, packages: { '': { name: '@fixture/pkg', version: '0.0.0' } } }, null, 2))
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: tagged CLI')
+  git(cwd, 'tag', 'v1.2.3')
+  writeFileSync(join(cwd, 'release.mjs'), 'throw new Error("main must not run")')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'chore: newer main')
+  git(cwd, 'checkout', '-q', 'refs/tags/v1.2.3')
+  const env = { ...process.env, ...envelope }
+  delete env.NODE_V8_COVERAGE // fixture and npm are not part of this package's coverage
+  const result = await execFileAsync('node', ['release.mjs', '--prepare-publish', '--tag', 'v1.2.3', '--branch', 'HEAD', '--registry', reg.url], { cwd, encoding: 'utf8', env })
+  assert.match(result.stdout, /publish=true/)
+  await execFileAsync('npm', ['version', '1.2.3', '--no-git-tag-version', '--allow-same-version'], { cwd, env })
+  const lock = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8'))
+  assert.equal(lock.version, '1.2.3')
+  assert.equal(lock.packages[''].version, '1.2.3')
+})
+
+test('workflow discovery fails closed on invalid run SHA and dispatch input', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Resolve the tag\n')[1].split('      - name: Check out the tag\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: null })
+  const output = join(cwd, 'output')
+  const call = (event, sha, requested) => execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, EVENT: event, SHA: sha, REQUESTED: requested, GITHUB_OUTPUT: output } })
+  await assert.rejects(call('workflow_run', '', ''), /invalid or missing workflow run SHA/)
+  await assert.rejects(call('workflow_dispatch', '', ''), /no tag/)
+  await assert.rejects(call('workflow_dispatch', '', 'main'), /invalid release tag/)
+  const sha = git(cwd, 'rev-parse', 'HEAD')
+  await call('workflow_run', sha, '')
+  assert.match(readFileSync(output, 'utf8'), /skip=true/)
+  git(cwd, 'tag', 'v1.2.3')
+  await call('workflow_dispatch', '', 'v1.2.3')
+  assert.match(readFileSync(output, 'utf8'), /tag=v1\.2\.3/)
+})
+
+test('publish workflow runs the checked-out tag CLI to prepare, then updates the lockfile', () => {
+  const workflow = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const checkout = workflow.indexOf('- name: Check out the tag')
+  const suite = workflow.indexOf('- name: The suite passes at this tag')
+  const prepare = workflow.indexOf('--prepare-publish')
+  const stamp = workflow.indexOf('npm version', prepare)
+  const publish = workflow.indexOf('- name: Publish', prepare)
+  assert.ok(checkout >= 0 && checkout < suite && suite < prepare && prepare < stamp && stamp < publish)
+  assert.match(workflow.slice(prepare, publish), /node release\.mjs/)
+  assert.doesNotMatch(workflow, /--discover-publish/)
+})
+
+test('discovery validates the actual tag even when a branch has the same name', async () => {
+  const cwd = repo()
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  git(cwd, 'tag', 'v2.0.0')
+  git(cwd, 'checkout', '-q', 'main')
+  git(cwd, 'branch', 'v2.0.0')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v2.0.0'], { env: { ...process.env, ...envelope } }), /not on HEAD/)
+})
+
+test('discovery returns no-tag skip for a valid commit and selects manual tags only on the branch', async () => {
+  const cwd = repo({ tag: null })
+  const sha = git(cwd, 'rev-parse', 'HEAD')
+  let result = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--sha', sha], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(result.stdout, /skip=true/)
+  git(cwd, 'tag', 'v1.2.3')
+  result = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v1.2.3'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
+  assert.match(result.stdout, /tag=v1\.2\.3/)
+  git(cwd, 'checkout', '-q', '-b', 'side')
+  writeFileSync(join(cwd, 'side'), 'side')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: side')
+  git(cwd, 'tag', 'v9.0.0')
+  git(cwd, 'checkout', '-q', 'main')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', 'v9.0.0'], { env: { ...process.env, ...envelope } }), /not on HEAD/)
+})
+
+test('discovery rejects an explicitly empty tag rather than falling back to HEAD', async () => {
+  const cwd = repo()
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', ''], { env: { ...process.env, ...envelope } }), { code: 2 })
+})
+
+test('discovery refuses even a shallow checkout with a visible tag', async () => {
+  const source = repo()
+  const cwd = mkdtempSync(join(tmpdir(), 'discovery-shallow-'))
+  git(cwd, 'clone', '-q', '--depth', '1', `file://${source}`, '.')
+  await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { env: { ...process.env, ...envelope } }), /shallow/)
+})
+
+test('discovery refuses manual non-tags and malformed tags', async () => {
+  const cwd = repo({ tag: 'v1.2.3' })
+  git(cwd, 'tag', 'x1.2.3')
+  git(cwd, 'tag', 'v1.2.3-malicious!')
+  for (const tag of ['main', 'x1.2.3', 'v1.2.3-malicious!', 'v1.2.3^{commit}']) {
+    await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--tag', tag], { env: { ...process.env, ...envelope } }), { code: 2 })
+  }
+})
+
+test('discovery rejects an invalid or missing explicit SHA instead of silently skipping', async () => {
+  const cwd = repo({ tag: null })
+  for (const sha of ['does-not-exist', '--bad', 'HEAD~999', '']) {
+    try {
+      await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--sha', sha], { env: { ...process.env, ...envelope } })
+      assert.fail(`accepted ${JSON.stringify(sha)}`)
+    } catch (error) {
+      assert.equal(error.code, 2, String(error))
+    }
+  }
+})
+
+test('discovery resolves the newest tag without reading the package or registry', async (t) => {
+  const reg = await registry(500)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: 'v1.2.3' })
+  git(cwd, 'tag', 'v1.10.0')
+  writeFileSync(join(cwd, 'package.json'), '{ broken')
+  const output = join(cwd, 'outputs')
+  const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--registry', reg.url, '--output', output], {
+    encoding: 'utf8', env: { ...process.env, ...envelope }
+  })
+  assert.match(stdout, /tag=v1\.10\.0/)
+  assert.match(readFileSync(output, 'utf8'), /skip=false\ntag=v1\.10\.0\nversion=1\.10\.0/)
+  assert.equal(readFileSync(join(cwd, 'package.json'), 'utf8'), '{ broken')
+  assert.deepEqual(reg.seen, [])
+})
+
 test('stamps the tag version and reports that it should publish', async (t) => {
   const reg = await registry(404)
   t.after(() => reg.stop())

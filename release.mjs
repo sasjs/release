@@ -42,6 +42,7 @@ const HELP = `sasjs-release - releases from conventional commits
                          exists, and nothing else: for artefacts built after the
                          tag, with the version stamped into them
   --level <l>            force patch|minor|major instead of classifying
+  --discover-publish     resolve a publish tag without stamping or registry access
   --prepare-publish      resolve and gate a publish, stamp the version, ask the
                          registry; writes no tag and creates no release
   --sha <sha>            commit to look for a tag at (default: HEAD)
@@ -81,7 +82,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // exist rather than failing.
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
-  'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
+  'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
@@ -924,22 +925,23 @@ async function preparePublish() {
   const prefix = arg('tag-prefix', 'v')
   const dry = flag('dry-run')
   const branch = arg('branch', 'HEAD')
-
-  const packagePath = join(cwd, 'package.json')
-  let pkg
-  try {
-    pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
-  } catch (error) {
-    fail(`cannot read ${packagePath}: ${error.message}`)
-  }
+  if (flag('discover-publish') && git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
+    fail('this checkout is shallow; fetch a full history and tags (fetch-depth: 0)')
 
   // --- which tag is this run for?
   let tag = arg('tag')
+  if (flag('discover-publish') && flag('tag') && !tag) fail('--tag needs a non-empty tag')
+  if (flag('discover-publish') && flag('tag') && flag('sha')) fail('--tag and --sha cannot be combined')
   if (tag) {
-    if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${tag}^{commit}`)))
+    const ref = flag('discover-publish') ? `refs/tags/${tag}` : tag
+    if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)))
       fail(`--tag ${tag} is not in this repository`)
   } else {
-    const sha = arg('sha') || git(cwd, 'rev-parse', 'HEAD')
+    const sha = arg('sha', 'HEAD')
+    if (flag('discover-publish') &&
+        ((flag('sha') && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) ||
+         !succeeds(() => git(cwd, 'rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`))))
+      fail(`--sha ${sha || '(empty)'} is not a valid commit SHA in this repository`)
     tag = (
       attempt(() =>
         git(cwd, 'tag', '--points-at', sha, '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
@@ -958,13 +960,17 @@ async function preparePublish() {
             'fetch the tags (fetch-depth: 0) rather than reporting that there was nothing to publish'
         )
       console.log(`no ${prefix}* tag at ${sha.slice(0, 7)} - that release cut nothing`)
-      output({ skip: true, tag: '', version: '', publish: false, exists: false })
+      output(flag('discover-publish')
+        ? { skip: true, tag: '', version: '' }
+        : { skip: true, tag: '', version: '', publish: false, exists: false })
       return
     }
   }
 
   const version = tag.slice(prefix.length)
-  if (!/^\d+\.\d+\.\d+/.test(version))
+  if (flag('discover-publish')
+    ? !tag.startsWith(prefix) || !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version)
+    : !/^\d+\.\d+\.\d+/.test(version))
     fail(`${tag} does not carry a version after the ${prefix} prefix`)
 
   // --- a tag cut from a branch nobody merged is not a release of this branch.
@@ -985,6 +991,19 @@ async function preparePublish() {
       `note: the local ${branch} does not contain ${tag}, ${holding} does - ` +
         'this checkout is behind, so fetch before trusting anything built from it'
     )
+
+  if (flag('discover-publish')) {
+    output({ skip: false, tag, version })
+    return
+  }
+
+  const packagePath = join(cwd, 'package.json')
+  let pkg
+  try {
+    pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
+  } catch (error) {
+    fail(`cannot read ${packagePath}: ${error.message}`)
+  }
 
   // --- stamp the version npm will read, and so make drift impossible
   const before = pkg.version
@@ -1065,7 +1084,9 @@ async function main() {
 
   checkFlags()
 
-  if (flag('prepare-publish')) {
+  if (flag('discover-publish') || flag('prepare-publish')) {
+    if (flag('discover-publish') && flag('prepare-publish'))
+      fail('--discover-publish and --prepare-publish are mutually exclusive')
     await preparePublish()
     return
   }

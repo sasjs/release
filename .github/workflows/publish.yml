@@ -80,6 +80,10 @@ jobs:
           tag="$REQUESTED"
 
           if [ -z "$tag" ] && [ "$EVENT" = "workflow_run" ]; then
+            if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]] || ! git cat-file -e "${SHA}^{commit}"; then
+              echo "::error::invalid or missing workflow run SHA"
+              exit 1
+            fi
             # the tag the release run just created, at the commit it released
             tag="$(git tag --points-at "$SHA" --sort=-v:refname | head -1)"
             if [ -z "$tag" ]; then
@@ -101,13 +105,21 @@ jobs:
             exit 1
           fi
 
+          # Resolve only real release tag refs, never a revision expression or a
+          # branch supplied by a dispatcher. The tag's own CLI runs below.
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
+             ! git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null; then
+            echo "::error::invalid release tag"
+            exit 1
+          fi
+
           # A dispatch can name any tag in the repository; only one cut from a
           # commit on the default branch is a release this pipeline made. The
           # checkout above pins main, so HEAD *is* the default branch here - the
           # tag is checked out further down - and this needs no fetch: the
           # checkout runs with persist-credentials: false, and asking origin for
           # refs would lean on the repository being public.
-          if ! git merge-base --is-ancestor "${tag}^{commit}" HEAD; then
+          if ! git merge-base --is-ancestor "refs/tags/${tag}^{commit}" HEAD; then
             echo "::error::$tag is not on the default branch - refusing to publish it"
             exit 1
           fi
@@ -150,33 +162,30 @@ jobs:
         if: steps.tag.outputs.skip != 'true'
         run: node --test
 
-      # the version npm reads is the tag, stamped into the tree and not committed
-      - name: Stamp the version
+      # This runs the implementation in the tag, not code from a newer main.
+      # Discovery above remains shell until the new discovery mode is released.
+      - name: Prepare publish
+        id: prepare
+        if: steps.tag.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPUBLISH: ${{ inputs.republish }}
+        run: |
+          set -euo pipefail
+          args=(--prepare-publish --tag "$TAG" --branch HEAD --output "$GITHUB_OUTPUT")
+          if [ "${REPUBLISH:-false}" = "true" ]; then args+=(--republish); fi
+          node release.mjs "${args[@]}"
+
+      # prepare-publish stamps package.json; npm also updates a lockfile when
+      # one exists. Do this only after checking out the tag and preparing it.
+      - name: Synchronize the lockfile version
         if: steps.tag.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.tag.outputs.version }}
         run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-      - name: Already on the registry?
-        id: existing
-        if: steps.tag.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.tag.outputs.version }}
-          # through env like every other input: boolean today, but an input
-          # interpolated into shell text is only safe while its type holds
-          REPUBLISH: ${{ inputs.republish }}
-        run: |
-          set -euo pipefail
-          published="$(npm view "@sasjs/release@${VERSION}" version --prefer-online 2>/dev/null || true)"
-          if [ "$published" = "$VERSION" ] && [ "${REPUBLISH:-false}" != "true" ]; then
-            echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "$VERSION is already on the registry - nothing to publish"
-          else
-            echo "already=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish
-        if: steps.tag.outputs.skip != 'true' && steps.existing.outputs.already != 'true'
+        if: steps.tag.outputs.skip != 'true' && steps.prepare.outputs.publish == 'true'
         run: npm publish --access public
         # no NODE_AUTH_TOKEN: the OIDC token is exchanged for a short-lived
         # credential, so there is no long-lived secret in this repository
