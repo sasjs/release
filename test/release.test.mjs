@@ -904,8 +904,14 @@ test('verified attach refuses unsupported hosts and misplaced flags', () => {
   const cwd = repo()
   writeFileSync(join(cwd, 'app.zip'), 'new')
   assert.match(failure(cwd, '--verify-assets', '--release', '--host', 'github'), /requires --attach/)
+  for (const mode of ['--release', '--prepare-publish', '--discover-publish'])
+    assert.match(failure(cwd, '--verify-assets', '--attach', 'v1.8.0', mode, '--host', 'github'), /requires --attach and cannot be combined/)
   assert.match(failure(cwd, '--verify-assets', '--attach', '', '--host', 'github', '--asset', 'app.zip'), /non-empty/)
   assert.match(failure(cwd, '--verify-assets', '--attach', 'v1.8.0', '--host', 'gitlab', '--asset', 'app.zip'), /github only/)
+  assert.match(failure(cwd, '--verify-assets', '--attach', 'v1.8.0', '--host', 'none', '--asset', 'app.zip'), /github only/)
+  assert.match(failure(cwd, '--verify-assets', '--attach', 'v1.8.0', '--host', 'bogus', '--asset', 'app.zip'), /--host must be none, github, gitea or gitlab/)
+  assert.match(run(cwd, '--verify-assets', '--attach', '', '--host', 'github', '--show-context'), /host=github/)
+  assert.match(run(cwd, '--verify-assets', '--attach', 'v1.8.0', '--host', 'gitlab', '--show-context'), /host=gitlab/)
 })
 
 test('verified attach refuses missing digest, starter state, and unknown draft status', async (t) => {
@@ -961,6 +967,49 @@ test('verified attach refuses insecure API endpoints outside loopback', async ()
   process.env.GH_TOKEN = 'token-123'
   await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
     '--api-url', 'http://example.com', '--repo', 'sasjs/app', '--asset', 'app.zip'), /HTTPS/)
+})
+
+test('verified attach does not retain full-page JSON fingerprints', async (t) => {
+  const filler = Array.from({ length: 100 }, (_, i) => ({ id: i + 100, tag_name: `v0.0.${i}`, body: 'large-marker-'.repeat(100) }))
+  const digest = `sha256:${createHash('sha256').update('new').digest('hex')}`
+  const replacement = await stub((request) => {
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=1') return { json: filler }
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=2')
+      return { json: [{ id: 9, draft: false, tag_name: 'v1.8.0' }] }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=1')
+      return { json: [{ name: 'app.zip', size: 3, state: 'uploaded', digest }] }
+    if (request.url === '/repos/sasjs/app/releases/9') return { json: { id: 9, draft: false, tag_name: 'v1.8.0' } }
+    return { status: 500, json: {} }
+  })
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  const probe = join(cwd, 'probe.cjs')
+  writeFileSync(probe, `const add = Set.prototype.add; Set.prototype.add = function (value) {
+    if (typeof value === 'string' && value.includes('large-marker-') && value.length > 1000)
+      throw new Error('retained full-page JSON fingerprint');
+    return add.call(this, value);
+  }`)
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', 'app.zip',
+    { GH_TOKEN: 'token-123', NODE_OPTIONS: `--require=${probe}` })
+  assert.ok(replacement.seen.some((r) => r.url.endsWith('page=2')))
+  assert.deepEqual(replacement.seen.filter((r) => r.method !== 'GET'), [])
+})
+
+test('verified attach rejects a nonconsecutive pagination cycle before writing', async (t) => {
+  const pages = [0, 1].map((n) => Array.from({ length: 100 }, (_, i) => ({ id: n * 100 + i, tag_name: `v0.${n}.${i}` })))
+  const replacement = await stub((request) => {
+    const page = Number(new URL(request.url, 'http://localhost').searchParams.get('page'))
+    return { json: pages[(page - 1) % 2] }
+  })
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', 'app.zip', { GH_TOKEN: 'token-123' }), /pagination.*repeat/i)
+  assert.equal(replacement.seen.length, 3)
+  assert.deepEqual(replacement.seen.filter((r) => r.method !== 'GET'), [])
 })
 
 test('verified attach fails closed when a server repeats a full page', async (t) => {

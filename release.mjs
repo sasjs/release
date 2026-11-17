@@ -671,7 +671,9 @@ async function strictPages(url, headers) {
   for (let page = 1; page <= 10000; page++) {
     const entries = await strictRequest(`${url}?per_page=100&page=${page}`, { headers })
     if (!Array.isArray(entries) || entries.length > 100) throw new Error(`invalid listing from ${url}`)
-    const fingerprint = JSON.stringify(entries)
+    // Keep fixed-size digests (at most 10,000), not a second copy of each page.
+    // Remember all digests so nonconsecutive pagination cycles also fail closed.
+    const fingerprint = createHash('sha256').update(JSON.stringify(entries)).digest('hex')
     if (entries.length && pages.has(fingerprint)) throw new Error(`pagination repeated at ${url}`)
     pages.add(fingerprint)
     all.push(...entries)
@@ -758,7 +760,6 @@ async function attachAssets({ host, api, token, header, repo, tag, files }) {
   const headers = authHeaders(host, token, header)
 
   if (flag('verify-assets')) {
-    if (host !== 'github') fail('--verify-assets supports github only')
     return attachVerified({ api, headers, repo, tag, files })
   }
 
@@ -1238,8 +1239,17 @@ async function main() {
   }
 
   checkFlags()
-  if (flag('verify-assets') && (!flag('attach') || flag('release') || flag('prepare-publish') || flag('discover-publish')))
-    fail('--verify-assets requires --attach and cannot be combined with release or publish modes')
+  if (flag('verify-assets')) {
+    if (!flag('attach') || flag('release') || flag('prepare-publish') || flag('discover-publish'))
+      fail('--verify-assets requires --attach and cannot be combined with release or publish modes')
+    // Preserve --show-context's existing read-only behavior for attach options.
+    if (!flag('show-context')) {
+      if (!arg('attach')) fail('--attach needs a non-empty tag with --verify-assets')
+      const host = arg('host', detectContext().host)
+      if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
+      if (host !== 'github') fail('--verify-assets supports github only')
+    }
+  }
 
   if (flag('discover-publish') || flag('prepare-publish')) {
     if (flag('discover-publish') && flag('prepare-publish'))
@@ -1272,10 +1282,8 @@ async function main() {
   // Attaching says nothing about commits: the tag exists, the files exist, and the
   // run has no business classifying or cutting anything.
   const attachTag = arg('attach')
-  if (flag('verify-assets') && !attachTag) fail('--attach needs a non-empty tag with --verify-assets')
 
   if (attachTag) {
-    if (flag('verify-assets') && host !== 'github') fail('--verify-assets supports github only')
     if (host === 'none') fail('--attach needs --host')
     const token = tokenFor(host, arg('token-env'))
     if (!token) fail(`no token: set ${arg('token-env', HOSTS[host].token)}`)
