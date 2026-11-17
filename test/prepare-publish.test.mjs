@@ -225,9 +225,19 @@ test('discovery refuses equal-precedence tags rather than picking an arbitrary b
   await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { env: { ...process.env, ...envelope } }), /equal version precedence/)
 })
 
-test('discovery ignores unrelated and invalid tags on an untagged release', async () => {
-  const cwd = repo({ tag: 'v1.2.3-01' })
-  git(cwd, 'tag', 'zzz-docs')
+test('discovery rejects malformed version-shaped tags, even beside valid ones', async () => {
+  for (const tag of ['v1.2', 'v1.2.3.4', 'v1.2.3-01']) {
+    for (const valid of [false, true]) {
+      const cwd = repo({ tag })
+      if (valid) git(cwd, 'tag', 'v2.0.0')
+      const sha = git(cwd, 'rev-parse', 'HEAD')
+      await assert.rejects(execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', '--sha', sha], { env: { ...process.env, ...envelope } }), /does not carry a version/)
+    }
+  }
+})
+
+test('discovery ignores unrelated tags on an untagged release', async () => {
+  const cwd = repo({ tag: 'zzz-docs' })
   const { stdout } = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish'], { encoding: 'utf8', env: { ...process.env, ...envelope } })
   assert.match(stdout, /skip=true/)
 })
@@ -243,13 +253,14 @@ test('workflow selects the highest valid semver ignoring unrelated tags and reje
   const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
   const cwd = repo({ tag: 'v1.2.3' })
   git(cwd, 'tag', 'v1.2.3-rc.1')
-  git(cwd, 'tag', 'v1.2.3-01')
   git(cwd, 'tag', 'zzz-docs')
   const sha = git(cwd, 'rev-parse', 'HEAD')
   const output = join(cwd, 'output')
   const env = { ...process.env, ...envelope, GITHUB_WORKSPACE: fileURLToPath(new URL('..', import.meta.url)), GITHUB_OUTPUT: output }
   await execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_run', SHA: sha, REQUESTED: '' } })
   assert.match(readFileSync(output, 'utf8'), /tag=v1\.2\.3\n/)
+  git(cwd, 'tag', 'v1.2.3-01')
+  await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_run', SHA: sha, REQUESTED: '' } }), /does not carry a version/)
   await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_dispatch', SHA: '', REQUESTED: 'v1.2.3-01' } }), /does not carry a version/)
   git(cwd, 'tag', 'v2.0.0+build.1')
   await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...env, EVENT: 'workflow_dispatch', SHA: '', REQUESTED: 'v2.0.0+build.1' } }), /npm cannot preserve build metadata/)
@@ -278,6 +289,66 @@ test('workflow accepts the tagged CLI prepare contract and rejects malformed or 
       await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env }), /invalid prepare publish output/)
     }
   } finally { reg.stop() }
+})
+
+test('workflow passes republish to the real tagged CLI for an existing registry version', async (t) => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const reg = await registry(200)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: null })
+  writeFileSync(join(cwd, 'release.mjs'), readFileSync(CLI))
+  git(cwd, 'add', 'release.mjs')
+  git(cwd, 'commit', '-m', 'feat: tagged CLI')
+  git(cwd, 'tag', 'v1.2.3')
+  git(cwd, 'checkout', '-q', 'refs/tags/v1.2.3')
+  const bin = mkdtempSync(join(tmpdir(), 'workflow-node-'))
+  const node = execFileSync('which', ['node'], { encoding: 'utf8' }).trim()
+  // Inject only the registry URL, preserving every argument from the workflow.
+  writeFileSync(join(bin, 'node'), '#!/bin/sh\nif [ "$1" = release.mjs ]; then exec "$REAL_NODE" "$@" --registry "$REGISTRY"; fi\nexec "$REAL_NODE" "$@"\n')
+  chmodSync(join(bin, 'node'), 0o755)
+  const output = join(cwd, 'output')
+  const env = { ...process.env, ...envelope, TAG: 'v1.2.3', VERSION: '1.2.3', GITHUB_OUTPUT: output, PATH: `${bin}:${process.env.PATH}`, REAL_NODE: node, REGISTRY: reg.url }
+  delete env.NODE_AUTH_TOKEN
+  for (const [republish, publish] of [['false', 'false'], ['true', 'true']]) {
+    writeFileSync(output, '')
+    const { stdout } = await execFileAsync('bash', ['-c', script], { cwd, env: { ...env, REPUBLISH: republish } })
+    assert.match(stdout, /^exists=true$/m)
+    assert.match(stdout, new RegExp(`^publish=${publish}$`, 'm'))
+    assert.equal(readFileSync(output, 'utf8'), `publish=${publish}\n`)
+  }
+  assert.deepEqual(reg.seen, ['/@fixture%2Fpkg/1.2.3', '/@fixture%2Fpkg/1.2.3'])
+})
+
+test('workflow rejects impossible prepare output combinations in both republish modes', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: null })
+  const output = join(cwd, 'output')
+  for (const [republish, publish, exists] of [['false', 'false', 'false'], ['false', 'true', 'true'], ['true', 'false', 'false'], ['true', 'false', 'true']]) {
+    const content = `skip=false\ntag=v1.2.3\nversion=1.2.3\npublish=${publish}\nexists=${exists}\n`
+    writeFileSync(join(cwd, 'release.mjs'), `import { appendFileSync } from 'node:fs'; appendFileSync(process.argv[process.argv.indexOf('--output')+1], ${JSON.stringify(content)});`)
+    writeFileSync(output, '')
+    await assert.rejects(execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, TAG: 'v1.2.3', VERSION: '1.2.3', REPUBLISH: republish, GITHUB_OUTPUT: output } }), /invalid prepare publish output/)
+    assert.equal(readFileSync(output, 'utf8'), '')
+  }
+})
+
+test('workflow accepts all valid prepare output combinations including republish', async () => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const cwd = repo({ tag: null })
+  const output = join(cwd, 'output')
+  for (const [republish, publish, exists] of [['false', 'true', 'false'], ['false', 'false', 'true'], ['true', 'true', 'false'], ['true', 'true', 'true']]) {
+    const content = `skip=false\ntag=v1.2.3\nversion=1.2.3\npublish=${publish}\nexists=${exists}\n`
+    writeFileSync(join(cwd, 'release.mjs'), `import { appendFileSync } from 'node:fs'; appendFileSync(process.argv[process.argv.indexOf('--output')+1], ${JSON.stringify(content)});`)
+    writeFileSync(output, '')
+    await execFileAsync('bash', ['-c', script], { cwd, env: { ...process.env, ...envelope, TAG: 'v1.2.3', VERSION: '1.2.3', REPUBLISH: republish, GITHUB_OUTPUT: output } })
+    assert.equal(readFileSync(output, 'utf8'), `publish=${publish}\n`)
+  }
 })
 
 test('workflow refuses historical tagged CLI that silently omits prepare outputs', async () => {
