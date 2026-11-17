@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 // scripts/mutate.mjs runs this suite against a deliberately broken copy, so the
@@ -269,7 +270,7 @@ async function stub(respond) {
 
       const holdsNothing = !('assets' in (answered.json || {}))
 
-      const { status = 200, json = {} } =
+      const { status = 200, json = {}, headers = {} } =
         releaseRead && held.size && holdsNothing
           ? {
               json: {
@@ -283,7 +284,8 @@ async function stub(respond) {
       // socket left open by a client makes node:test wait for it
       response.writeHead(status, {
         'content-type': 'application/json',
-        connection: 'close'
+        connection: 'close',
+        ...headers
       })
       response.end(JSON.stringify(json))
     })
@@ -671,6 +673,161 @@ test('a cut refuses a release that stored something other than the build', async
   )
 
   assert.match(message, /holds "app\.zip" at 412 bytes, where the file is 3 bytes/)
+})
+
+test('verified attach refuses an existing asset with different bytes of the same size', async (t) => {
+  let base = ''
+  const replacement = await stub((request) => {
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=1')
+      return { json: [{ id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` }] }
+    if (request.url.startsWith('/upload')) return { status: 422, json: { message: 'already_exists' } }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=1')
+      return { json: [{ name: 'app.zip', size: 3, state: 'uploaded', digest: `sha256:${createHash('sha256').update('old').digest('hex')}` }] }
+    if (request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, assets: [{ name: 'app.zip', size: 3 }] } }
+    return { json: { ok: true } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github',
+    '--api-url', base, '--repo', 'sasjs/app', '--asset', 'app.zip', '--verify-assets'),
+  /cannot verify|digest|different/i)
+  assert.equal(replacement.seen.some((r) => r.method === 'PATCH'), false)
+})
+
+test('verified attach finds paginated drafts and assets and finalizes an identical existing asset', async (t) => {
+  let base = ''
+  const filler = Array.from({ length: 100 }, (_, i) => ({ id: i + 100, tag_name: `v0.0.${i}` }))
+  const fillerAssets = Array.from({ length: 100 }, (_, i) => ({ name: `other-${i}` }))
+  const replacement = await stub((request) => {
+    if (request.url.includes('/releases/tags/')) return { status: 404, json: {} }
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=1') return { json: filler }
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=2')
+      return { json: [{ id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` }] }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=1') return { json: fillerAssets }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=2')
+      return { json: [{ name: 'app.zip', size: 3, state: 'uploaded', digest: `sha256:${createHash('sha256').update('new').digest('hex')}` }] }
+    if (request.method === 'PATCH' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, draft: false, tag_name: 'v1.8.0' } }
+    return { status: 500, json: { message: 'unexpected request' } }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', base,
+    '--repo', 'sasjs/app', '--asset', 'app.zip', '--verify-assets', '--keep-draft')
+  assert.equal(replacement.seen.some((r) => r.method === 'POST' || r.method === 'PATCH'), false)
+  // The finalization is independent of npm's publish decision: rerun after npm
+  // already contains the version and publish the verified draft without an upload.
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--host', 'github', '--api-url', base,
+    '--repo', 'sasjs/app', '--asset', 'app.zip', '--verify-assets')
+  assert.equal(replacement.seen.filter((r) => r.method === 'POST').length, 0)
+  assert.equal(replacement.seen.filter((r) => r.method === 'PATCH').length, 1)
+})
+
+test('verified attach uploads missing assets and publishes only after digest verification', async (t) => {
+  let base = ''
+  let uploaded = false
+  const digest = `sha256:${createHash('sha256').update('new').digest('hex')}`
+  const replacement = await stub((request) => {
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=1')
+      return { json: [{ id: 9, draft: true, tag_name: 'v1.8.0', upload_url: `${base}/upload{?name,label}` }] }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=1')
+      return { json: uploaded ? [{ name: 'app.zip', size: 3, state: 'uploaded', digest }] : [] }
+    if (request.method === 'POST' && request.url.startsWith('/upload?')) { uploaded = true; return { json: {} } }
+    if (request.method === 'PATCH' && request.url === '/repos/sasjs/app/releases/9')
+      return { json: { id: 9, tag_name: 'v1.8.0', draft: false } }
+    return { status: 500, json: {} }
+  })
+  t.after(() => replacement.stop())
+  base = replacement.base
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', base, '--repo', 'sasjs/app', '--asset', 'app.zip')
+  assert.deepEqual(replacement.seen.filter((r) => r.method !== 'GET').map((r) => r.method), ['POST', 'PATCH'])
+  assert.equal(replacement.seen.find((r) => r.method === 'POST').body, 'new')
+})
+
+test('verified attach refuses unsupported hosts and misplaced flags', () => {
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  assert.match(failure(cwd, '--verify-assets', '--release', '--host', 'github'), /requires --attach/)
+  assert.match(failure(cwd, '--verify-assets', '--attach', '', '--host', 'github', '--asset', 'app.zip'), /non-empty/)
+  assert.match(failure(cwd, '--verify-assets', '--attach', 'v1.8.0', '--host', 'gitlab', '--asset', 'app.zip'), /github only/)
+})
+
+test('verified attach refuses missing digest, starter state, and unknown draft status', async (t) => {
+  let asset = { name: 'app.zip', size: 3, state: 'uploaded', digest: null }
+  let draft = true
+  const replacement = await stub((request) => {
+    if (request.url === '/repos/sasjs/app/releases?per_page=100&page=1')
+      return { json: [{ id: 9, draft, tag_name: 'v1.8.0' }] }
+    if (request.url === '/repos/sasjs/app/releases/9/assets?per_page=100&page=1') return { json: [asset] }
+    return { status: 500, json: {} }
+  })
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  const runIt = () => runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', 'app.zip')
+  await assert.rejects(runIt(), /cannot verify digest/)
+  asset = { ...asset, state: 'starter', digest: `sha256:${createHash('sha256').update('new').digest('hex')}` }
+  await assert.rejects(runIt(), /cannot verify digest/)
+  draft = null
+  await assert.rejects(runIt(), /cannot verify release status/)
+  assert.equal(replacement.seen.some((r) => r.method === 'PATCH' || r.method === 'DELETE'), false)
+})
+
+test('verified attach never follows a credential-bearing redirect', async (t) => {
+  const receiver = await stub(() => ({ json: [] }))
+  t.after(() => receiver.stop())
+  const replacement = await stub(() => ({ status: 302, headers: { location: `${receiver.base}/stolen` } }))
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', 'app.zip'))
+  assert.equal(receiver.seen.length, 0)
+})
+
+test('verified attach rejects ambiguous repository paths before making any API call', async (t) => {
+  const replacement = await stub(() => ({ json: [] }))
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app/../../other', '--asset', 'app.zip'), /owner\/name/)
+  assert.equal(replacement.seen.length, 0)
+})
+
+test('verified attach refuses insecure API endpoints outside loopback', async () => {
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', 'http://example.com', '--repo', 'sasjs/app', '--asset', 'app.zip'), /HTTPS/)
+})
+
+test('verified attach fails closed when a server repeats a full page', async (t) => {
+  const page = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, tag_name: `v0.0.${i}` }))
+  const replacement = await stub(() => ({ json: page }))
+  t.after(() => replacement.stop())
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  process.env.GH_TOKEN = 'token-123'
+  await assert.rejects(runInParallel(cwd, '--attach', 'v1.8.0', '--verify-assets', '--host', 'github',
+    '--api-url', replacement.base, '--repo', 'sasjs/app', '--asset', 'app.zip'), /pagination.*repeat/i)
+  assert.equal(replacement.seen.length, 2)
 })
 
 test('--attach says so when the host reports no size, rather than trusting the name', async (t) => {

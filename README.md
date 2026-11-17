@@ -54,6 +54,7 @@ Two things it does that the toolchain cannot:
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
+| `--verify-assets` | with `--attach`, require GitHub SHA-256 digests for every named file before publishing; unsupported hosts fail |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--discover-publish` | resolve and validate a publish tag without reading the package or registry |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
@@ -249,6 +250,10 @@ because a release published before its files exist is one whose download links a
 names, and then publishes the draft - so a release that fails to attach stays
 invisible instead of advertising downloads that answer 404. `--keep-draft` leaves it
 drafted for a later step to publish.
+
+For strict GitHub verification, add `--verify-assets`: every configured asset must have state `uploaded`, its size must match, and its GitHub `sha256:` digest must equal the local bytes. A missing or unsupported digest fails closed, including older assets for which GitHub does not provide one. No asset is deleted or overwritten; resolve mismatches manually. The release and asset lists are paginated. Strict mode rejects redirects rather than forwarding credentials, and requires a unique release for the tag. Each file is buffered in memory while it is processed, so very large files can exceed the runner's memory; a verification failure does not publish a draft.
+
+To recover a draft after an interrupted npm publish, rebuild the identical assets from the tag and run `--attach "$TAG" --verify-assets --keep-draft` before npm publish. Then run `--attach "$TAG" --verify-assets` after npm publish succeeds **or was already published**: it verifies again and publishes the draft. Gate this last step on tag discovery and successful preparation, not on `publish=true`, so an npm-already-published retry still finalizes. A rebuilt file that differs must not replace the original automatically. Strict verification is opt-in and does not change the default attach behavior or other hosts.
 
 ### Coming from `semantic-release`
 
