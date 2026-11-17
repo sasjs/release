@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import http from 'node:http'
@@ -135,6 +135,32 @@ test('publish workflow runs the checked-out tag CLI to prepare, then updates the
   assert.ok(checkout >= 0 && checkout < suite && suite < prepare && prepare < stamp && stamp < publish)
   assert.match(workflow.slice(prepare, publish), /node release\.mjs/)
   assert.doesNotMatch(workflow, /--discover-publish/)
+})
+
+test('discovery uses the explicit tag ref for ancestry of manual and SHA-selected tags', async () => {
+  const cwd = repo()
+  git(cwd, 'branch', 'v1.2.3')
+  const sha = git(cwd, 'rev-parse', 'HEAD')
+  const bin = mkdtempSync(join(tmpdir(), 'discovery-git-'))
+  const trace = join(bin, 'args')
+  const wrapper = join(bin, 'git')
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+  writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = merge-base ]; then printf "%s\\n" "$@" > "$GIT_TRACE_ARGS"; fi\nexec "$REAL_GIT" "$@"\n')
+  chmodSync(wrapper, 0o755)
+  const env = { ...process.env, ...envelope, PATH: `${bin}:${process.env.PATH}`, REAL_GIT: realGit, GIT_TRACE_ARGS: trace }
+  for (const selector of [['--tag', 'v1.2.3'], ['--sha', sha]]) {
+    const result = await execFileAsync('node', [CLI, '--repo-dir', cwd, '--discover-publish', ...selector], { encoding: 'utf8', env })
+    assert.match(result.stdout, /tag=v1\.2\.3/)
+    assert.deepEqual(readFileSync(trace, 'utf8').trim().split('\n'), ['merge-base', '--is-ancestor', 'refs/tags/v1.2.3^{commit}', 'HEAD'])
+  }
+})
+
+test('prepare-publish keeps accepting a legacy branch as its tag argument', async () => {
+  const cwd = repo({ tag: null })
+  git(cwd, 'branch', 'v1.2.3')
+  const result = await run(cwd, '--tag', 'v1.2.3', '--no-registry-lookup')
+  assert.equal(result.ok, true, result.out)
+  assert.match(result.out, /publish=true/)
 })
 
 test('discovery validates the actual tag even when a branch has the same name', async () => {

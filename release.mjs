@@ -940,10 +940,11 @@ async function preparePublish() {
 
   // --- which tag is this run for?
   let tag = arg('tag')
+  const tagRef = (value) => flag('discover-publish') ? `refs/tags/${value}` : value
   if (flag('discover-publish') && flag('tag') && !tag) fail('--tag needs a non-empty tag')
   if (flag('discover-publish') && flag('tag') && flag('sha')) fail('--tag and --sha cannot be combined')
   if (tag) {
-    const ref = flag('discover-publish') ? `refs/tags/${tag}` : tag
+    const ref = tagRef(tag)
     if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)))
       fail(`--tag ${tag} is not in this repository`)
   } else {
@@ -993,7 +994,7 @@ async function preparePublish() {
   if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
 
   const holding = candidates.find((candidate) =>
-    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tag}^{commit}`, candidate))
+    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tagRef(tag)}^{commit}`, candidate))
   )
   if (!holding) fail(`${tag} is not on ${branch} - refusing to publish it`)
   if (holding !== branch)
