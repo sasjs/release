@@ -1242,6 +1242,7 @@ async function main() {
   if (flag('verify-assets')) {
     if (!flag('attach') || flag('release') || flag('prepare-publish') || flag('discover-publish'))
       fail('--verify-assets requires --attach and cannot be combined with release or publish modes')
+    if (flag('dry-run')) fail('--verify-assets cannot be combined with --dry-run')
     // Preserve --show-context's existing read-only behavior for attach options.
     if (!flag('show-context')) {
       if (!arg('attach')) fail('--attach needs a non-empty tag with --verify-assets')

@@ -900,6 +900,13 @@ test('verified attach uploads missing assets and publishes only after digest ver
   assert.equal(replacement.seen.find((r) => r.method === 'POST').body, 'new')
 })
 
+test('verified attach refuses dry-run rather than claiming unperformed verification', () => {
+  const cwd = repo()
+  writeFileSync(join(cwd, 'app.zip'), 'new')
+  assert.match(failure(cwd, '--verify-assets', '--dry-run', '--attach', 'v1.8.0', '--host', 'github',
+    '--repo', 'sasjs/app', '--asset', 'app.zip', '--api-url', 'http://example.com'), /--verify-assets cannot be combined with --dry-run/)
+})
+
 test('verified attach refuses unsupported hosts and misplaced flags', () => {
   const cwd = repo()
   writeFileSync(join(cwd, 'app.zip'), 'new')
