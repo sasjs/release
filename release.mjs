@@ -21,7 +21,8 @@
  * before the tag step, and the tag alone exists when it is returned after.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { createHash } from 'node:crypto'
 
@@ -697,36 +698,59 @@ async function attachVerified({ api, headers, repo, tag, files }) {
     fail(`cannot verify release status for ${tag}`)
   if (new Set(files.map((file) => file.name)).size !== files.length)
     fail('duplicate asset names cannot be verified')
-  const desired = []
-  const assetsPath = `${path}/${release.id}/assets`
-  let assets = await strictPages(assetsPath, headers)
-  for (const file of files) {
-    const bytes = readFileSync(file.path)
-    desired.push({ name: file.name, size: bytes.length, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` })
-    const held = assets.filter((asset) => asset.name === file.name)
-    if (held.length > 1) fail(`duplicate asset ${file.name}`)
-    if (!held.length) {
-      if (typeof release.upload_url !== 'string' || !release.upload_url) fail(`missing upload URL for ${tag}`)
-      const upload = new URL(release.upload_url.replace(/\{.*$/, ''))
-      const apiUrl = new URL(base)
-      const trusted = upload.origin === apiUrl.origin ||
-        (apiUrl.origin === 'https://api.github.com' && upload.origin === 'https://uploads.github.com')
-      if (!trusted || upload.username || upload.password) fail('untrusted upload URL')
-      upload.searchParams.set('name', file.name)
-      if (file.label) upload.searchParams.set('label', file.label)
-      await strictRequest(upload.href, { method: 'POST', headers: { ...headers, 'content-type': 'application/octet-stream' }, body: bytes })
+  const snapshotDir = mkdtempSync(join(tmpdir(), 'sasjs-release-assets-'))
+  try {
+    const desired = files.map((file, index) => {
+      const bytes = readFileSync(file.path)
+      const snapshot = join(snapshotDir, String(index))
+      writeFileSync(snapshot, bytes, { mode: 0o600, flag: 'wx' })
+      return { ...file, snapshot, size: bytes.length, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` }
+    })
+    const assetsPath = `${path}/${release.id}/assets`
+    let assets = await strictPages(assetsPath, headers)
+    const verify = (file, held) => {
+      if (held.length !== 1 || held[0].state !== 'uploaded' || held[0].size !== file.size || held[0].digest !== file.digest)
+        throw new Error(`cannot verify digest for ${file.name}`)
     }
-  }
-  assets = await strictPages(assetsPath, headers)
-  for (const file of desired) {
-    const held = assets.filter((asset) => asset.name === file.name)
-    if (held.length !== 1 || held[0].state !== 'uploaded' || held[0].size !== file.size || held[0].digest !== file.digest)
-      fail(`cannot verify digest for ${file.name}`)
-  }
-  if (release.draft && !flag('keep-draft')) {
-    const result = await strictRequest(`${path}/${release.id}`, { method: 'PATCH', headers, json: { draft: false } })
-    if (result.id !== release.id || result.tag_name !== tag || result.draft !== false)
-      fail(`cannot confirm publication of ${tag}`)
+    for (const file of desired) {
+      const held = assets.filter((asset) => asset.name === file.name)
+      if (held.length) verify(file, held)
+    }
+    const confirmIdentity = async () => {
+      const current = await strictRequest(`${path}/${release.id}`, { headers })
+      if (current.id !== release.id || current.tag_name !== tag || current.draft !== release.draft)
+        throw new Error(`release identity or draft status changed for ${tag}`)
+    }
+    if (desired.some((file) => !assets.some((asset) => asset.name === file.name)))
+      await confirmIdentity()
+    for (const file of desired) {
+      if (!assets.some((asset) => asset.name === file.name)) {
+        if (typeof release.upload_url !== 'string' || !release.upload_url) throw new Error(`missing upload URL for ${tag}`)
+        const upload = new URL(release.upload_url.replace(/\{.*$/, ''))
+        const apiUrl = new URL(base)
+        const trusted = upload.origin === apiUrl.origin ||
+          (apiUrl.origin === 'https://api.github.com' && upload.origin === 'https://uploads.github.com')
+        const expectedPath = new URL(assetsPath).pathname
+        if (!trusted || upload.username || upload.password || upload.search || upload.hash || upload.pathname !== expectedPath)
+          throw new Error('untrusted upload URL')
+        const bytes = readFileSync(file.snapshot)
+        if (bytes.length !== file.size || `sha256:${createHash('sha256').update(bytes).digest('hex')}` !== file.digest)
+          throw new Error(`snapshot changed for ${file.name}`)
+        upload.searchParams.set('name', file.name)
+        if (file.label) upload.searchParams.set('label', file.label)
+        await strictRequest(upload.href, { method: 'POST', headers: { ...headers, 'content-type': 'application/octet-stream' }, body: bytes })
+      }
+    }
+    assets = await strictPages(assetsPath, headers)
+    for (const file of desired) verify(file, assets.filter((asset) => asset.name === file.name))
+    await confirmIdentity()
+    if (release.draft && !flag('keep-draft')) {
+      const result = await strictRequest(`${path}/${release.id}`, { method: 'PATCH', headers, json: { draft: false } })
+      if (result.id !== release.id || result.tag_name !== tag || result.draft !== false)
+        throw new Error(`cannot confirm publication of ${tag}`)
+    }
+  } finally {
+    rmSync(snapshotDir, { recursive: true, force: true })
   }
 }
 
