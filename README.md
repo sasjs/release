@@ -54,7 +54,7 @@ Two things it does that the toolchain cannot:
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
-| `--verify-assets` | with `--attach`, require GitHub SHA-256 digests for every named file before publishing; unsupported hosts and `--dry-run` fail |
+| `--verify-assets` | with `--attach`, require GitHub SHA-256 digests for every named file before publishing; unsupported hosts and `--dry-run` fail (except the read-only `--show-context` mode) |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--discover-publish` | resolve and validate a publish tag without reading the package or registry |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |

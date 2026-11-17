@@ -905,6 +905,8 @@ test('verified attach refuses dry-run rather than claiming unperformed verificat
   writeFileSync(join(cwd, 'app.zip'), 'new')
   assert.match(failure(cwd, '--verify-assets', '--dry-run', '--attach', 'v1.8.0', '--host', 'github',
     '--repo', 'sasjs/app', '--asset', 'app.zip', '--api-url', 'http://example.com'), /--verify-assets cannot be combined with --dry-run/)
+  assert.match(run(cwd, '--verify-assets', '--dry-run', '--attach', 'v1.8.0', '--show-context', '--host', 'github',
+    '--repo', 'sasjs/app', '--asset', 'app.zip'), /host=github/)
 })
 
 test('verified attach refuses unsupported hosts and misplaced flags', () => {
