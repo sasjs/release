@@ -54,6 +54,7 @@ Two things it does that the toolchain cannot:
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
+| `--verify-assets` | with `--attach`, require GitHub SHA-256 digests for every named file before publishing; unsupported hosts and `--dry-run` fail (except the read-only `--show-context` mode) |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
 | `--discover-publish` | resolve and validate a publish tag without reading the package or registry |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
@@ -249,6 +250,14 @@ because a release published before its files exist is one whose download links a
 names, and then publishes the draft - so a release that fails to attach stays
 invisible instead of advertising downloads that answer 404. `--keep-draft` leaves it
 drafted for a later step to publish.
+
+For strict GitHub verification, add `--verify-assets`: every configured asset must have state `uploaded`, its size must match, and its GitHub `sha256:` digest must equal the snapshot bytes. Before uploading anything, strict mode snapshots all local files sequentially into a private temporary directory and checks every already-present named asset. Files are read at different times, not as an atomic filesystem snapshot; avoid changing build outputs during the run. It hashes and uploads the same in-memory bytes for each missing asset, and checks the snapshot against its original hash first. One file is buffered at a time, but very large files can exceed memory, and disk space is needed for all snapshots. Temporary files are removed on normal success or failure; abrupt termination can leave them behind.
+
+A missing or unsupported digest fails closed, including older assets for which GitHub does not provide one. No remote asset is deleted or overwritten; resolve mismatches manually. An upload or later check can fail after earlier uploads succeeded, leaving those assets in place. Only configured assets are checked; other existing assets can also become public when a draft is published. The release and asset lists are paginated, redirects are rejected, and the upload endpoint must match the selected repository and release ID. Strict mode re-reads the release by ID before the first upload and after final asset verification, checking its tag and draft status; on the draft path this last read is immediately before publishing. This is not atomic: GitHub provides no conditional operation tying those reads and the asset checks to uploads or the publication PATCH. A concurrent writer can change the release or its assets between checks and writes; coordinate or exclude concurrent writers. A failed post-PATCH confirmation cannot undo publication.
+
+Strict requests explicitly send `X-GitHub-Api-Version: 2022-11-28`, including to custom GitHub-compatible endpoints; an endpoint that does not support this version may reject them. The version header does not guarantee a digest exists, and older assets or unsupported hosts still fail verification.
+
+To recover a draft after an interrupted npm publish, rebuild the identical assets from the tag and run `--attach "$TAG" --verify-assets --keep-draft` before npm publish. Then run `--attach "$TAG" --verify-assets` after npm publish succeeds **or was already published**: it verifies again and publishes the draft. Gate this last step on tag discovery and successful preparation, not on `publish=true`, so an npm-already-published retry still finalizes. A rebuilt file that differs must not replace the original automatically. Strict verification is opt-in and does not change the default attach behavior or other hosts.
 
 ### Coming from `semantic-release`
 

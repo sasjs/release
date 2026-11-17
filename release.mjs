@@ -21,8 +21,10 @@
  * before the tag step, and the tag alone exists when it is returned after.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
+import { createHash } from 'node:crypto'
 
 const LEVELS = { major: 3, minor: 2, patch: 1 }
 
@@ -41,6 +43,7 @@ const HELP = `sasjs-release - releases from conventional commits
   --attach <tag>         upload the configured assets to a release that already
                          exists, and nothing else: for artefacts built after the
                          tag, with the version stamped into them
+  --verify-assets        with --attach, require GitHub SHA-256 digests before publishing
   --level <l>            force patch|minor|major instead of classifying
   --discover-publish     resolve a publish tag without stamping or registry access
   --prepare-publish      resolve and gate a publish, stamp the version, ask the
@@ -85,7 +88,7 @@ const known = new Set([
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
-  'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
+  'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header', 'verify-assets'
 ])
 
 function checkFlags() {
@@ -649,8 +652,116 @@ const HOSTS = {
  * and this is the second half of that: the same list, uploaded to the tag that
  * has already been made.
  */
+async function strictRequest(url, options = {}) {
+  const response = await fetch(url, {
+    method: options.method || 'GET',
+    headers: { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', ...options.headers,
+      ...(options.json === undefined ? {} : { 'content-type': 'application/json' }) },
+    body: options.json === undefined ? options.body : JSON.stringify(options.json),
+    redirect: 'error'
+  })
+  const text = await response.text()
+  if (!response.ok) throw new HttpError(options.method || 'GET', url, response.status, text)
+  return text ? JSON.parse(text) : {}
+}
+
+async function strictPages(url, headers) {
+  const all = []
+  const pages = new Set()
+  for (let page = 1; page <= 10000; page++) {
+    const entries = await strictRequest(`${url}?per_page=100&page=${page}`, { headers })
+    if (!Array.isArray(entries) || entries.length > 100) throw new Error(`invalid listing from ${url}`)
+    // Keep fixed-size digests (at most 10,000), not a second copy of each page.
+    // Remember all digests so nonconsecutive pagination cycles also fail closed.
+    const fingerprint = createHash('sha256').update(JSON.stringify(entries)).digest('hex')
+    if (entries.length && pages.has(fingerprint)) throw new Error(`pagination repeated at ${url}`)
+    pages.add(fingerprint)
+    all.push(...entries)
+    if (entries.length < 100) return all
+  }
+  throw new Error(`pagination exceeded 10000 pages at ${url}`)
+}
+
+async function attachVerified({ api, headers, repo, tag, files }) {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9_.-]+$/.test(repo) || repo.endsWith('/.') || repo.endsWith('/..'))
+    fail('--verify-assets requires --repo owner/name')
+  const base = api || HOSTS.github.api
+  const endpoint = new URL(base)
+  const loopback = endpoint.hostname === '127.0.0.1' || endpoint.hostname === '[::1]'
+  if ((endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback)) ||
+      endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
+    fail('--verify-assets requires HTTPS without URL credentials or query')
+  const path = `${base.replace(/\/+$/, '')}/repos/${repo}/releases`
+  const releases = await strictPages(path, headers)
+  const matches = releases.filter((release) => release.tag_name === tag)
+  if (matches.length !== 1) fail(`expected one release for ${tag}, found ${matches.length}`)
+  const release = matches[0]
+  if (!Number.isSafeInteger(release.id) || release.id <= 0 || typeof release.draft !== 'boolean')
+    fail(`cannot verify release status for ${tag}`)
+  if (new Set(files.map((file) => file.name)).size !== files.length)
+    fail('duplicate asset names cannot be verified')
+  const snapshotDir = mkdtempSync(join(tmpdir(), 'sasjs-release-assets-'))
+  try {
+    const desired = files.map((file, index) => {
+      const bytes = readFileSync(file.path)
+      const snapshot = join(snapshotDir, String(index))
+      writeFileSync(snapshot, bytes, { mode: 0o600, flag: 'wx' })
+      return { ...file, snapshot, size: bytes.length, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` }
+    })
+    const assetsPath = `${path}/${release.id}/assets`
+    let assets = await strictPages(assetsPath, headers)
+    const verify = (file, held) => {
+      if (held.length !== 1 || held[0].state !== 'uploaded' || held[0].size !== file.size || held[0].digest !== file.digest)
+        throw new Error(`cannot verify digest for ${file.name}`)
+    }
+    for (const file of desired) {
+      const held = assets.filter((asset) => asset.name === file.name)
+      if (held.length) verify(file, held)
+    }
+    const confirmIdentity = async () => {
+      const current = await strictRequest(`${path}/${release.id}`, { headers })
+      if (current.id !== release.id || current.tag_name !== tag || current.draft !== release.draft)
+        throw new Error(`release identity or draft status changed for ${tag}`)
+    }
+    if (desired.some((file) => !assets.some((asset) => asset.name === file.name)))
+      await confirmIdentity()
+    for (const file of desired) {
+      if (!assets.some((asset) => asset.name === file.name)) {
+        if (typeof release.upload_url !== 'string' || !release.upload_url) throw new Error(`missing upload URL for ${tag}`)
+        const upload = new URL(release.upload_url.replace(/\{.*$/, ''))
+        const apiUrl = new URL(base)
+        const trusted = upload.origin === apiUrl.origin ||
+          (apiUrl.origin === 'https://api.github.com' && upload.origin === 'https://uploads.github.com')
+        const expectedPath = new URL(assetsPath).pathname
+        if (!trusted || upload.username || upload.password || upload.search || upload.hash || upload.pathname !== expectedPath)
+          throw new Error('untrusted upload URL')
+        const bytes = readFileSync(file.snapshot)
+        if (bytes.length !== file.size || `sha256:${createHash('sha256').update(bytes).digest('hex')}` !== file.digest)
+          throw new Error(`snapshot changed for ${file.name}`)
+        upload.searchParams.set('name', file.name)
+        if (file.label) upload.searchParams.set('label', file.label)
+        await strictRequest(upload.href, { method: 'POST', headers: { ...headers, 'content-type': 'application/octet-stream' }, body: bytes })
+      }
+    }
+    assets = await strictPages(assetsPath, headers)
+    for (const file of desired) verify(file, assets.filter((asset) => asset.name === file.name))
+    await confirmIdentity()
+    if (release.draft && !flag('keep-draft')) {
+      const result = await strictRequest(`${path}/${release.id}`, { method: 'PATCH', headers, json: { draft: false } })
+      if (result.id !== release.id || result.tag_name !== tag || result.draft !== false)
+        throw new Error(`cannot confirm publication of ${tag}`)
+    }
+  } finally {
+    rmSync(snapshotDir, { recursive: true, force: true })
+  }
+}
+
 async function attachAssets({ host, api, token, header, repo, tag, files }) {
   const headers = authHeaders(host, token, header)
+
+  if (flag('verify-assets')) {
+    return attachVerified({ api, headers, repo, tag, files })
+  }
 
   if (host === 'github') {
     const base = api || HOSTS.github.api
@@ -1128,6 +1239,18 @@ async function main() {
   }
 
   checkFlags()
+  if (flag('verify-assets')) {
+    if (!flag('attach') || flag('release') || flag('prepare-publish') || flag('discover-publish'))
+      fail('--verify-assets requires --attach and cannot be combined with release or publish modes')
+    // Preserve --show-context's existing read-only behavior for attach options.
+    if (!flag('show-context')) {
+      if (flag('dry-run')) fail('--verify-assets cannot be combined with --dry-run')
+      if (!arg('attach')) fail('--attach needs a non-empty tag with --verify-assets')
+      const host = arg('host', detectContext().host)
+      if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
+      if (host !== 'github') fail('--verify-assets supports github only')
+    }
+  }
 
   if (flag('discover-publish') || flag('prepare-publish')) {
     if (flag('discover-publish') && flag('prepare-publish'))
