@@ -55,6 +55,7 @@ Two things it does that the toolchain cannot:
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
 | `--asset-link <n=url>` | link to attach (repeatable; the only asset shape GitLab has) |
+| `--discover-publish` | resolve and validate a publish tag without reading the package or registry |
 | `--prepare-publish` | gate a publish instead of cutting a release - see below |
 | `--sha <sha>` | commit to look for a tag at, with `--prepare-publish` (default: `HEAD`) |
 | `--branch <ref>` | the branch a publishable tag must be on (default: `HEAD`) |
@@ -85,19 +86,11 @@ npx @sasjs/release --prepare-publish --sha "$SHA" --branch main --output "$GITHU
 
 It prints, and emits with `--output`: `skip`, `tag`, `version`, `publish`, `exists`.
 
-It does not run `npm publish` - that stays in the publishing workflow, which is the identity npm trusts for provenance - and it does not create the tag or the release; that is what the rest of this tool is for. A publish workflow therefore reads:
+For a pipeline that must check out the tag **before** changing the package, `--discover-publish` does just the Git decision. It emits `skip`, `tag`, and `version`, does not read or stamp `package.json`, and never contacts a registry. Supply either `--tag` (an actual prefixed SemVer tag) or `--sha` (a full 40- or 64-character commit object ID); otherwise it uses HEAD. Discovery ignores non-version tags, selects by SemVer precedence, and rejects equal-precedence ties rather than choosing arbitrarily. A shallow checkout fails even when it has a tag, because the checkout may omit another tag at the same commit. The branch must resolve, and the tag must be reachable from `--branch` or `origin/<branch>`. Do not treat discovery as permission to publish: run `--prepare-publish` on the checked-out tag, validate its complete output, then use its `publish` output. The repository's own workflow runs discovery from trusted main and preparation from the tag; an old tagged CLI that cannot prepare must fail rather than silently skip publication. Its npm workflow rejects build metadata because `npm version` strips it.
 
-```yaml
-- uses: actions/checkout@<sha>
-  with: { ref: main, fetch-depth: 0, persist-credentials: false }
-- run: npm run release -- --prepare-publish --sha "${{ github.event.workflow_run.head_sha }}" --branch main --output "$GITHUB_OUTPUT"
-  id: prepare
-  env: { NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}' }
-- run: git checkout -q "refs/tags/${{ steps.prepare.outputs.tag }}"
-  if: steps.prepare.outputs.skip != 'true'
-- run: npm publish --provenance
-  if: steps.prepare.outputs.publish == 'true'
-```
+It does not run `npm publish` - that stays in the publishing workflow, which is the identity npm trusts for provenance - and it does not create the tag or the release. See [the publish workflow](.github/workflows/publish.yml) for the complete sequence, including validation of the tagged CLI's outputs before using them.
+
+If the project has a lockfile, synchronize it after preparation and before publishing (for example, `npm version "$VERSION" --no-git-tag-version --allow-same-version`). `--prepare-publish` updates `package.json` only.
 
 `--dry-run` prints the same decisions and writes nothing, which is how a failing publish job is debugged without publishing.
 

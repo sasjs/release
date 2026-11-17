@@ -42,6 +42,7 @@ const HELP = `sasjs-release - releases from conventional commits
                          exists, and nothing else: for artefacts built after the
                          tag, with the version stamped into them
   --level <l>            force patch|minor|major instead of classifying
+  --discover-publish     resolve a publish tag without stamping or registry access
   --prepare-publish      resolve and gate a publish, stamp the version, ask the
                          registry; writes no tag and creates no release
   --sha <sha>            commit to look for a tag at (default: HEAD)
@@ -81,7 +82,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // exist rather than failing.
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
-  'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
+  'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
   'since', 'tag', 'tag-prefix', 'title', 'token-env', 'token-header'
@@ -144,6 +145,32 @@ const succeeds = (fn) => {
   } catch {
     return false
   }
+}
+
+// SemVer precedence ignores build metadata; ties are rejected rather than choosing
+// between distinct tags that name the same precedence arbitrarily.
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
+function parseVersion(version) {
+  const match = SEMVER.exec(version)
+  if (!match || (match[4] && match[4].split('.').some((part) => /^\d+$/.test(part) && part.length > 1 && part[0] === '0'))) return null
+  return { core: match.slice(1, 4), pre: match[4]?.split('.') }
+}
+function compareVersion(a, b) {
+  const numeric = (x, y) => x.length - y.length || (x < y ? -1 : x > y ? 1 : 0)
+  for (let i = 0; i < 3; i++) {
+    const diff = numeric(a.core[i], b.core[i])
+    if (diff) return diff
+  }
+  if (!a.pre || !b.pre) return a.pre ? -1 : b.pre ? 1 : 0
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+    if (a.pre[i] === undefined) return -1
+    if (b.pre[i] === undefined) return 1
+    const x = a.pre[i], y = b.pre[i]
+    const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y)
+    const diff = xn && yn ? numeric(x, y) : xn ? -1 : yn ? 1 : x < y ? -1 : x > y ? 1 : 0
+    if (diff) return diff
+  }
+  return 0
 }
 
 /** The commit range to classify: after the newest tag carrying our prefix. */
@@ -924,29 +951,54 @@ async function preparePublish() {
   const prefix = arg('tag-prefix', 'v')
   const dry = flag('dry-run')
   const branch = arg('branch', 'HEAD')
+  let candidates
+  if (flag('discover-publish')) {
+    candidates = [branch, `origin/${branch}`].filter((candidate) =>
+      succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${candidate}^{commit}`))
+    )
+    if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
+  }
+  if (flag('discover-publish') && git(cwd, 'rev-parse', '--is-shallow-repository') === 'true')
+    fail('this checkout is shallow; fetch a full history and tags (fetch-depth: 0)')
 
   const packagePath = join(cwd, 'package.json')
   let pkg
-  try {
-    pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
-  } catch (error) {
-    fail(`cannot read ${packagePath}: ${error.message}`)
+  if (!flag('discover-publish')) {
+    try {
+      pkg = JSON.parse(readFileSync(packagePath, 'utf8'))
+    } catch (error) {
+      fail(`cannot read ${packagePath}: ${error.message}`)
+    }
   }
 
   // --- which tag is this run for?
   let tag = arg('tag')
+  const tagRef = (value) => flag('discover-publish') ? `refs/tags/${value}` : value
+  if (flag('discover-publish') && flag('tag') && !tag) fail('--tag needs a non-empty tag')
+  if (flag('discover-publish') && flag('tag') && flag('sha')) fail('--tag and --sha cannot be combined')
   if (tag) {
-    if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${tag}^{commit}`)))
+    const ref = tagRef(tag)
+    if (!succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', '--end-of-options', `${ref}^{commit}`)))
       fail(`--tag ${tag} is not in this repository`)
   } else {
-    const sha = arg('sha') || git(cwd, 'rev-parse', 'HEAD')
-    tag = (
+    const sha = flag('discover-publish') ? arg('sha', 'HEAD') : (arg('sha') || git(cwd, 'rev-parse', 'HEAD'))
+    if (flag('discover-publish') &&
+        ((flag('sha') && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) ||
+         !succeeds(() => git(cwd, 'rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`))))
+      fail(`--sha ${sha || '(empty)'} is not a valid commit SHA in this repository`)
+    const found = (
       attempt(() =>
         git(cwd, 'tag', '--points-at', sha, '--list', `${prefix}[0-9]*`, '--sort=-v:refname')
       ) || ''
-    )
-      .split('\n')
-      .filter(Boolean)[0]
+    ).split('\n').filter(Boolean)
+    if (flag('discover-publish')) {
+      const parsed = found.map((value) => ({ tag: value, version: parseVersion(value.slice(prefix.length)) }))
+      const valid = parsed.filter((entry) => entry.tag.startsWith(prefix) && entry.version)
+        .sort((a, b) => compareVersion(b.version, a.version))
+      if (valid.length > 1 && compareVersion(valid[0].version, valid[1].version) === 0)
+        fail(`multiple tags have equal version precedence: ${valid[0].tag}, ${valid[1].tag}`)
+      tag = valid[0]?.tag
+    } else tag = found[0]
 
     if (!tag) {
       // A shallow clone has no tags, so it cannot tell "this release cut no tag"
@@ -958,26 +1010,30 @@ async function preparePublish() {
             'fetch the tags (fetch-depth: 0) rather than reporting that there was nothing to publish'
         )
       console.log(`no ${prefix}* tag at ${sha.slice(0, 7)} - that release cut nothing`)
-      output({ skip: true, tag: '', version: '', publish: false, exists: false })
+      output(flag('discover-publish')
+        ? { skip: true, tag: '', version: '' }
+        : { skip: true, tag: '', version: '', publish: false, exists: false })
       return
     }
   }
 
   const version = tag.slice(prefix.length)
-  if (!/^\d+\.\d+\.\d+/.test(version))
+  if (flag('discover-publish')
+    ? !tag.startsWith(prefix) || !parseVersion(version)
+    : !/^\d+\.\d+\.\d+/.test(version))
     fail(`${tag} does not carry a version after the ${prefix} prefix`)
 
   // --- a tag cut from a branch nobody merged is not a release of this branch.
   // The forge's ref is authoritative, so a local branch that is merely behind
   // does not block a publish - it is the operator's checkout that is stale, and
   // saying so is more use than refusing on a technicality.
-  const candidates = [branch, `origin/${branch}`].filter((candidate) =>
+  candidates ||= [branch, `origin/${branch}`].filter((candidate) =>
     succeeds(() => git(cwd, 'rev-parse', '-q', '--verify', `${candidate}^{commit}`))
   )
   if (!candidates.length) fail(`cannot resolve ${branch} in this repository`)
 
   const holding = candidates.find((candidate) =>
-    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tag}^{commit}`, candidate))
+    succeeds(() => git(cwd, 'merge-base', '--is-ancestor', `${tagRef(tag)}^{commit}`, candidate))
   )
   if (!holding) fail(`${tag} is not on ${branch} - refusing to publish it`)
   if (holding !== branch)
@@ -985,6 +1041,12 @@ async function preparePublish() {
       `note: the local ${branch} does not contain ${tag}, ${holding} does - ` +
         'this checkout is behind, so fetch before trusting anything built from it'
     )
+
+  if (flag('discover-publish')) {
+    output({ skip: false, tag, version })
+    return
+  }
+
 
   // --- stamp the version npm will read, and so make drift impossible
   const before = pkg.version
@@ -1065,7 +1127,9 @@ async function main() {
 
   checkFlags()
 
-  if (flag('prepare-publish')) {
+  if (flag('discover-publish') || flag('prepare-publish')) {
+    if (flag('discover-publish') && flag('prepare-publish'))
+      fail('--discover-publish and --prepare-publish are mutually exclusive')
     await preparePublish()
     return
   }
