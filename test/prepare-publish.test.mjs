@@ -291,6 +291,36 @@ test('workflow accepts the tagged CLI prepare contract and rejects malformed or 
   } finally { reg.stop() }
 })
 
+test('workflow passes republish to the real tagged CLI for an existing registry version', async (t) => {
+  const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
+  const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
+  const script = block.split('        run: |\n')[1].split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n')
+  const reg = await registry(200)
+  t.after(() => reg.stop())
+  const cwd = repo({ tag: null })
+  writeFileSync(join(cwd, 'release.mjs'), readFileSync(CLI))
+  git(cwd, 'add', 'release.mjs')
+  git(cwd, 'commit', '-m', 'feat: tagged CLI')
+  git(cwd, 'tag', 'v1.2.3')
+  git(cwd, 'checkout', '-q', 'refs/tags/v1.2.3')
+  const bin = mkdtempSync(join(tmpdir(), 'workflow-node-'))
+  const node = execFileSync('which', ['node'], { encoding: 'utf8' }).trim()
+  // Inject only the registry URL, preserving every argument from the workflow.
+  writeFileSync(join(bin, 'node'), '#!/bin/sh\nif [ "$1" = release.mjs ]; then exec "$REAL_NODE" "$@" --registry "$REGISTRY"; fi\nexec "$REAL_NODE" "$@"\n')
+  chmodSync(join(bin, 'node'), 0o755)
+  const output = join(cwd, 'output')
+  const env = { ...process.env, ...envelope, TAG: 'v1.2.3', VERSION: '1.2.3', GITHUB_OUTPUT: output, PATH: `${bin}:${process.env.PATH}`, REAL_NODE: node, REGISTRY: reg.url }
+  delete env.NODE_AUTH_TOKEN
+  for (const [republish, publish] of [['false', 'false'], ['true', 'true']]) {
+    writeFileSync(output, '')
+    const { stdout } = await execFileAsync('bash', ['-c', script], { cwd, env: { ...env, REPUBLISH: republish } })
+    assert.match(stdout, /^exists=true$/m)
+    assert.match(stdout, new RegExp(`^publish=${publish}$`, 'm'))
+    assert.equal(readFileSync(output, 'utf8'), `publish=${publish}\n`)
+  }
+  assert.deepEqual(reg.seen, ['/@fixture%2Fpkg/1.2.3', '/@fixture%2Fpkg/1.2.3'])
+})
+
 test('workflow rejects impossible prepare output combinations in both republish modes', async () => {
   const yaml = readFileSync(fileURLToPath(new URL('../.github/workflows/publish.yml', import.meta.url)), 'utf8')
   const block = yaml.split('      - name: Prepare publish\n')[1].split('      - name: Synchronize the lockfile version\n')[0]
