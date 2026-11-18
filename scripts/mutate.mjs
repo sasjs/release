@@ -139,6 +139,51 @@ const mutations = [
     name: 'an asset the host reports no size for is trusted silently',
     find: `  if (unreported.length)`,
     replace: `  if (false)`
+  },
+  {
+    name: 'an advisory the tool cannot name is dropped',
+    find: `    if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })`,
+    replace: `    if (false) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })`
+  },
+  {
+    name: 'a stale exemption is allowed to rot',
+    find: `  if (stale.length)`,
+    replace: `  if (false)`
+  },
+  {
+    name: 'the production report is never asked for',
+    find: `  const shipped = omit
+    ? above
+    : needsProd`,
+    replace: `  const shipped = omit
+    ? above
+    : false`
+  },
+  {
+    name: 'a report that cannot be parsed is treated as a clean tree',
+    find: `    gateFailure(\`this is not an npm audit report: \${error.message}\`)`,
+    replace: `    report = { auditReportVersion: 2, vulnerabilities: {} }`
+  },
+  {
+    name: 'an exemption for one package exempts the id everywhere',
+    find: `        sameId(entry.id, finding.id) &&
+        (!entry.packages.length || entry.packages.includes(finding.package))`,
+    replace: `        sameId(entry.id, finding.id)`
+  },
+  {
+    name: 'a review date in the past is not enforced',
+    find: `    if (entry.recheckBy < today)`,
+    replace: `    if (false)`
+  },
+  {
+    name: 'an exemption key nobody reads is accepted silently',
+    find: `    if (unknown.length)`,
+    replace: `    if (false)`
+  },
+  {
+    name: 'a package that ships dependencies passes the assertion',
+    find: `  if (shipped.length)`,
+    replace: `  if (false)`
   }
 ]
 
