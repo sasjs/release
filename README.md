@@ -56,7 +56,7 @@ Two things it does that the toolchain cannot:
 | `--audit-omit <a,b>` | judge the `npm --omit` set (eg `dev`) instead of the full tree |
 | `--audit-config <path>` | exemption list (default `scripts/audit-allowlist.json`; a repository without one has none) |
 | `--audit-report <path>` | write the report this run judged |
-| `--audit-input <path>` | read a recorded full-tree report instead of running npm |
+| `--audit-input <path>` | read a recorded full-tree report instead of running npm; with a `devOnly` entry, `--audit-prod-input` comes with it |
 | `--audit-prod-input <path>` | read a recorded production report, for a `devOnly` entry |
 | `--assert-no-dependencies` | fail unless the installed `@sasjs/release` ships no dependencies |
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
@@ -143,7 +143,7 @@ The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repos
 
 Exit codes tell the two kinds of failure apart: `1` is a verdict (a finding, a stale entry, an expiry, an unreadable report) and `2` is this tool being asked something it cannot do (an unknown flag, a malformed exemption). A mistyped allowlist must not read as a vulnerability, and a vulnerability must not read as a broken pipeline.
 
-`--audit` composes with `--prepare-publish` and with the tag and release modes, and runs first: a tree that carries an advisory nobody has argued for is not one to stamp a version onto or cut a tag from. `--audit-input` takes a recorded report instead of running npm, so a failing build can be replayed offline and the suite can exercise each of the rules against real payloads.
+`--audit` composes with `--prepare-publish` and with the tag and release modes, and runs first: a tree that carries an advisory nobody has argued for is not one to stamp a version onto or cut a tag from. `--audit-input` takes a recorded report instead of running npm, and `--audit-prod-input` the production one when a `devOnly` entry needs it - together they run no npm at all, so a failing build is replayed offline and the suite exercises each rule against real payloads.
 
 The weekly watcher in a repository that files an issue on failure keeps only the part that renders the report and appends to the issue: `--audit --audit-report` is the verdict, and writing to an issue tracker is a second write surface this tool deliberately does not have.
 

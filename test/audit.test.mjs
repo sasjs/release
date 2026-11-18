@@ -445,3 +445,14 @@ test('an audit flag without --audit is a usage error, not an ordinary release', 
   assert.equal(result.status, 2)
   assert.match(`${result.stdout}${result.stderr}`, /--audit-level needs --audit/)
 })
+
+test('a recorded replay never asks npm, so a devOnly entry needs both inputs', () => {
+  const cwd = repo({ exemptions: [exemption()], prodReport: report() })
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit', '--audit-input', 'full.json'], {
+    encoding: 'utf8'
+  })
+  assert.equal(result.status, 2, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /needs --audit-prod-input/)
+  // nothing was run: no npm, and no verdict about the tree
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /not an npm audit report/)
+})

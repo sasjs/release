@@ -154,9 +154,9 @@ const mutations = [
     name: 'the production report is never asked for',
     find: `  const shipped = omit
     ? above
-    : exemptions.some((entry) => entry.devOnly)`,
+    : needsProd`,
     replace: `  const shipped = omit
-    ? []
+    ? above
     : false`
   },
   {

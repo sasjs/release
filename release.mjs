@@ -1612,6 +1612,14 @@ async function auditGate() {
         (!entry.packages.length || entry.packages.includes(finding.package))
     )
 
+  // A recorded replay runs no npm at all: if the production report is needed, it has
+  // to arrive as a file too. Without this the gate would ask npm in a run whose whole
+  // point was not to, and blame the caller's JSON for the answer.
+  const needsProd = exemptions.some((entry) => entry.devOnly)
+
+  if (needsProd && arg('audit-input') && !arg('audit-prod-input'))
+    fail('--audit-input with a devOnly exemption needs --audit-prod-input: a recorded replay runs no npm')
+
   const judged = auditReport({ cwd, omit, input: arg('audit-input') })
   const reportPath = arg('audit-report')
 
@@ -1634,7 +1642,7 @@ async function auditGate() {
   // run itself is the production set, every finding in it is one.
   const shipped = omit
     ? above
-    : exemptions.some((entry) => entry.devOnly)
+    : needsProd
       ? auditFindings(auditReport({ cwd, omit: 'dev', input: arg('audit-prod-input') })).filter(atFloor)
       : []
 
