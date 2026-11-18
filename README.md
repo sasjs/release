@@ -51,6 +51,14 @@ Two things it does that the toolchain cannot:
 | `--token-env <NAME>` | environment variable holding the token |
 | `--asset <path>` | file to attach (repeatable; GitHub and Gitea upload it) |
 | `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
+| `--audit` | judge the npm audit report: the production tree is never exemptible, a dev advisory passes only when the allowlist argues for it |
+| `--audit-level <l>` | severity floor, `info` to `critical` (default `low`) |
+| `--audit-omit <a,b>` | judge the `npm --omit` set (eg `dev`) instead of the full tree |
+| `--audit-config <path>` | exemption list (default `scripts/audit-allowlist.json`; a repository without one has none) |
+| `--audit-report <path>` | write the report this run judged |
+| `--audit-input <path>` | read a recorded full-tree report instead of running npm |
+| `--audit-prod-input <path>` | read a recorded production report, for a `devOnly` entry |
+| `--assert-no-dependencies` | fail unless the installed `@sasjs/release` ships no dependencies |
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
@@ -64,7 +72,7 @@ Two things it does that the toolchain cannot:
 | `--republish` | publish even when the registry already serves that version |
 | `--draft` | create the release as a draft: the release is invisible. On GitHub the tag is created when the draft is published, not now; Gitea and GitLab create it with the release |
 
-Exit codes: `0` released or nothing to release, `2` usage, git or host error.
+Exit codes: `0` released or nothing to release, `1` a failed check (`--audit` or `--assert-no-dependencies`), `2` usage, git or host error.
 
 The result is printed as `key=value` lines, so a pipeline can feed it to whatever variable protocol it has - `$GITHUB_OUTPUT`, `$GITHUB_ENV`, a dotenv artifact, nothing at all - with `--output`.
 
@@ -96,6 +104,56 @@ It does not run `npm publish` - that stays in the publishing workflow, which is 
 If the project has a lockfile, synchronize it after preparation and before publishing (for example, `npm version "$VERSION" --no-git-tag-version --allow-same-version`). `--prepare-publish` updates `package.json` only.
 
 `--dry-run` prints the same decisions and writes nothing, which is how a failing publish job is debugged without publishing.
+
+## The audit gate
+
+`npm audit --audit-level=low` is the right bar and the wrong answer to one case: an advisory with no fixed version upstream, which turns every pull request red for a reason no branch can act on. The response in each repository was a script - six of them, in six repositories, with three different exemption schemas - and the same rule, learned slightly differently in each.
+
+`--audit` is that rule once:
+
+```yaml
+- name: Check npm audit
+  run: npm run release -- --audit
+```
+
+What it enforces:
+
+- **Production is never exemptible.** The `--omit dev` report is judged on its own and any advisory there fails, whatever the allowlist says. The tree that ships is a version to change, not a risk to accept.
+- **A dev advisory fails unless an entry names it**, and the entry carries the argument: where the package sits, what input reaches the affected code, when it clears.
+- **An entry that stops appearing fails**, so an exemption cannot outlive its reason.
+- **An advisory with no GHSA id fails**, because an exemption is a claim about a specific advisory - and "I cannot name this" is not "there is nothing to fix".
+- **A report that cannot be read fails.** `npm audit --json` writes its own errors to stdout and exits non-zero, so a missing lockfile or an unreachable registry parses as JSON with no `vulnerabilities`. That is not a clean tree, and it must not become one once the exemption list empties out.
+- **`devOnly` is measured, not asserted.** When an entry claims it, the production report is asked for and the run fails if the advisory is there after all. With no entries the second call is skipped, because there is nothing an exemption could be hiding.
+
+The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repository without the file has no exemptions:
+
+```json
+[
+  {
+    "id": "GHSA-fc5q-39xc-vjpf",
+    "packages": ["picomatch"],
+    "devOnly": true,
+    "recheckBy": "2027-01-31",
+    "reason": "Vulnerable range is <=4.0.7 and 4.0.7 is the newest published version, so no upgrade and no override clears it. It reaches this tree only through the build and test tooling; no production dependency resolves it. The input the advisory needs is a glob pattern this repository writes itself. Clears when a release above 4.0.7 is published."
+  }
+]
+```
+
+`packages` is optional and names the packages the argument covers - an id exempted for `picomatch` says nothing about the same id arriving under `micromatch`. `recheckBy` is required, because a waiver without a review date is the failure mode the date exists for. `devOnly` is checked per run. The id is the key and `packages` narrows an entry, never widens it.
+
+Exit codes tell the two kinds of failure apart: `1` is a verdict (a finding, a stale entry, an expiry, an unreadable report) and `2` is this tool being asked something it cannot do (an unknown flag, a malformed exemption). A mistyped allowlist must not read as a vulnerability, and a vulnerability must not read as a broken pipeline.
+
+`--audit` composes with `--prepare-publish` and with the tag and release modes, and runs first: a tree that carries an advisory nobody has argued for is not one to stamp a version onto or cut a tag from. `--audit-input` takes a recorded report instead of running npm, so a failing build can be replayed offline and the suite can exercise each of the rules against real payloads.
+
+The weekly watcher in a repository that files an issue on failure keeps only the part that renders the report and appends to the issue: `--audit --audit-report` is the verdict, and writing to an issue tracker is a second write surface this tool deliberately does not have.
+
+### `--assert-no-dependencies`
+
+A release job runs with `contents: write`, so the tree carrying the release tool has to be auditable - and the property that makes it so is that this package ships nothing of its own. Three workflows asserted that with an inline `node -e` block; the flag is the same assertion, next to the code that has to keep the promise:
+
+```yaml
+- run: npm run release -- --assert-no-dependencies
+```
 
 ## Permissions
 

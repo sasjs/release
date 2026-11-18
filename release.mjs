@@ -20,7 +20,7 @@
  * Exit 2: usage, git or host error; nothing is tagged when this is returned
  * before the tag step, and the tag alone exists when it is returned after.
  */
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
@@ -55,6 +55,20 @@ const HELP = `sasjs-release - releases from conventional commits
   --no-registry-lookup   do not ask the registry whether the version exists; the
                          artifact ships somewhere that is not npm (a marketplace,
                          an app store), so npm cannot answer the question
+  --audit                judge the npm audit report: the production tree is never
+                         exemptible, and a dev advisory passes only when the
+                         allowlist argues for it
+  --audit-level <l>      severity floor: info|low|moderate|high|critical (default low)
+  --audit-omit <a,b>     judge the npm --omit set instead of the full tree, eg dev
+  --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
+                         repository without one has no exemptions)
+  --audit-report <path>  write the report this run judged here
+  --audit-input <path>   read a recorded full-tree report instead of running npm
+  --audit-prod-input <p> read a recorded production report (used when a devOnly
+                         entry makes the second question necessary)
+  --assert-no-dependencies
+                         fail unless the installed @sasjs/release ships no
+                         dependencies of its own
   --draft                create the release as a draft, so it is invisible until
                          something publishes it (gh release edit --draft=false)
   --prerelease <id>      cut <version>-<id>.1 (or continue the last one)
@@ -84,7 +98,9 @@ const HELP = `sasjs-release - releases from conventional commits
 // which is how a dropped `--draft` would publish a release before its assets
 // exist rather than failing.
 const known = new Set([
-  'api-url', 'asset', 'asset-link', 'attach', 'branch', 'config', 'draft', 'dry-run', 'help', 'host',
+  'api-url', 'asset', 'asset-link', 'attach', 'audit', 'audit-config', 'audit-input',
+  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'assert-no-dependencies',
+  'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
@@ -1357,6 +1373,365 @@ async function versionPublished(registry, name, version, token) {
   fail(`${url} answered ${response.status}`)
 }
 
+/**
+ * Severity order, so a floor is a comparison rather than a list of names. The
+ * words are the ones `npm audit --audit-level` takes.
+ */
+const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical']
+
+/** Where a repository's exemptions live when no flag names a file. */
+const DEFAULT_AUDIT_CONFIG = join('scripts', 'audit-allowlist.json')
+
+/** The keys an exemption may carry. Anything else is a typo that would be inert. */
+const EXEMPTION_KEYS = ['id', 'packages', 'devOnly', 'recheckBy', 'reason']
+
+/**
+ * A gate failure: the tree has a problem, or the report cannot be read.
+ *
+ * Exit 1, against `fail`'s 2, because the two are different answers: exit 2 is
+ * this tool being asked something it cannot do, exit 1 is a verdict. A mistyped
+ * allowlist must not read as a vulnerability, and a vulnerability must not read
+ * as a broken pipeline.
+ */
+function gateFailure(message) {
+  console.error(`sasjs-release: ${message}`)
+  process.exit(1)
+}
+
+/**
+ * The advisory a `via` entry names, if it names one.
+ *
+ * npm reports two kinds: an advisory it has an id for, whose `url` points at a
+ * GHSA page, and one of its own, which carries a numeric `source` and no url.
+ * Only the first can be exempted - an exemption is a claim about a specific
+ * advisory - and the second is reported as a failure rather than dropped, because
+ * "I cannot name this" is not "there is nothing to fix".
+ */
+function advisoryOf(via) {
+  const url = typeof via?.url === 'string' ? via.url : ''
+  const found = /GHSA(?:-[0-9a-z]{4}){3}/i.exec(url)
+  return found ? found[0] : ''
+}
+
+/** Advisory ids are reported in one case and written in another; compare them as one. */
+const sameId = (a, b) => a.toUpperCase() === b.toUpperCase()
+
+/** Every advisory in a report, one row per package it is reported against. */
+function auditFindings(report) {
+  const rows = []
+  const seen = new Set()
+
+  for (const [name, vuln] of Object.entries(report.vulnerabilities || {})) {
+    for (const via of Array.isArray(vuln?.via) ? vuln.via : []) {
+      // a string is a pointer at another package's entry, which is reported under
+      // its own name - counting it here would report one advisory twice
+      if (!via || typeof via !== 'object') continue
+
+      const id = advisoryOf(via)
+      const key = `${id}|${name}`
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      rows.push({
+        id,
+        package: name,
+        // an unrecognised severity is treated as the highest rather than the
+        // lowest: a report this tool cannot read must not become a pass
+        severity: SEVERITIES.includes(via.severity) ? via.severity : 'critical',
+        title: typeof via.title === 'string' ? via.title : ''
+      })
+    }
+  }
+
+  return rows
+}
+
+/**
+ * The report to judge: `npm audit --json`, or a recorded one.
+ *
+ * A report this tool cannot read is a failure, never an empty tree. `npm audit
+ * --json` writes its own errors to stdout and exits non-zero, so a missing
+ * lockfile or an unreachable registry parses as JSON with no `vulnerabilities` -
+ * which once read as "nothing to fix" and would again the moment the exemption
+ * list emptied out.
+ */
+function auditReport({ cwd, omit, input }) {
+  let text = ''
+
+  if (input) {
+    try {
+      text = readFileSync(isAbsolute(input) ? input : join(cwd, input), 'utf8')
+    } catch (error) {
+      gateFailure(`the recorded report could not be read (${input}): ${error.message}`)
+    }
+  } else {
+    const argv = ['audit', '--json', ...(omit ? ['--omit', omit] : [])]
+    const run = spawnSync('npm', argv, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    text = run.stdout || ''
+
+    if (!text.trim()) {
+      const stderr = String(run.stderr || '').trim()
+      gateFailure(
+        `npm ${argv.join(' ')} printed no report` +
+          (run.error ? `: ${run.error.message}` : '') +
+          (stderr ? `:\n${stderr}` : '')
+      )
+    }
+  }
+
+  let report
+
+  try {
+    report = JSON.parse(text)
+  } catch (error) {
+    gateFailure(`this is not an npm audit report: ${error.message}`)
+  }
+
+  if (
+    !report ||
+    typeof report !== 'object' ||
+    !report.vulnerabilities ||
+    typeof report.vulnerabilities !== 'object' ||
+    report.auditReportVersion === undefined
+  )
+    gateFailure('this is not an npm audit report: no vulnerabilities or auditReportVersion')
+
+  if (report.auditReportVersion !== 2)
+    gateFailure(
+      `npm audit report version ${report.auditReportVersion} is not supported - ` +
+        'this gate was written against 2, so pin the npm the pipeline runs'
+    )
+
+  return report
+}
+
+/**
+ * The exemption list, validated.
+ *
+ * A waiver is an argument, so the fields that carry the argument are required and
+ * the ones that would be a second copy of the report are not accepted: `severity`
+ * and `title` come from the advisory itself, and an entry that stored them could
+ * disagree with the finding it describes.
+ */
+function auditExemptions(cwd, omit) {
+  const named = arg('audit-config')
+  const file = isAbsolute(named || DEFAULT_AUDIT_CONFIG) ? named || DEFAULT_AUDIT_CONFIG : join(cwd, named || DEFAULT_AUDIT_CONFIG)
+
+  // A file found by convention that is not there is a repository with no
+  // exemptions, which is most of them. A file the caller named is a mistake.
+  if (!named && !existsSync(file)) return []
+
+  const listed = readJson(file, cwd, '--audit-config')
+
+  if (!Array.isArray(listed)) fail(`${file} must be a JSON array of exemptions`)
+
+  const today = new Date().toISOString().slice(0, 10)
+
+  const exemptions = listed.map((entry) => {
+    const at = `${file}: ${JSON.stringify(entry)}`
+
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry))
+      fail(`${file} has an exemption that is not an object: ${JSON.stringify(entry)}`)
+
+    const unknown = Object.keys(entry).filter((key) => !EXEMPTION_KEYS.includes(key))
+    if (unknown.length)
+      fail(
+        `${file} has an exemption with unknown key(s) ${unknown.join(', ')}: ${JSON.stringify(entry.id || entry)} - ` +
+          `the fields are ${EXEMPTION_KEYS.join(', ')}`
+      )
+
+    if (typeof entry.id !== 'string' || !/^GHSA(?:-[0-9a-z]{4}){3}$/i.test(entry.id))
+      fail(`${at} needs an id of the form GHSA-xxxx-xxxx-xxxx`)
+
+    if (typeof entry.reason !== 'string' || !entry.reason.trim())
+      fail(`${at} needs a reason: the argument a reader can check`)
+
+    if (typeof entry.recheckBy !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.recheckBy))
+      fail(`${at} needs recheckBy as YYYY-MM-DD: a waiver without a review date outlives its reason`)
+
+    // A date has passed when the calendar says so, not the clock: comparing the
+    // strings is exact for YYYY-MM-DD and needs no timezone
+    if (entry.recheckBy < today)
+      gateFailure(
+        `the exemption for ${entry.id} was due for review on ${entry.recheckBy} - ` +
+          're-check it, then move the date or remove the entry'
+      )
+
+    if (
+      entry.packages !== undefined &&
+      (!Array.isArray(entry.packages) || entry.packages.some((name) => typeof name !== 'string' || !name))
+    )
+      fail(`${at} has packages that are not a list of package names`)
+
+    if (entry.devOnly !== undefined && typeof entry.devOnly !== 'boolean')
+      fail(`${at} has a devOnly that is not true or false`)
+
+    return {
+      id: entry.id,
+      packages: entry.packages || [],
+      devOnly: entry.devOnly === true,
+      recheckBy: entry.recheckBy,
+      reason: entry.reason
+    }
+  })
+
+  // An exemption on a production-only gate is a waiver that can never apply: the
+  // gate refuses to exempt anything that ships, so the list would be inert and
+  // every entry would report as stale.
+  if (omit && exemptions.length)
+    fail(
+      `--audit-omit ${omit} judges only what ships, where nothing is exemptible, ` +
+        `but ${file} carries ${exemptions.length} exemption(s): drop the flag to judge the full tree`
+    )
+
+  return exemptions
+}
+
+/**
+ * The audit gate.
+ *
+ * Reads the report and the exemption list, writes nothing but the report the
+ * caller asked for, and answers with an exit code - so a workflow step is one
+ * line and a laptop can ask the same question with no token.
+ */
+async function auditGate() {
+  const cwd = arg('repo-dir', process.cwd())
+  const level = arg('audit-level', 'low')
+
+  if (!SEVERITIES.includes(level)) fail(`--audit-level must be one of ${SEVERITIES.join(', ')}`)
+
+  const omit = arg('audit-omit')
+  const exemptions = auditExemptions(cwd, omit)
+
+  const floor = SEVERITIES.indexOf(level)
+  const atFloor = (finding) => SEVERITIES.indexOf(finding.severity) >= floor
+  const matches = (finding) =>
+    exemptions.findIndex(
+      (entry) =>
+        sameId(entry.id, finding.id) &&
+        (!entry.packages.length || entry.packages.includes(finding.package))
+    )
+
+  const judged = auditReport({ cwd, omit, input: arg('audit-input') })
+  const reportPath = arg('audit-report')
+
+  if (reportPath) {
+    if (flag('dry-run')) console.log(`would write the audit report to ${reportPath}`)
+    else
+      writeFileSync(
+        isAbsolute(reportPath) ? reportPath : join(cwd, reportPath),
+        `${JSON.stringify(judged, null, 2)}\n`
+      )
+  }
+
+  const findings = auditFindings(judged)
+  const above = findings.filter(atFloor)
+
+  // The production tree is a second report: --omit=dev is the only question that
+  // answers "does this ship" for a transitive dependency. It is asked only when an
+  // entry claims devOnly, because with no entries there is nothing an exemption
+  // could be hiding - the claim is measured rather than taken on trust. When the
+  // run itself is the production set, every finding in it is one.
+  const shipped = omit
+    ? above
+    : exemptions.some((entry) => entry.devOnly)
+      ? auditFindings(auditReport({ cwd, omit: 'dev', input: arg('audit-prod-input') })).filter(atFloor)
+      : []
+
+  const rows = new Map()
+  const key = (finding) => `${finding.id}|${finding.package}`
+  const used = new Set()
+
+  for (const finding of above) {
+    const at = matches(finding)
+
+    if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })
+    else if (at === -1) rows.set(key(finding), { finding, why: 'not in the allowlist' })
+    else used.add(at)
+  }
+
+  // Whatever the allowlist says, an advisory in the production tree blocks: the
+  // tree that ships is a version to change, not a risk to accept. The devOnly
+  // reason outranks the one above, because it says why the allowlist cannot help.
+  for (const finding of shipped) {
+    const at = matches(finding)
+    rows.set(key(finding), {
+      finding,
+      why:
+        at === -1
+          ? 'in the production tree, where nothing is exemptible'
+          : `in the production tree, though the allowlist calls it devOnly (review by ${exemptions[at].recheckBy})`
+    })
+  }
+
+  // An entry that stops appearing fails: a stale waiver is invisible in a passing
+  // build, which is how it outlives the problem it describes. Judged against every
+  // advisory the report carries, so raising the floor does not make an entry look
+  // stale when the advisory is still there.
+  const stale = exemptions.filter((entry) => !findings.some((finding) => sameId(finding.id, entry.id)))
+
+  output({
+    audited: rows.size === 0 && stale.length === 0,
+    advisories: above.length,
+    exempted: used.size,
+    stale: stale.length,
+    level,
+    scope: omit ? `omit:${omit}` : 'full'
+  })
+
+  for (const { finding, why } of rows.values())
+    console.log(
+      `${finding.severity} ${finding.id || '(no advisory id)'} ${finding.package}: ${why}` +
+        (finding.title ? ` - ${finding.title}` : '')
+    )
+
+  for (const entry of stale)
+    console.log(`${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
+
+  if (rows.size)
+    gateFailure(`${rows.size} advisory/advisories at or above ${level} that the allowlist does not clear`)
+
+  if (stale.length)
+    gateFailure(
+      `${stale.length} allowlist entr${stale.length === 1 ? 'y' : 'ies'} no longer match anything in the report`
+    )
+
+  console.log(`no advisory at or above ${level} outside the allowlist`)
+}
+
+/**
+ * This package's own auditability.
+ *
+ * The release job runs with `contents: write`, so the tree that carries this tool
+ * has to be auditable - and the property that makes it so is that it ships
+ * nothing of its own. Three workflows assert that with an inline `node -e` block;
+ * this is the same assertion, made where the promise has to be kept.
+ */
+function assertNoDependencies(cwd) {
+  const at = join(cwd, 'node_modules', '@sasjs', 'release', 'package.json')
+
+  if (!existsSync(at))
+    fail(`--assert-no-dependencies: @sasjs/release is not installed at ${at} - run npm ci first`)
+
+  let pkg
+
+  try {
+    pkg = JSON.parse(readFileSync(at, 'utf8'))
+  } catch (error) {
+    fail(`--assert-no-dependencies: ${at} could not be read: ${error.message}`)
+  }
+
+  const shipped = Object.keys(pkg.dependencies || {})
+
+  if (shipped.length)
+    gateFailure(
+      `@sasjs/release ${pkg.version} ships dependencies (${shipped.join(', ')}), ` +
+        'so auditing a release tree no longer audits the tool that runs with it'
+    )
+
+  console.log(`@sasjs/release ${pkg.version} ships no dependencies`)
+}
+
 async function main() {
   if (flag('help')) {
     console.log(HELP)
@@ -1375,6 +1750,39 @@ async function main() {
       if (host !== 'none' && !(host in HOSTS)) fail('--host must be none, github, gitea or gitlab')
       if (host !== 'github') fail('--verify-assets supports github only')
     }
+  }
+
+  // The audit gate runs before anything decides or writes: a tree that carries an
+  // advisory nobody has argued for should not get a version stamped onto it or a
+  // tag created for it. It composes with the modes below, and stands alone when
+  // nothing else was asked for.
+  const otherMode = (self) =>
+    [
+      'assert-no-dependencies',
+      'audit',
+      'prepare-publish',
+      'discover-publish',
+      'attach',
+      'tag',
+      'push-tag',
+      'release',
+      'show-context'
+    ].some((mode) => mode !== self && flag(mode))
+
+  // A flag that only means something with --audit is otherwise silent: `--audit-level
+  // high` on its own would run an ordinary release, which is not what anyone typing
+  // it expects.
+  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input']
+  if (!flag('audit') && auditOnly.some(flag)) fail(`--${auditOnly.find(flag)} needs --audit`)
+
+  if (flag('assert-no-dependencies')) {
+    assertNoDependencies(arg('repo-dir', process.cwd()))
+    if (!otherMode('assert-no-dependencies')) return
+  }
+
+  if (flag('audit')) {
+    await auditGate()
+    if (!otherMode('audit')) return
   }
 
   if (flag('discover-publish') || flag('prepare-publish')) {
