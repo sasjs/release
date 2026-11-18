@@ -48,6 +48,20 @@ const report = (entries = []) => ({
 
 const PICOMATCH = 'GHSA-fc5q-39xc-vjpf'
 
+// A runner has no git identity, and an annotated tag needs one; the fixture sets
+// its own rather than depending on the machine it runs on.
+const envelope = {
+  GIT_AUTHOR_NAME: 'test',
+  GIT_AUTHOR_EMAIL: 'test@example.com',
+  GIT_COMMITTER_NAME: 'test',
+  GIT_COMMITTER_EMAIL: 'test@example.com',
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_SYSTEM: '/dev/null'
+}
+
+const git = (cwd, ...argv) =>
+  execFileSync('git', argv, { cwd, encoding: 'utf8', env: { ...process.env, ...envelope } }).trim()
+
 /** A repository with a package.json; `scripts/` and the allowlist are optional. */
 function repo({ exemptions, report: reportText, prodReport, label = '' } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'audit-'))
@@ -353,10 +367,10 @@ test('an allowlist the caller named that holds no array is a usage error', () =>
 
 test('--audit runs before a publish is prepared, so a failing tree is never stamped', () => {
   const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]) })
-  execFileSync('git', ['init', '-b', 'main'], { cwd })
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@e', 'add', '.'], { cwd })
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-m', 'feat: fixture'], { cwd })
-  execFileSync('git', ['tag', '-a', 'v1.2.3', '-m', 'v1.2.3'], { cwd })
+  git(cwd, 'init', '-b', 'main')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: fixture')
+  git(cwd, 'tag', '-a', 'v1.2.3', '-m', 'v1.2.3')
 
   const result = spawnSync(
     'node',
@@ -369,10 +383,10 @@ test('--audit runs before a publish is prepared, so a failing tree is never stam
 
 test('the gate composes with a publish preparation that then succeeds', () => {
   const cwd = repo()
-  execFileSync('git', ['init', '-b', 'main'], { cwd })
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@e', 'add', '.'], { cwd })
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@e', 'commit', '-m', 'feat: fixture'], { cwd })
-  execFileSync('git', ['tag', '-a', 'v1.2.3', '-m', 'v1.2.3'], { cwd })
+  git(cwd, 'init', '-b', 'main')
+  git(cwd, 'add', '.')
+  git(cwd, 'commit', '-m', 'feat: fixture')
+  git(cwd, 'tag', '-a', 'v1.2.3', '-m', 'v1.2.3')
 
   const result = spawnSync(
     'node',
