@@ -146,9 +146,24 @@ const mutations = [
     replace: `  if (false)`
   },
   {
+    name: 'source bounds can be bypassed',
+    find: `if (bound.length && unmatched.length)`,
+    replace: `if (false)`
+  },
+  {
+    name: 'stale entries ignore their source',
+    find: `(entry.source === undefined || finding.sources.has(entry.source))`,
+    replace: `true`
+  },
+  {
+    name: 'strict source does not require a bound',
+    find: `flag('audit-require-source') && entry.source === undefined`,
+    replace: `false`
+  },
+  {
     name: 'duplicate advisory ratings are collapsed before exact waiver matching',
-    find: `entry.severity !== undefined && [...finding.ratings].some((rating) => rating !== entry.severity)`,
-    replace: `entry.severity !== undefined && (!finding.severityKnown || entry.severity !== finding.severity)`
+    find: `[...finding.ratings].some((rating) => rating !== entry.severity)`,
+    replace: `(!finding.severityKnown || entry.severity !== finding.severity)`
   },
   {
     name: 'an advisory the tool cannot name is dropped',

@@ -21,7 +21,7 @@ function execute(command, args, options) {
   })
 }
 
-async function fixture(t) {
+async function fixture(t, { duplicateSource = false } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'audit-real-npm-'))
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
   const requests = []
@@ -34,6 +34,7 @@ async function fixture(t) {
         id: 10001 + i, name, url: `https://github.com/advisories/GHSA-aaaa-bbbb-ccc${i}`,
         title: `${name} vulnerability`, severity: 'high', vulnerable_versions: '<2.0.0'
       }]]))
+      if (duplicateSource) advisories['scope-dev'].push({ ...advisories['scope-dev'][0], id: 10099, title: 'second advisory' })
       res.writeHead(200, { 'content-type': 'application/json' })
       const name = decodeURIComponent(req.url.slice(1))
       res.end(JSON.stringify(req.url.startsWith('/-/') ? advisories : {
@@ -81,6 +82,27 @@ async function workspaceFixture(t) {
   writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify(lock))
   return data
 }
+
+test('real npm preserves separate numeric sources sharing a GHSA', async (t) => {
+  const { cwd, env } = await fixture(t, { duplicateSource: true })
+  const pkg = { name: 'audit-source-fixture', version: '1.0.0', devDependencies: { 'scope-dev': '1.0.0' } }
+  writeFileSync(join(cwd, 'package.json'), JSON.stringify(pkg))
+  writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify({ name: pkg.name, version: pkg.version, lockfileVersion: 3,
+    packages: { '': pkg, 'node_modules/scope-dev': { version: '1.0.0', dev: true } } }))
+  const entry = { id: 'GHSA-aaaa-bbbb-ccc2', packages: ['scope-dev'], source: 10003, severity: 'high',
+    devOnly: true, recheckBy: '2099-01-31', reason: 'Fixture' }
+  const config = join(cwd, 'allowlist.json')
+  writeFileSync(config, JSON.stringify([entry]))
+  const args = [CLI, '--repo-dir', cwd, '--audit', '--audit-config', config, '--audit-require-source', '--audit-require-severity', '--audit-report', 'actual.json']
+  const first = await execute(process.execPath, args, { cwd, env })
+  assert.equal(first.code, 1, `${first.stdout}\n${first.stderr}`)
+  assert.match(first.stdout, /source differs/)
+  const actual = JSON.parse(readFileSync(join(cwd, 'actual.json'), 'utf8'))
+  assert.deepEqual(actual.vulnerabilities['scope-dev'].via.map((v) => v.source).sort(), [10003, 10099])
+  writeFileSync(config, JSON.stringify([entry, { ...entry, source: 10099 }]))
+  const second = await execute(process.execPath, args, { cwd, env })
+  assert.equal(second.code, 0, `${second.stdout}\n${second.stderr}`)
+})
 
 for (const source of ['environment', 'project', 'user', 'global', 'disabled']) {
   for (const omit of ['', 'dev']) {
