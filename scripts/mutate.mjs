@@ -146,6 +146,11 @@ const mutations = [
     replace: `  if (false)`
   },
   {
+    name: 'duplicate advisory ratings are collapsed before exact waiver matching',
+    find: `entry.severity !== undefined && [...finding.ratings].some((rating) => rating !== entry.severity)`,
+    replace: `entry.severity !== undefined && (!finding.severityKnown || entry.severity !== finding.severity)`
+  },
+  {
     name: 'an advisory the tool cannot name is dropped',
     find: `    if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })`,
     replace: `    if (false) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })`

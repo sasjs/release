@@ -1494,7 +1494,13 @@ function auditFindings(report) {
 
       const id = advisoryOf(via)
       const key = `${id.toUpperCase()}|${name}`
+      const previous = seen.get(key)
+      // Keep every raw rating for exact waiver checks, separately from the
+      // worst-case severity used for floor and production decisions.
+      const ratings = previous?.ratings || new Set()
+      ratings.add(SEVERITIES.includes(via.severity) ? via.severity : null)
       const finding = {
+        ratings,
         id,
         package: name,
         // an unrecognised severity is treated as the highest rather than the
@@ -1503,7 +1509,6 @@ function auditFindings(report) {
         severityKnown: SEVERITIES.includes(via.severity),
         title: typeof via.title === 'string' ? via.title : ''
       }
-      const previous = seen.get(key)
       // Preserve an unknown rating over an equal-ranked critical in either order:
       // normalization to critical must not make it satisfy a critical waiver.
       if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity) ||
@@ -1805,7 +1810,7 @@ async function auditGate() {
     const mismatch = exemptions.find((entry) =>
       sameId(entry.id, finding.id) &&
       (!entry.packages.length || entry.packages.includes(finding.package)) &&
-      entry.severity !== undefined && (!finding.severityKnown || entry.severity !== finding.severity))
+      entry.severity !== undefined && [...finding.ratings].some((rating) => rating !== entry.severity))
 
     if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })
     else if (at === -1) rows.set(key(finding), { finding, why: 'not in the allowlist' })
