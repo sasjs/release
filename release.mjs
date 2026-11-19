@@ -1500,7 +1500,13 @@ function auditReport({ cwd, omit, input }) {
       gateFailure(`the recorded report could not be read (${input}): ${error.message}`)
     }
   } else {
-    const argv = ['audit', '--json', ...(omit ? omit.split(',').flatMap((value) => ['--omit', value]) : [])]
+    // npm combines include and omit, and include always wins even when omit came
+    // from a higher-priority source. Set both lists explicitly: npmrc, npm_config_*
+    // and NODE_ENV must not silently alter the scope we print and judge.
+    const omitted = omit ? omit.split(',') : []
+    const included = ['prod', 'dev', 'optional', 'peer'].filter((value) => !omitted.includes(value))
+    const argv = ['audit', '--json', ...included.flatMap((value) => ['--include', value]),
+      ...omitted.flatMap((value) => ['--omit', value])]
     const run = spawnSync('npm', argv, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
     npmStatus = run.status
     text = run.stdout || ''

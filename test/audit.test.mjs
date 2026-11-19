@@ -451,7 +451,10 @@ test('the gate asks npm for the full report, and for the production one only whe
   })
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
   const argv = readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n')
-  assert.deepEqual(argv, ['audit --json', 'audit --json --omit dev'])
+  assert.deepEqual(argv, [
+    'audit --json --include prod --include dev --include optional --include peer',
+    'audit --json --include prod --include optional --include peer --omit dev'
+  ])
 })
 
 test('npm is asked for production even when devOnly is false', () => {
@@ -461,7 +464,10 @@ test('npm is asked for production even when devOnly is false', () => {
   const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit'], { encoding: 'utf8', env: { ...process.env, ...env } })
   assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
   assert.match(result.stdout, /in the production tree, where nothing is exemptible/)
-  assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json', 'audit --json --omit dev'])
+  assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), [
+    'audit --json --include prod --include dev --include optional --include peer',
+    'audit --json --include prod --include optional --include peer --omit dev'
+  ])
 })
 
 test('a comma-separated omit set is passed to npm as repeated omit options', () => {
@@ -477,7 +483,7 @@ test('a comma-separated omit set is passed to npm as repeated omit options', () 
   })
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
   assert.deepEqual(JSON.parse(readFileSync(join(cwd, 'argv.log'), 'utf8')),
-    ['audit', '--json', '--omit', 'dev', '--omit', 'optional'])
+    ['audit', '--json', '--include', 'prod', '--include', 'peer', '--omit', 'dev', '--omit', 'optional'])
 })
 
 test('all supported npm omit values are accepted', () => {
@@ -523,7 +529,7 @@ test('a tree with no exemptions is answered by one npm call', () => {
     env: { ...process.env, ...env }
   })
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
-  assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json'])
+  assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json --include prod --include dev --include optional --include peer'])
 })
 
 test('npm exit 1 with an empty report is not treated as a clean audit', () => {
