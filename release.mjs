@@ -23,7 +23,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const LEVELS = { major: 3, minor: 2, patch: 1 }
@@ -59,13 +59,13 @@ const HELP = `sasjs-release - releases from conventional commits
                          exemptible, and a dev advisory passes only when the
                          allowlist argues for it
   --audit-level <l>      severity floor: info|low|moderate|high|critical (default low)
-  --audit-omit <a,b>     judge the npm --omit set instead of the full tree, eg dev
+  --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)
   --audit-report <path>  write the report this run judged here
   --audit-input <path>   read a recorded full-tree report instead of running npm
-  --audit-prod-input <p> read a recorded production report (used when a devOnly
-                         entry makes the second question necessary)
+  --audit-prod-input <p> read a recorded production report (needed for a replay
+                         with any exemption)
   --assert-no-dependencies
                          fail unless the installed @sasjs/release ships no
                          dependencies of its own
@@ -1418,8 +1418,73 @@ const sameId = (a, b) => a.toUpperCase() === b.toUpperCase()
 
 /** Every advisory in a report, one row per package it is reported against. */
 function auditFindings(report) {
-  const rows = []
-  const seen = new Set()
+  const seen = new Map()
+
+  // npm's indirect nodes can form cycles. Mark nodes reachable backwards from
+  // advisory-bearing nodes rather than rejecting cycles that also reach a cause.
+  const reachable = new Set()
+  const dependents = new Map()
+  for (const [name, vuln] of Object.entries(report.vulnerabilities)) {
+    if (!name || !vuln || typeof vuln !== 'object' || Array.isArray(vuln) ||
+        vuln.name !== name || !Array.isArray(vuln.via) || !vuln.via.length)
+      gateFailure(`invalid audit vulnerability ${name}: expected a matching name and nonempty via array`)
+    if (!SEVERITIES.includes(vuln.severity) && vuln.via.some((via) => via && typeof via === 'object' && SEVERITIES.includes(via.severity)))
+      gateFailure(`audit severity for ${name} is unknown and cannot be reconciled`)
+    if (SEVERITIES.includes(vuln.severity) && vuln.via.every((via) => via && typeof via === 'object' && !Array.isArray(via) && SEVERITIES.includes(via.severity)) &&
+        Math.max(...vuln.via.map((via) => SEVERITIES.indexOf(via.severity))) !== SEVERITIES.indexOf(vuln.severity))
+      gateFailure(`audit severity inconsistent for ${name}`)
+    for (const via of vuln.via) {
+      if (typeof via === 'string') {
+        if (!Object.hasOwn(report.vulnerabilities, via))
+          gateFailure(`unresolved audit via reference ${via} from ${name}`)
+        if (!dependents.has(via)) dependents.set(via, [])
+        dependents.get(via).push(name)
+      } else if (via && typeof via === 'object' && !Array.isArray(via)) reachable.add(name)
+      else gateFailure(`invalid audit via entry for ${name}`)
+    }
+  }
+  const queue = [...reachable]
+  for (let i = 0; i < queue.length; i++) {
+    for (const name of dependents.get(queue[i]) || []) {
+      if (!reachable.has(name)) {
+        reachable.add(name)
+        queue.push(name)
+      }
+    }
+  }
+  for (const name of Object.keys(report.vulnerabilities))
+    if (!reachable.has(name)) gateFailure(`audit vulnerability ${name} has no reachable advisory`)
+
+  // A metavulnerability refers to one version-specific cause, not necessarily
+  // the referenced package's maximum severity. Reconcile against reachable
+  // advisories instead, propagating maxima to a fixed point even through cycles.
+  // Never assign an upstream package's severity or identity to an advisory: that
+  // would let an exemption for one package silently waive another.
+  const causeSeverity = new Map()
+  const severityQueue = []
+  for (const [name, vuln] of Object.entries(report.vulnerabilities)) {
+    const direct = vuln.via.filter((via) => typeof via !== 'string')
+    if (!direct.length) continue
+    causeSeverity.set(name, Math.max(...direct.map((via) => {
+      const rank = SEVERITIES.indexOf(via.severity)
+      return rank < 0 ? SEVERITIES.length - 1 : rank
+    })))
+    severityQueue.push(name)
+  }
+  for (let i = 0; i < severityQueue.length; i++) {
+    const cause = severityQueue[i]
+    for (const name of dependents.get(cause) || []) {
+      if ((causeSeverity.get(name) ?? -1) < causeSeverity.get(cause)) {
+        causeSeverity.set(name, causeSeverity.get(cause))
+        severityQueue.push(name)
+      }
+    }
+  }
+  for (const [name, vuln] of Object.entries(report.vulnerabilities)) {
+    const rank = SEVERITIES.indexOf(vuln.severity)
+    if ((rank < 0 ? SEVERITIES.length - 1 : rank) > causeSeverity.get(name))
+      gateFailure(`audit severity inconsistent for ${name}: no reachable advisory explains package severity`)
+  }
 
   for (const [name, vuln] of Object.entries(report.vulnerabilities || {})) {
     for (const via of Array.isArray(vuln?.via) ? vuln.via : []) {
@@ -1428,22 +1493,22 @@ function auditFindings(report) {
       if (!via || typeof via !== 'object') continue
 
       const id = advisoryOf(via)
-      const key = `${id}|${name}`
-      if (seen.has(key)) continue
-      seen.add(key)
-
-      rows.push({
+      const key = `${id.toUpperCase()}|${name}`
+      const finding = {
         id,
         package: name,
         // an unrecognised severity is treated as the highest rather than the
         // lowest: a report this tool cannot read must not become a pass
         severity: SEVERITIES.includes(via.severity) ? via.severity : 'critical',
         title: typeof via.title === 'string' ? via.title : ''
-      })
+      }
+      const previous = seen.get(key)
+      if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity))
+        seen.set(key, finding)
     }
   }
 
-  return rows
+  return [...seen.values()]
 }
 
 /**
@@ -1457,6 +1522,7 @@ function auditFindings(report) {
  */
 function auditReport({ cwd, omit, input }) {
   let text = ''
+  let npmStatus = null
 
   if (input) {
     try {
@@ -1465,8 +1531,54 @@ function auditReport({ cwd, omit, input }) {
       gateFailure(`the recorded report could not be read (${input}): ${error.message}`)
     }
   } else {
-    const argv = ['audit', '--json', ...(omit ? ['--omit', omit] : [])]
-    const run = spawnSync('npm', argv, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    // npm combines include and omit, and include always wins even when omit came
+    // from a higher-priority source. Set both lists explicitly: npmrc, npm_config_*
+    // and NODE_ENV must not silently alter the scope we print and judge.
+    const omitted = omit ? omit.split(',') : []
+    const included = ['prod', 'dev', 'optional', 'peer'].filter((value) => !omitted.includes(value))
+    // Find the nearest npm project; npm's prefix command cannot run under a
+    // workspace selector. Keep all registry and authentication settings intact.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^npm_config_workspace(s)?$/i.test(key)))
+    let auditCwd = resolve(cwd)
+    while (!existsSync(join(auditCwd, 'package.json')) && !existsSync(join(auditCwd, 'node_modules')) && auditCwd !== dirname(auditCwd))
+      auditCwd = dirname(auditCwd)
+    const localPrefix = auditCwd
+    // A local lockfile makes this an independent project. Otherwise search past
+    // intermediate manifests: npm workspaces may be nested beneath one of them.
+    // A different lockfile is a project boundary unless it explicitly links this
+    // package as a workspace.
+    for (let parent = dirname(localPrefix); !existsSync(join(localPrefix, 'package-lock.json')); parent = dirname(parent)) {
+      try {
+        const lock = JSON.parse(readFileSync(join(parent, 'package-lock.json'), 'utf8'))
+        const entry = relative(parent, localPrefix).split(sep).join('/')
+        if (lock.packages?.[entry] && Object.values(lock.packages).some((item) => item?.link && item.resolved === entry)) {
+          auditCwd = parent
+          break
+        }
+      } catch { /* not a readable npm workspace lockfile */ }
+      if (existsSync(join(parent, 'package-lock.json')) || parent === dirname(parent)) break
+    }
+    let workspaceProject = false
+    let workspacePatterns = []
+    try {
+      const pkg = JSON.parse(readFileSync(join(auditCwd, 'package.json'), 'utf8'))
+      workspacePatterns = Array.isArray(pkg.workspaces) ? pkg.workspaces : Array.isArray(pkg.workspaces?.packages) ? pkg.workspaces.packages : []
+      workspaceProject = workspacePatterns.length > 0
+    } catch { /* npm reports missing or invalid manifests */ }
+    let lockedWorkspacePaths = []
+    try {
+      const lock = JSON.parse(readFileSync(join(auditCwd, 'package-lock.json'), 'utf8'))
+      lockedWorkspacePaths = Object.values(lock.packages || {}).filter((entry) => entry?.link && typeof entry.resolved === 'string')
+        .map((entry) => resolve(auditCwd, entry.resolved))
+    } catch { /* npm will reject a missing or invalid lockfile */ }
+    // Select configured patterns as well as lockfile links: globstar does not
+    // cross hidden paths and a workspace might not yet be in the lockfile.
+    const workspaceSelectors = ['**', ...workspacePatterns.filter((pattern) => typeof pattern === 'string' && !pattern.startsWith('!')), ...lockedWorkspacePaths]
+    const workspaceArgs = workspaceProject ? [...workspaceSelectors.flatMap((path) => ['--workspace', path]), '--include-workspace-root', '--workspaces'] : []
+    const argv = ['audit', '--json', ...workspaceArgs, ...included.flatMap((value) => ['--include', value]),
+      ...omitted.flatMap((value) => ['--omit', value])]
+    const run = spawnSync('npm', argv, { cwd: auditCwd, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    npmStatus = run.status
     text = run.stdout || ''
 
     if (!text.trim()) {
@@ -1477,6 +1589,10 @@ function auditReport({ cwd, omit, input }) {
           (stderr ? `:\n${stderr}` : '')
       )
     }
+    // npm uses 1 for an audit with findings; other exits and interrupted or
+    // truncated executions cannot be treated as a complete report.
+    if (run.error || run.signal || (run.status !== 0 && run.status !== 1))
+      gateFailure(`npm ${argv.join(' ')} failed: ${run.error?.message || (run.signal ? `signal ${run.signal}` : `exit ${run.status}`)}`)
   }
 
   let report
@@ -1492,15 +1608,36 @@ function auditReport({ cwd, omit, input }) {
     typeof report !== 'object' ||
     !report.vulnerabilities ||
     typeof report.vulnerabilities !== 'object' ||
+    Array.isArray(report.vulnerabilities) ||
     report.auditReportVersion === undefined
   )
     gateFailure('this is not an npm audit report: no vulnerabilities or auditReportVersion')
+
+  if (report.error) gateFailure(`npm audit report contains an error: ${JSON.stringify(report.error)}`)
 
   if (report.auditReportVersion !== 2)
     gateFailure(
       `npm audit report version ${report.auditReportVersion} is not supported - ` +
         'this gate was written against 2, so pin the npm the pipeline runs'
     )
+
+  const counts = report.metadata?.vulnerabilities
+  if (!counts || typeof counts !== 'object' || Array.isArray(counts) ||
+      !Number.isSafeInteger(counts.total) || counts.total !== Object.keys(report.vulnerabilities).length)
+    gateFailure('npm audit metadata vulnerabilities total is missing or inconsistent with affected packages')
+
+  if (npmStatus === 1 && counts.total === 0)
+    gateFailure('npm audit exited 1 but the report is empty')
+
+  // Counts describe vulnerable packages, not the number of advisory objects.
+  // Preserve conservative handling of unknown package severities by requiring
+  // internally coherent counts without pretending to know their category.
+  const values = Object.values(report.vulnerabilities)
+  if (SEVERITIES.some((severity) => !Number.isSafeInteger(counts[severity]) || counts[severity] < 0) ||
+      SEVERITIES.reduce((sum, severity) => sum + counts[severity], 0) !== counts.total ||
+      (values.every((vuln) => SEVERITIES.includes(vuln?.severity)) &&
+        SEVERITIES.some((severity) => counts[severity] !== values.filter((vuln) => vuln.severity === severity).length)))
+    gateFailure('npm audit metadata severity counts are inconsistent with affected packages')
 
   return report
 }
@@ -1549,6 +1686,10 @@ function auditExemptions(cwd, omit) {
     if (typeof entry.recheckBy !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.recheckBy))
       fail(`${at} needs recheckBy as YYYY-MM-DD: a waiver without a review date outlives its reason`)
 
+    const date = new Date(`${entry.recheckBy}T00:00:00Z`)
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== entry.recheckBy)
+      fail(`${at} needs a valid calendar date for recheckBy`)
+
     // A date has passed when the calendar says so, not the clock: comparing the
     // strings is exact for YYYY-MM-DD and needs no timezone
     if (entry.recheckBy < today)
@@ -1575,12 +1716,11 @@ function auditExemptions(cwd, omit) {
     }
   })
 
-  // An exemption on a production-only gate is a waiver that can never apply: the
-  // gate refuses to exempt anything that ships, so the list would be inert and
-  // every entry would report as stale.
+  // An omitted-tree gate refuses exemptions: the partial report cannot establish
+  // whether an omitted advisory is still present or whether a waiver is stale.
   if (omit && exemptions.length)
     fail(
-      `--audit-omit ${omit} judges only what ships, where nothing is exemptible, ` +
+      `--audit-omit ${omit} ${omit === 'dev' ? 'judges only what ships' : 'judges an omitted tree'}, where nothing is exemptible, ` +
         `but ${file} carries ${exemptions.length} exemption(s): drop the flag to judge the full tree`
     )
 
@@ -1601,6 +1741,8 @@ async function auditGate() {
   if (!SEVERITIES.includes(level)) fail(`--audit-level must be one of ${SEVERITIES.join(', ')}`)
 
   const omit = arg('audit-omit')
+  if (flag('audit-omit') && omit.split(',').some((value) => !['dev', 'optional', 'peer'].includes(value)))
+    fail('--audit-omit must be a comma-separated list of dev, optional, peer')
   const exemptions = auditExemptions(cwd, omit)
 
   const floor = SEVERITIES.indexOf(level)
@@ -1615,10 +1757,10 @@ async function auditGate() {
   // A recorded replay runs no npm at all: if the production report is needed, it has
   // to arrive as a file too. Without this the gate would ask npm in a run whose whole
   // point was not to, and blame the caller's JSON for the answer.
-  const needsProd = exemptions.some((entry) => entry.devOnly)
+  const needsProd = exemptions.length > 0
 
   if (needsProd && arg('audit-input') && !arg('audit-prod-input'))
-    fail('--audit-input with a devOnly exemption needs --audit-prod-input: a recorded replay runs no npm')
+    fail('--audit-input with an exemption needs --audit-prod-input: a recorded replay runs no npm')
 
   const judged = auditReport({ cwd, omit, input: arg('audit-input') })
   const reportPath = arg('audit-report')
@@ -1635,11 +1777,9 @@ async function auditGate() {
   const findings = auditFindings(judged)
   const above = findings.filter(atFloor)
 
-  // The production tree is a second report: --omit=dev is the only question that
-  // answers "does this ship" for a transitive dependency. It is asked only when an
-  // entry claims devOnly, because with no entries there is nothing an exemption
-  // could be hiding - the claim is measured rather than taken on trust. When the
-  // run itself is the production set, every finding in it is one.
+  // Any exemption can hide a production finding, so a full report with exemptions
+  // needs a second report omitting dev. An explicitly omitted tree is judged on
+  // its own, without exemptions; only omit=dev identifies the production tree.
   const shipped = omit
     ? above
     : needsProd
@@ -1666,17 +1806,21 @@ async function auditGate() {
     rows.set(key(finding), {
       finding,
       why:
-        at === -1
-          ? 'in the production tree, where nothing is exemptible'
-          : `in the production tree, though the allowlist calls it devOnly (review by ${exemptions[at].recheckBy})`
+        at !== -1 && exemptions[at].devOnly
+          ? `in the production tree, though the allowlist calls it devOnly (review by ${exemptions[at].recheckBy})`
+          : omit && omit !== 'dev'
+            ? 'in the omitted tree, where nothing is exemptible'
+            : 'in the production tree, where nothing is exemptible'
     })
   }
 
-  // An entry that stops appearing fails: a stale waiver is invisible in a passing
-  // build, which is how it outlives the problem it describes. Judged against every
-  // advisory the report carries, so raising the floor does not make an entry look
-  // stale when the advisory is still there.
-  const stale = exemptions.filter((entry) => !findings.some((finding) => sameId(finding.id, entry.id)))
+  // Check each named package against the full report, not the severity-filtered
+  // findings. An unscoped entry remains current while its id appears anywhere.
+  const stale = exemptions.flatMap((entry) => {
+    const matching = findings.filter((finding) => sameId(finding.id, entry.id))
+    const missing = [...new Set(entry.packages)].filter((name) => !matching.some((finding) => finding.package === name))
+    return (!entry.packages.length && !matching.length) || missing.length ? [{ entry, missing }] : []
+  })
 
   output({
     audited: rows.size === 0 && stale.length === 0,
@@ -1693,15 +1837,17 @@ async function auditGate() {
         (finding.title ? ` - ${finding.title}` : '')
     )
 
-  for (const entry of stale)
-    console.log(`${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
+  for (const { entry, missing } of stale)
+    console.log(missing.length
+      ? `${entry.id} is in the allowlist but the report no longer carries it for: ${missing.join(', ')}; ${missing.length === new Set(entry.packages).size ? 'remove the entry' : 'remove those packages or the entry'}`
+      : `${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
 
   if (rows.size)
     gateFailure(`${rows.size} advisory/advisories at or above ${level} that the allowlist does not clear`)
 
   if (stale.length)
     gateFailure(
-      `${stale.length} allowlist entr${stale.length === 1 ? 'y' : 'ies'} no longer match anything in the report`
+      `${stale.length} allowlist entr${stale.length === 1 ? 'y has' : 'ies have'} an id or named package missing from the report`
     )
 
   console.log(`no advisory at or above ${level} outside the allowlist`)
@@ -1729,7 +1875,17 @@ function assertNoDependencies(cwd) {
     fail(`--assert-no-dependencies: ${at} could not be read: ${error.message}`)
   }
 
-  const shipped = Object.keys(pkg.dependencies || {})
+  const shipped = Object.keys({
+    ...pkg.dependencies,
+    ...pkg.peerDependencies,
+    ...pkg.optionalDependencies,
+    ...(Array.isArray(pkg.bundledDependencies)
+      ? Object.fromEntries(pkg.bundledDependencies.map((name) => [name, 1]))
+      : pkg.bundledDependencies),
+    ...(Array.isArray(pkg.bundleDependencies)
+      ? Object.fromEntries(pkg.bundleDependencies.map((name) => [name, 1]))
+      : pkg.bundleDependencies)
+  })
 
   if (shipped.length)
     gateFailure(

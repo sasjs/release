@@ -109,6 +109,11 @@ const mutations = [
     replace: `    const refused = await find()`
   },
   {
+    name: 'inherited workspace selectors narrow the audit',
+    find: `    const workspaceArgs = workspaceProject ? [...workspaceSelectors.flatMap((path) => ['--workspace', path]), '--include-workspace-root', '--workspaces'] : []`,
+    replace: `    const workspaceArgs = []`
+  },
+  {
     name: 'a draft published while the run looked at it is deleted anyway',
     find: `          if (current?.draft !== true)`,
     replace: `          if (false)`
@@ -151,6 +156,11 @@ const mutations = [
     replace: `  if (false)`
   },
   {
+    name: 'stale exemptions ignore package scope',
+    find: `    const missing = [...new Set(entry.packages)].filter((name) => !matching.some((finding) => finding.package === name))`,
+    replace: `    const missing = matching.length ? [] : [...new Set(entry.packages)]`
+  },
+  {
     name: 'the production report is never asked for',
     find: `  const shipped = omit
     ? above
@@ -179,6 +189,41 @@ const mutations = [
     name: 'an exemption key nobody reads is accepted silently',
     find: `    if (unknown.length)`,
     replace: `    if (false)`
+  },
+  {
+    name: 'only devOnly exemptions trigger the production audit',
+    find: `  const needsProd = exemptions.length > 0`,
+    replace: `  const needsProd = exemptions.some((entry) => entry.devOnly)`
+  },
+  {
+    name: 'indirect and mixed package severity is not reconciled with reachable advisory causes',
+    find: `    if ((rank < 0 ? SEVERITIES.length - 1 : rank) > causeSeverity.get(name))`,
+    replace: `    if (false)`
+  },
+  {
+    name: 'an orphaned via chain is accepted',
+    find: `    if (!reachable.has(name)) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`,
+    replace: `    if (false) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`
+  },
+  {
+    name: 'affected-package metadata checks are bypassed',
+    find: `  const counts = report.metadata?.vulnerabilities\n  if (!counts || typeof counts !== 'object' || Array.isArray(counts) ||\n      !Number.isSafeInteger(counts.total) || counts.total !== Object.keys(report.vulnerabilities).length)\n    gateFailure('npm audit metadata vulnerabilities total is missing or inconsistent with affected packages')`,
+    replace: `  const counts = report.metadata?.vulnerabilities`
+  },
+  {
+    name: 'the assertion ignores non-direct runtime dependency fields',
+    find: `  const shipped = Object.keys({
+    ...pkg.dependencies,
+    ...pkg.peerDependencies,
+    ...pkg.optionalDependencies,
+    ...(Array.isArray(pkg.bundledDependencies)
+      ? Object.fromEntries(pkg.bundledDependencies.map((name) => [name, 1]))
+      : pkg.bundledDependencies),
+    ...(Array.isArray(pkg.bundleDependencies)
+      ? Object.fromEntries(pkg.bundleDependencies.map((name) => [name, 1]))
+      : pkg.bundleDependencies)
+  })`,
+    replace: `  const shipped = Object.keys(pkg.dependencies || {})`
   },
   {
     name: 'a package that ships dependencies passes the assertion',
