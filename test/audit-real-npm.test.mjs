@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -61,6 +61,132 @@ async function fixture(t) {
   Object.assign(env, { npm_config_userconfig: join(cwd, 'user.npmrc'), npm_config_globalconfig: join(cwd, 'global.npmrc'), npm_config_cache: join(cwd, 'npm-cache'), NODE_ENV: 'production', npm_config_omit: 'optional' })
   return { cwd, env, requests }
 }
+
+async function workspaceFixture(t) {
+  const data = await fixture(t)
+  const { cwd } = data
+  const root = { name: 'audit-scope-fixture', version: '1.0.0', private: true, workspaces: ['packages/*'], dependencies: { [names[0]]: '1.0.0' } }
+  const a = { name: 'ws-a', version: '1.0.0', dependencies: { [names[1]]: '1.0.0' } }
+  const b = { name: 'ws-b', version: '1.0.0', dependencies: { [names[2]]: '1.0.0' } }
+  const lock = { name: root.name, version: root.version, lockfileVersion: 3, requires: true, packages: {
+    '': root, 'packages/a': a, 'packages/b': b,
+    'node_modules/ws-a': { resolved: 'packages/a', link: true },
+    'node_modules/ws-b': { resolved: 'packages/b', link: true },
+    ...Object.fromEntries(names.slice(0, 3).map((name) => [`node_modules/${name}`, { version: '1.0.0' }]))
+  } }
+  for (const [path, pkg] of [['', root], ['packages/a', a], ['packages/b', b]]) {
+    mkdirSync(join(cwd, path), { recursive: true })
+    writeFileSync(join(cwd, path, 'package.json'), JSON.stringify(pkg))
+  }
+  writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify(lock))
+  return data
+}
+
+for (const source of ['environment', 'project', 'user', 'global', 'disabled']) {
+  for (const omit of ['', 'dev']) {
+    test(`real npm ${omit || 'full'} workspace audit ignores ${source} selection`, async (t) => {
+      const { cwd, env, requests } = await workspaceFixture(t)
+      const files = { project: '.npmrc', user: 'user.npmrc', global: 'global.npmrc' }
+      if (files[source]) {
+        const path = join(cwd, files[source])
+        writeFileSync(path, `${readFileSync(path, 'utf8')}workspace=ws-a\n`)
+      } else if (source === 'disabled') writeFileSync(join(cwd, '.npmrc'), `${readFileSync(join(cwd, '.npmrc'), 'utf8')}workspaces=false\n`)
+      else env.npm_config_workspace = 'ws-a'
+      const args = [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json']
+      if (omit) args.push('--audit-omit', omit)
+      const result = await execute(process.execPath, args, { cwd, env })
+      assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+      const actual = JSON.parse(readFileSync(join(cwd, 'actual.json'), 'utf8'))
+      assert.deepEqual(Object.keys(actual.vulnerabilities).sort(), names.slice(0, 3).sort(), result.stdout)
+      assert.equal(requests.find((request) => request.url === '/-/npm/v1/security/advisories/bulk')?.authorization, 'Bearer fixture-secret')
+    })
+  }
+}
+
+test('real npm second production audit sees production advisories in an unselected workspace', async (t) => {
+  const { cwd, env } = await workspaceFixture(t)
+  env.npm_config_workspace = 'ws-a'
+  mkdirSync(join(cwd, 'scripts'))
+  writeFileSync(join(cwd, 'scripts', 'audit-allowlist.json'), JSON.stringify(names.slice(0, 3).map((name, i) => ({
+    id: `GHSA-aaaa-bbbb-ccc${i}`, packages: [name], devOnly: true, recheckBy: '2099-01-31', reason: 'Fixture exemption for production safety test'
+  }))))
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit'], { cwd, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /scope-dev: in the production tree, though the allowlist calls it devOnly/)
+})
+
+test('real npm audit from a workspace directory covers the root and sibling workspace', async (t) => {
+  const { cwd, env } = await workspaceFixture(t)
+  env.npm_config_workspace = 'ws-a'
+  const nested = join(cwd, 'packages/a')
+  const result = await execute(process.execPath, [CLI, '--repo-dir', nested, '--audit', '--audit-report', 'actual.json'], { cwd: nested, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  const actual = JSON.parse(readFileSync(join(nested, 'actual.json'), 'utf8'))
+  assert.deepEqual(Object.keys(actual.vulnerabilities).sort(), names.slice(0, 3).sort(), result.stdout)
+})
+
+test('real npm audits an independent project nested inside a workspace repository', async (t) => {
+  const { cwd, env } = await workspaceFixture(t)
+  const nested = join(cwd, 'packages/a/standalone')
+  mkdirSync(nested, { recursive: true })
+  const pkg = { name: 'standalone', version: '1.0.0', dependencies: { [names[3]]: '1.0.0' } }
+  writeFileSync(join(nested, 'package.json'), JSON.stringify(pkg))
+  writeFileSync(join(nested, 'package-lock.json'), JSON.stringify({ name: pkg.name, version: pkg.version, lockfileVersion: 3, packages: { '': pkg, [`node_modules/${names[3]}`]: { version: '1.0.0' } } }))
+  writeFileSync(join(nested, '.npmrc'), readFileSync(join(cwd, '.npmrc'), 'utf8'))
+  const result = await execute(process.execPath, [CLI, '--repo-dir', nested, '--audit', '--audit-report', 'actual.json'], { cwd: nested, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(nested, 'actual.json'), 'utf8')).vulnerabilities), [names[3]], result.stdout)
+})
+
+test('real npm audit includes workspaces explicitly located under hidden directories', async (t) => {
+  const { cwd, env } = await workspaceFixture(t)
+  const root = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'))
+  root.workspaces.push('.hidden/.deep/*')
+  const hidden = { name: 'ws-hidden', version: '1.0.0', dependencies: { [names[3]]: '1.0.0' } }
+  mkdirSync(join(cwd, '.hidden/.deep/c'), { recursive: true })
+  writeFileSync(join(cwd, '.hidden/.deep/c/package.json'), JSON.stringify(hidden))
+  writeFileSync(join(cwd, 'package.json'), JSON.stringify(root))
+  const lock = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8'))
+  lock.packages[''] = root
+  lock.packages['.hidden/.deep/c'] = hidden
+  lock.packages['node_modules/ws-hidden'] = { resolved: '.hidden/.deep/c', link: true }
+  lock.packages[`node_modules/${names[3]}`] = { version: '1.0.0' }
+  writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify(lock))
+  env.npm_config_workspace = 'ws-a'
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(cwd, 'actual.json'), 'utf8')).vulnerabilities).sort(), [...names].sort(), result.stdout)
+})
+
+test('real npm fails closed for workspace projects with no matching workspaces', async (t) => {
+  const { cwd, env } = await fixture(t)
+  const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf8'))
+  pkg.workspaces = ['packages/*']
+  writeFileSync(join(cwd, 'package.json'), JSON.stringify(pkg))
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.ok(!existsSync(join(cwd, 'actual.json')), `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /not an npm audit report/)
+})
+
+test('real npm non-workspace audit ignores an environment workspace selection', async (t) => {
+  const { cwd, env } = await fixture(t)
+  env.NPM_CONFIG_WORKSPACE = 'ws-a'
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.ok(existsSync(join(cwd, 'actual.json')), `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(cwd, 'actual.json'), 'utf8')).vulnerabilities).sort(), [...names].sort())
+})
+
+test('real npm non-workspace audit fails closed with an inherited workspace selection', async (t) => {
+  const { cwd, env } = await fixture(t)
+  writeFileSync(join(cwd, '.npmrc'), `${readFileSync(join(cwd, '.npmrc'), 'utf8')}workspace=ws-a\n`)
+  env.npm_config_workspace = 'ws-a'
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+  assert.ok(!existsSync(join(cwd, 'actual.json')), `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /not an npm audit report/)
+})
 
 test('real npm full audit ignores inherited omit and production defaults while retaining registry auth', async (t) => {
   const { cwd, env, requests } = await fixture(t)

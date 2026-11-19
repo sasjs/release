@@ -109,6 +109,11 @@ const mutations = [
     replace: `    const refused = await find()`
   },
   {
+    name: 'inherited workspace selectors narrow the audit',
+    find: `    const workspaceArgs = workspaceProject ? [...workspaceSelectors.flatMap((path) => ['--workspace', path]), '--include-workspace-root', '--workspaces'] : []`,
+    replace: `    const workspaceArgs = []`
+  },
+  {
     name: 'a draft published while the run looked at it is deleted anyway',
     find: `          if (current?.draft !== true)`,
     replace: `          if (false)`

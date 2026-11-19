@@ -23,7 +23,7 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const LEVELS = { major: 3, minor: 2, patch: 1 }
@@ -1536,9 +1536,44 @@ function auditReport({ cwd, omit, input }) {
     // and NODE_ENV must not silently alter the scope we print and judge.
     const omitted = omit ? omit.split(',') : []
     const included = ['prod', 'dev', 'optional', 'peer'].filter((value) => !omitted.includes(value))
-    const argv = ['audit', '--json', ...included.flatMap((value) => ['--include', value]),
+    // Find the nearest npm project; npm's prefix command cannot run under a
+    // workspace selector. Keep all registry and authentication settings intact.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^npm_config_workspace(s)?$/i.test(key)))
+    let auditCwd = resolve(cwd)
+    while (!existsSync(join(auditCwd, 'package.json')) && !existsSync(join(auditCwd, 'node_modules')) && auditCwd !== dirname(auditCwd))
+      auditCwd = dirname(auditCwd)
+    const localPrefix = auditCwd
+    for (let parent = dirname(localPrefix); ; parent = dirname(parent)) {
+      try {
+        const lock = JSON.parse(readFileSync(join(parent, 'package-lock.json'), 'utf8'))
+        const entry = relative(parent, localPrefix).split(sep).join('/')
+        if (lock.packages?.[entry] && Object.values(lock.packages).some((item) => item?.link && item.resolved === entry)) {
+          auditCwd = parent
+          break
+        }
+      } catch { /* not a readable npm workspace lockfile */ }
+      if (existsSync(join(parent, 'package.json')) || parent === dirname(parent)) break
+    }
+    let workspaceProject = false
+    let workspacePatterns = []
+    try {
+      const pkg = JSON.parse(readFileSync(join(auditCwd, 'package.json'), 'utf8'))
+      workspacePatterns = Array.isArray(pkg.workspaces) ? pkg.workspaces : Array.isArray(pkg.workspaces?.packages) ? pkg.workspaces.packages : []
+      workspaceProject = workspacePatterns.length > 0
+    } catch { /* npm reports missing or invalid manifests */ }
+    let lockedWorkspacePaths = []
+    try {
+      const lock = JSON.parse(readFileSync(join(auditCwd, 'package-lock.json'), 'utf8'))
+      lockedWorkspacePaths = Object.values(lock.packages || {}).filter((entry) => entry?.link && typeof entry.resolved === 'string')
+        .map((entry) => resolve(auditCwd, entry.resolved))
+    } catch { /* npm will reject a missing or invalid lockfile */ }
+    // Select configured patterns as well as lockfile links: globstar does not
+    // cross hidden paths and a workspace might not yet be in the lockfile.
+    const workspaceSelectors = ['**', ...workspacePatterns.filter((pattern) => typeof pattern === 'string' && !pattern.startsWith('!')), ...lockedWorkspacePaths]
+    const workspaceArgs = workspaceProject ? [...workspaceSelectors.flatMap((path) => ['--workspace', path]), '--include-workspace-root', '--workspaces'] : []
+    const argv = ['audit', '--json', ...workspaceArgs, ...included.flatMap((value) => ['--include', value]),
       ...omitted.flatMap((value) => ['--omit', value])]
-    const run = spawnSync('npm', argv, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    const run = spawnSync('npm', argv, { cwd: auditCwd, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
     npmStatus = run.status
     text = run.stdout || ''
 
