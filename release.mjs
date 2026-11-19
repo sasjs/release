@@ -1403,16 +1403,17 @@ function gateFailure(message) {
 /**
  * The advisory a `via` entry names, if it names one.
  *
- * npm reports two kinds: an advisory it has an id for, whose `url` points at a
- * GHSA page, and one of its own, which carries a numeric `source` and no url.
- * Only the first can be exempted - an exemption is a claim about a specific
- * advisory - and the second is reported as a failure rather than dropped, because
- * "I cannot name this" is not "there is nothing to fix".
+ * npm reports advisory URLs such as https://github.com/advisories/GHSA-... .
+ * Only that complete URL identifies a GHSA: a substring in another URL, query,
+ * or malformed path must not turn an unnamed finding into an exemption.
+ * An advisory without a recognized URL is reported as a failure rather than
+ * dropped, because "I cannot name this" is not "there is nothing to fix".
  */
 function advisoryOf(via) {
   const url = typeof via?.url === 'string' ? via.url : ''
-  const found = /GHSA(?:-[0-9a-z]{4}){3}/i.exec(url)
-  return found ? found[0] : ''
+  const found = /^https:\/\/github\.com\/advisories\/(GHSA(?:-[0-9a-z]{4}){3})\/?$/i.exec(url)
+  // JavaScript's $ can match before a final newline; require the whole string.
+  return found && found[0] === url ? found[1] : ''
 }
 
 /** Advisory ids are reported in one case and written in another; compare them as one. */

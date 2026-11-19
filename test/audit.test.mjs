@@ -174,6 +174,72 @@ test('a dev advisory passes only when the allowlist argues for it and the produc
   assert.match(stdout, /^exempted=1$/m)
 })
 
+test('a malformed advisory URL suffix cannot satisfy a waiver', () => {
+  const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url: `https://github.com/advisories/${PICOMATCH}-extra` }
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+})
+
+test('a GHSA embedded in an unrelated URL query cannot satisfy a waiver', () => {
+  const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url: `https://example.com/?advisory=${PICOMATCH}` }
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+})
+
+test('only an entire unambiguous GitHub advisory URL can satisfy a waiver', () => {
+  const badUrls = [
+    `https://github.com/advisories/${PICOMATCH}0`,
+    `https://github.com/advisories/x${PICOMATCH}`,
+    `https://github.com/advisories/${PICOMATCH}/extra`,
+    `https://github.com/advisories/${PICOMATCH}?other=GHSA-aaaa-bbbb-cccc`,
+    `https://github.com/advisories/${PICOMATCH}#GHSA-aaaa-bbbb-cccc`,
+    `https://github.com.evil.example/advisories/${PICOMATCH}`,
+    `https://github.com@evil.example/advisories/${PICOMATCH}`,
+    `https://evil.example/advisories/${PICOMATCH}`,
+    `https://github.com/other/${PICOMATCH}`,
+    `https://github.com/advisories/${PICOMATCH}\n`,
+    `https://github.com/advisories/${PICOMATCH} https://github.com/advisories/GHSA-aaaa-bbbb-cccc`,
+    `http://github.com/advisories/${PICOMATCH}`,
+    null, '', 42
+  ]
+  for (const url of badUrls) {
+    const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url }
+    const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 1, `${String(url)}: ${result.out}`)
+    assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+    assert.match(result.out, /^exempted=0$/m)
+  }
+})
+
+test('a malformed URL below the floor cannot make an unrelated waiver current', () => {
+  const via = { ...advisory(PICOMATCH, { severity: 'low', package: 'picomatch' }), url: `https://example.com/?id=${PICOMATCH}` }
+  const cwd = repo({ report: report([{ package: 'picomatch', severity: 'low', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /report no longer carries it/)
+  assert.match(result.out, /^stale=1$/m)
+})
+
+test('a real npm advisory URL and a case-insensitive GitHub URL satisfy their waivers', () => {
+  const sample = JSON.parse(readFileSync(new URL('./fixtures/npm-audit-sasjs-cli.json', import.meta.url), 'utf8'))
+  const actual = sample.vulnerabilities.glob.via.find((via) => typeof via === 'object')
+  assert.equal(actual.url, 'https://github.com/advisories/GHSA-3g3m-2fjr-6pw4')
+  for (const url of [actual.url, 'https://GITHUB.COM/advisories/ghsa-3G3M-2FJR-6PW4/']) {
+    const cwd = repo({
+      report: report([{ package: 'glob', severity: actual.severity, via: [{ ...actual, url }] }]),
+      prodReport: report(), exemptions: [exemption({ id: 'GHSA-3g3m-2fjr-6pw4', packages: ['glob'] })]
+    })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 0, `${url}: ${result.out}`)
+    assert.match(result.out, /^exempted=1$/m)
+  }
+})
+
 test('strict severity permits a clean tree with no exemptions', () => {
   for (const exemptions of [undefined, []]) {
     const result = run(repo({ exemptions }), '--audit-input', 'full.json', '--audit-require-severity')

@@ -122,7 +122,7 @@ What it enforces:
 - **Production is never exemptible.** The `--omit dev` report is judged on its own and any advisory there fails, whatever the allowlist says. The tree that ships is a version to change, not a risk to accept.
 - **A dev advisory fails unless an entry names it**, and the entry carries the argument: where the package sits, what input reaches the affected code, when it clears.
 - **An entry that stops appearing fails**, so an exemption cannot outlive its reason.
-- **An advisory with no GHSA id fails**, because an exemption is a claim about a specific advisory - and "I cannot name this" is not "there is nothing to fix".
+- **An advisory with no GHSA id fails**, because an exemption is a claim about a specific advisory - and "I cannot name this" is not "there is nothing to fix". A waiver matches only a complete GitHub advisory URL (`https://github.com/advisories/GHSA-xxxx-xxxx-xxxx`, with an optional trailing slash); other URLs, queries, and fragments cannot supply an identity.
 - **A report that cannot be read fails.** `npm audit --json` writes its own errors to stdout and exits non-zero, so a missing lockfile or an unreachable registry parses as JSON with no `vulnerabilities`. That is not a clean tree, and it must not become one once the exemption list empties out.
 - **Production is measured for every exemption.** Any entry, whether `devOnly` is true, false, or omitted, triggers a production report; an advisory in that report is never exemptible. With no entries the second call is skipped, because there is nothing an exemption could be hiding.
 
