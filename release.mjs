@@ -1383,7 +1383,7 @@ const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical']
 const DEFAULT_AUDIT_CONFIG = join('scripts', 'audit-allowlist.json')
 
 /** The keys an exemption may carry. Anything else is a typo that would be inert. */
-const EXEMPTION_KEYS = ['id', 'packages', 'devOnly', 'recheckBy', 'reason']
+const EXEMPTION_KEYS = ['id', 'packages', 'devOnly', 'recheckBy', 'reason', 'severity']
 
 /**
  * A gate failure: the tree has a problem, or the report cannot be read.
@@ -1500,10 +1500,14 @@ function auditFindings(report) {
         // an unrecognised severity is treated as the highest rather than the
         // lowest: a report this tool cannot read must not become a pass
         severity: SEVERITIES.includes(via.severity) ? via.severity : 'critical',
+        severityKnown: SEVERITIES.includes(via.severity),
         title: typeof via.title === 'string' ? via.title : ''
       }
       const previous = seen.get(key)
-      if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity))
+      // Preserve an unknown rating over an equal-ranked critical in either order:
+      // normalization to critical must not make it satisfy a critical waiver.
+      if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity) ||
+          (finding.severity === previous.severity && !finding.severityKnown))
         seen.set(key, finding)
     }
   }
@@ -1645,10 +1649,10 @@ function auditReport({ cwd, omit, input }) {
 /**
  * The exemption list, validated.
  *
- * A waiver is an argument, so the fields that carry the argument are required and
- * the ones that would be a second copy of the report are not accepted: `severity`
- * and `title` come from the advisory itself, and an entry that stored them could
- * disagree with the finding it describes.
+ * A waiver is an argument. Severity is an optional constraint on that argument,
+ * not a copy of the report: a changed rating requires the waiver to be reviewed.
+ * Omitting it retains the original severity-agnostic behavior. Title remains
+ * report data and is not accepted in the exemption.
  */
 function auditExemptions(cwd, omit) {
   const named = arg('audit-config')
@@ -1707,7 +1711,11 @@ function auditExemptions(cwd, omit) {
     if (entry.devOnly !== undefined && typeof entry.devOnly !== 'boolean')
       fail(`${at} has a devOnly that is not true or false`)
 
+    if (entry.severity !== undefined && !SEVERITIES.includes(entry.severity))
+      fail(`${at} has a severity that is not one of ${SEVERITIES.join(', ')}`)
+
     return {
+      severity: entry.severity,
       id: entry.id,
       packages: entry.packages || [],
       devOnly: entry.devOnly === true,
@@ -1792,9 +1800,17 @@ async function auditGate() {
 
   for (const finding of above) {
     const at = matches(finding)
+    // Every applicable bound is a restriction, regardless of list order or an
+    // overlapping unbounded entry; an older waiver must not undo a newer one.
+    const mismatch = exemptions.find((entry) =>
+      sameId(entry.id, finding.id) &&
+      (!entry.packages.length || entry.packages.includes(finding.package)) &&
+      entry.severity !== undefined && (!finding.severityKnown || entry.severity !== finding.severity))
 
     if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })
     else if (at === -1) rows.set(key(finding), { finding, why: 'not in the allowlist' })
+    else if (mismatch)
+      rows.set(key(finding), { finding, why: `severity differs from allowlist (${mismatch.severity})` })
     else used.add(at)
   }
 

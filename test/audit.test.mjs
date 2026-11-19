@@ -174,6 +174,101 @@ test('a dev advisory passes only when the allowlist argues for it and the produc
   assert.match(stdout, /^exempted=1$/m)
 })
 
+test('a severity-bound waiver refuses an escalated advisory', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc' // synthetic advisory
+  const cwd = repo({
+    report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'moderate' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /high GHSA-aaaa-bbbb-cccc fixture:.*severity/)
+})
+
+test('an unbounded overlapping waiver cannot bypass a severity-bound waiver', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  for (const entries of [
+    [exemption({ id, packages: [] }), exemption({ id, packages: ['fixture'], severity: 'moderate' })],
+    [exemption({ id, packages: ['fixture'], severity: 'moderate' }), exemption({ id, packages: [] })]
+  ]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+      prodReport: report(),
+      exemptions: entries
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 1, out)
+    assert.match(out, /severity differs/)
+  }
+})
+
+test('an unknown advisory severity cannot match a critical severity waiver', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'mystery', via: [{ id, severity: 'mystery' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'critical' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity differs/)
+})
+
+test('a matching severity-bound waiver passes without waiving production', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const vuln = report([{ package: 'fixture', severity: 'moderate', via: [{ id, severity: 'moderate' }] }])
+  const entry = exemption({ id, packages: ['fixture'], severity: 'moderate' })
+  const cwd = repo({ report: vuln, prodReport: report(), exemptions: [entry] })
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 0)
+  const production = repo({ report: vuln, prodReport: vuln, exemptions: [entry] })
+  assert.equal(run(production, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 1)
+})
+
+test('an unbounded waiver preserves the existing severity-agnostic policy', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'] })]
+  })
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 0)
+})
+
+test('a severity-bound waiver also requires review for a downgrade above the floor', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'low', via: [{ id, severity: 'low' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'moderate' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity differs/)
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'moderate').code, 0)
+})
+
+test('invalid exemption severity is a usage error', () => {
+  const cwd = repo({ exemptions: [exemption({ severity: 'HIGH' })], prodReport: report() })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 2, out)
+  assert.match(out, /severity.*not one of/)
+})
+
+test('unknown severity survives duplicate critical advisory rows in either order', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  for (const severities of [['critical', 'mystery'], ['mystery', 'critical']]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', severity: 'critical', via: severities.map((severity) => ({ id, severity })) }]),
+      prodReport: report(),
+      exemptions: [exemption({ id, packages: ['fixture'], severity: 'critical' })]
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 1, out)
+    assert.match(out, /severity differs/)
+  }
+})
+
 test('a dev advisory nobody has argued for fails, naming the id and the package', () => {
   const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]) })
   const { code, out } = run(cwd, '--audit-input', 'full.json')
