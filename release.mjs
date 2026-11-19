@@ -59,6 +59,8 @@ const HELP = `sasjs-release - releases from conventional commits
                          exemptible, and a dev advisory passes only when the
                          allowlist argues for it
   --audit-level <l>      severity floor: info|low|moderate|high|critical (default low)
+  --audit-require-severity
+                         require a reviewed severity on every exemption (opt-in)
   --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)
@@ -99,7 +101,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // exist rather than failing.
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'audit', 'audit-config', 'audit-input',
-  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'assert-no-dependencies',
+  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'audit-require-severity', 'assert-no-dependencies',
   'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
@@ -1716,6 +1718,8 @@ function auditExemptions(cwd, omit) {
     if (entry.devOnly !== undefined && typeof entry.devOnly !== 'boolean')
       fail(`${at} has a devOnly that is not true or false`)
 
+    if (flag('audit-require-severity') && entry.severity === undefined)
+      fail(`${at} severity is required with --audit-require-severity`)
     if (entry.severity !== undefined && !SEVERITIES.includes(entry.severity))
       fail(`${at} has a severity that is not one of ${SEVERITIES.join(', ')}`)
 
@@ -1957,7 +1961,7 @@ async function main() {
   // A flag that only means something with --audit is otherwise silent: `--audit-level
   // high` on its own would run an ordinary release, which is not what anyone typing
   // it expects.
-  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input']
+  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input', 'audit-require-severity']
   if (!flag('audit') && auditOnly.some(flag)) fail(`--${auditOnly.find(flag)} needs --audit`)
 
   if (flag('assert-no-dependencies')) {

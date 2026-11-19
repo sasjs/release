@@ -174,6 +174,47 @@ test('a dev advisory passes only when the allowlist argues for it and the produc
   assert.match(stdout, /^exempted=1$/m)
 })
 
+test('strict severity permits a clean tree with no exemptions', () => {
+  for (const exemptions of [undefined, []]) {
+    const result = run(repo({ exemptions }), '--audit-input', 'full.json', '--audit-require-severity')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.stdout, /^audited=true$/m)
+  }
+})
+
+test('strict severity accepts a matching rating and blocks escalation', () => {
+  const entry = exemption({ packages: ['fixture'], severity: 'moderate' })
+  for (const [rating, expected] of [['moderate', 0], ['high', 1]]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', severity: rating, via: [{ id: PICOMATCH, severity: rating }] }]),
+      prodReport: report(), exemptions: [entry]
+    })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-severity')
+    assert.equal(result.code, expected, result.out)
+    if (expected) assert.match(result.out, /severity differs/)
+  }
+})
+
+test('strict severity rejects invalid ratings as usage errors', () => {
+  for (const severity of [null, '', 'HIGH', 42]) {
+    const result = run(repo({ exemptions: [exemption({ severity })] }), '--audit-input', 'full.json', '--audit-require-severity')
+    assert.equal(result.code, 2, result.out)
+    assert.match(result.out, /severity.*not one of/)
+  }
+})
+
+test('strict severity requires every waiver to name its reviewed severity', () => {
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['fixture'], severity: 'low' }), exemption({ packages: ['fixture'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high', '--audit-require-severity')
+  assert.equal(code, 2, out)
+  assert.match(out, /severity.*required/)
+  assert.match(out, /GHSA-fc5q-39xc-vjpf/)
+})
+
 test('a severity-bound waiver refuses an escalated advisory', () => {
   const id = 'GHSA-aaaa-bbbb-cccc' // synthetic advisory
   const cwd = repo({
@@ -1065,6 +1106,18 @@ test('--audit alone writes nothing but its verdict', () => {
   assert.equal(code, 0)
   assert.equal(readFileSync(join(cwd, 'package.json'), 'utf8'), before)
   assert.equal(existsSync(join(cwd, 'judged.json')), false)
+})
+
+test('help describes the strict severity option', () => {
+  const result = spawnSync('node', [CLI, '--help'], { encoding: 'utf8' })
+  assert.equal(result.status, 0)
+  assert.match(result.stdout, /--audit-require-severity/)
+})
+
+test('strict severity without --audit is a usage error', () => {
+  const result = spawnSync('node', [CLI, '--audit-require-severity'], { encoding: 'utf8' })
+  assert.equal(result.status, 2)
+  assert.match(`${result.stdout}${result.stderr}`, /--audit-require-severity needs --audit/)
 })
 
 test('an audit flag without --audit is a usage error, not an ordinary release', () => {
