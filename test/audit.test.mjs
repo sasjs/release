@@ -174,6 +174,533 @@ test('a dev advisory passes only when the allowlist argues for it and the produc
   assert.match(stdout, /^exempted=1$/m)
 })
 
+test('exempted counts distinct first applicable entries without source bounds', () => {
+  const data = report([
+    { package: 'a', via: [{ id: PICOMATCH }] },
+    { package: 'b', via: [{ id: PICOMATCH }] }
+  ])
+  const shared = exemption({ packages: [] })
+  const onlyA = exemption({ packages: ['a'] })
+  for (const [entries, count] of [[[shared, onlyA], 1], [[onlyA, shared], 2]]) {
+    const result = run(repo({ report: data, prodReport: report(), exemptions: entries }),
+      '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.out, /^advisories=2$/m)
+    assert.match(result.out, new RegExp(`^exempted=${count}$`, 'm'))
+  }
+})
+
+test('exempted selects first bound entry per above-floor source, ignoring unbounded overlaps', () => {
+  const via = (name, source, severity) => ({ ...advisory(PICOMATCH, { package: name, severity }), source })
+  const data = report([
+    { package: 'a', via: [via('a', 101, 'high'), via('a', 101, 'high'), via('a', 102, 'high'), via('a', 103, 'low')] },
+    { package: 'b', via: [via('b', 101, 'high')] }
+  ])
+  const entries = [exemption({ packages: [] }), exemption({ packages: [], source: 101 }),
+    exemption({ packages: ['a'], source: 101 }), exemption({ packages: ['a'], source: 102 }),
+    exemption({ packages: ['a'], source: 103 })]
+  for (const [order, count] of [[entries, 2], [[entries[0], entries[2], entries[1], entries[3], entries[4]], 3]]) {
+    const result = run(repo({ report: data, prodReport: report(), exemptions: order }),
+      '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.out, /^advisories=2$/m)
+    assert.match(result.out, new RegExp(`^exempted=${count}$`, 'm'))
+    assert.match(result.out, /^stale=0$/m)
+  }
+})
+
+test('exempted selects no entries for a finding blocked by severity or source', () => {
+  const via = (source) => ({ ...advisory(PICOMATCH, { package: 'picomatch' }), source })
+  for (const entries of [[exemption(), exemption({ severity: 'moderate' })],
+    [exemption(), exemption({ source: 101 })]]) {
+    const result = run(repo({ report: report([{ package: 'picomatch', via: [via(101), via(102)] }]),
+      prodReport: report(), exemptions: entries }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 1, result.out)
+    assert.match(result.out, entries[1].severity ? /severity differs/ : /source differs/)
+    assert.match(result.out, /^exempted=0$/m)
+  }
+})
+
+test('exempted is selected from the full report even when production blocks the gate', () => {
+  const data = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const result = run(repo({ report: data, prodReport: data, exemptions: [exemption()] }),
+    '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /production tree/)
+  assert.match(result.out, /^exempted=1$/m)
+})
+
+test('exempted remains selected when another entry is stale', () => {
+  const data = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const result = run(repo({ report: data, prodReport: report(), exemptions: [exemption(),
+    exemption({ id: 'GHSA-aaaa-bbbb-cccc' })] }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /^stale=1$/m)
+  assert.match(result.out, /^exempted=1$/m)
+})
+
+test('a malformed advisory URL suffix cannot satisfy a waiver', () => {
+  const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url: `https://github.com/advisories/${PICOMATCH}-extra` }
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+})
+
+test('a GHSA embedded in an unrelated URL query cannot satisfy a waiver', () => {
+  const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url: `https://example.com/?advisory=${PICOMATCH}` }
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+})
+
+test('only an entire unambiguous GitHub advisory URL can satisfy a waiver', () => {
+  const badUrls = [
+    `https://github.com/advisories/${PICOMATCH}0`,
+    `https://github.com/advisories/x${PICOMATCH}`,
+    `https://github.com/advisories/${PICOMATCH}/extra`,
+    `https://github.com/advisories/${PICOMATCH}?other=GHSA-aaaa-bbbb-cccc`,
+    `https://github.com/advisories/${PICOMATCH}#GHSA-aaaa-bbbb-cccc`,
+    `https://github.com.evil.example/advisories/${PICOMATCH}`,
+    `https://github.com@evil.example/advisories/${PICOMATCH}`,
+    `https://evil.example/advisories/${PICOMATCH}`,
+    `https://github.com/other/${PICOMATCH}`,
+    `https://github.com/advisories/${PICOMATCH}\n`,
+    `https://github.com/advisories/${PICOMATCH} https://github.com/advisories/GHSA-aaaa-bbbb-cccc`,
+    `http://github.com/advisories/${PICOMATCH}`,
+    null, '', 42
+  ]
+  for (const url of badUrls) {
+    const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url }
+    const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 1, `${String(url)}: ${result.out}`)
+    assert.match(result.out, /no GHSA id, so it cannot be exempted/)
+    assert.match(result.out, /^exempted=0$/m)
+  }
+})
+
+test('a malformed URL below the floor cannot make an unrelated waiver current', () => {
+  const via = { ...advisory(PICOMATCH, { severity: 'low', package: 'picomatch' }), url: `https://example.com/?id=${PICOMATCH}` }
+  const cwd = repo({ report: report([{ package: 'picomatch', severity: 'low', via: [via] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /report no longer carries it/)
+  assert.match(result.out, /^stale=1$/m)
+})
+
+test('a real npm advisory URL and a case-insensitive GitHub URL satisfy their waivers', () => {
+  const sample = JSON.parse(readFileSync(new URL('./fixtures/npm-audit-sasjs-cli.json', import.meta.url), 'utf8'))
+  const actual = sample.vulnerabilities.glob.via.find((via) => typeof via === 'object')
+  assert.equal(actual.url, 'https://github.com/advisories/GHSA-3g3m-2fjr-6pw4')
+  for (const url of [actual.url, 'https://GITHUB.COM/advisories/ghsa-3G3M-2FJR-6PW4/']) {
+    const cwd = repo({
+      report: report([{ package: 'glob', severity: actual.severity, via: [{ ...actual, url }] }]),
+      prodReport: report(), exemptions: [exemption({ id: 'GHSA-3g3m-2fjr-6pw4', packages: ['glob'] })]
+    })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 0, `${url}: ${result.out}`)
+    assert.match(result.out, /^exempted=1$/m)
+  }
+})
+
+test('a source-bound waiver refuses a second source for the same GHSA and package', () => {
+  const first = { ...advisory(PICOMATCH, { package: 'picomatch' }), source: 101 }
+  const second = { ...first, source: 102 }
+  const cwd = repo({
+    report: report([{ package: 'picomatch', via: [first, second] }]),
+    prodReport: report(), exemptions: [exemption({ source: 101 })]
+  })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /source differs/)
+  assert.match(result.out, /102/)
+})
+
+test('distinct sources have independent severity bounds', () => {
+  const via = [
+    { ...advisory(PICOMATCH, { package: 'picomatch', severity: 'high' }), source: 101 },
+    { ...advisory(PICOMATCH, { package: 'picomatch', severity: 'moderate' }), source: 102 }
+  ]
+  const cwd = repo({ report: report([{ package: 'picomatch', via }]), prodReport: report(),
+    exemptions: [exemption({ source: 101, severity: 'high' }), exemption({ source: 102, severity: 'moderate' })] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-source', '--audit-require-severity')
+  assert.equal(result.code, 0, result.out)
+  assert.match(result.out, /^exempted=2$/m)
+})
+
+test('a different source below the floor does not block', () => {
+  const via = [
+    { ...advisory(PICOMATCH, { package: 'picomatch', severity: 'high' }), source: 101 },
+    { ...advisory(PICOMATCH, { package: 'picomatch', severity: 'low' }), source: 102 }
+  ]
+  const cwd = repo({ report: report([{ package: 'picomatch', via }]), prodReport: report(),
+    exemptions: [exemption({ source: 101, severity: 'high' })] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(result.code, 0, result.out)
+})
+
+test('source bounds are checked per package and stale for each missing package below the floor', () => {
+  const via = (name, source, severity = 'low') => ({ ...advisory(PICOMATCH, { package: name, severity }), source })
+  const cwd = repo({ report: report([
+    { package: 'a', severity: 'low', via: [via('a', 101)] },
+    { package: 'b', severity: 'low', via: [via('b', 102)] }
+  ]), prodReport: report(), exemptions: [exemption({ packages: ['a', 'b'], source: 101 })] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /stale=1/)
+  assert.match(result.out, /for: b/)
+})
+
+test('source bounds cannot be bypassed by overlapping unbounded entries in either order', () => {
+  for (const entries of [[exemption(), exemption({ source: 101 })], [exemption({ source: 101 }), exemption()]]) {
+    for (const values of [[101, 102], [102, 101], [101, null], [null, 101], [101, '101'], [101, 0]]) {
+      const via = values.map((source) => ({ ...advisory(PICOMATCH, { package: 'picomatch' }), source }))
+      const result = run(repo({ report: report([{ package: 'picomatch', via }]), prodReport: report(), exemptions: entries }),
+        '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+      assert.equal(result.code, 1, result.out)
+      assert.match(result.out, /source differs/)
+    }
+  }
+})
+
+test('a missing report source cannot match a bound waiver even with an unbounded overlap', () => {
+  const missing = advisory(PICOMATCH, { package: 'picomatch' })
+  delete missing.source
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [missing, { ...missing, source: 101 }] }]),
+    prodReport: report(), exemptions: [exemption(), exemption({ source: 101 })] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /source differs/)
+})
+
+test('legacy unbounded exemption accepts a missing source when strict mode is off', () => {
+  const item = advisory(PICOMATCH, { package: 'picomatch' })
+  delete item.source
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [item] }]), prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 0, result.out)
+})
+
+test('source-bound entries cover only their package and source', () => {
+  const via = (name, source) => ({ ...advisory(PICOMATCH, { package: name }), source })
+  const entries = [exemption({ packages: ['a'], source: 101 }), exemption({ packages: ['b'], source: 102 })]
+  for (const reverse of [false, true]) {
+    const reportData = report([{ package: 'a', via: [via('a', 101)] }, { package: 'b', via: [via('b', 102)] }])
+    const cwd = repo({ report: reportData, prodReport: report(), exemptions: reverse ? entries.toReversed() : entries })
+    assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-source').code, 0)
+    reportData.vulnerabilities.b.via.push(via('b', 101))
+    const bad = run(repo({ report: reportData, prodReport: report(), exemptions: entries }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(bad.code, 1, bad.out)
+    assert.match(bad.out, /b: source differs/)
+  }
+})
+
+test('source-bound stale identity must match id and source, including unscoped entries', () => {
+  const other = 'GHSA-aaaa-bbbb-cccc'
+  const data = report([{ package: 'picomatch', via: [
+    { ...advisory(PICOMATCH, { package: 'picomatch' }), source: 102 },
+    { ...advisory(other, { package: 'picomatch' }), source: 101 }
+  ] }])
+  const result = run(repo({ report: data, prodReport: report(), exemptions: [exemption({ packages: [], source: 101 })] }),
+    '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'critical')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /stale=1/)
+})
+
+test('strict source requires valid numeric source on every entry', () => {
+  for (const source of [null, '101', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, true, []]) {
+    const result = run(repo({ exemptions: [exemption({ source })] }), '--audit-input', 'full.json', '--audit-require-source')
+    assert.equal(result.code, 2, result.out)
+    assert.match(result.out, /source must be a positive safe integer/)
+  }
+  const missing = run(repo({ exemptions: [exemption()] }), '--audit-input', 'full.json', '--audit-require-source')
+  assert.equal(missing.code, 2, missing.out)
+  assert.match(missing.out, /source is required/)
+  for (const exemptions of [undefined, []]) assert.equal(run(repo({ exemptions }), '--audit-input', 'full.json', '--audit-require-source').code, 0)
+  const noAudit = spawnSync('node', [CLI, '--audit-require-source'], { encoding: 'utf8' })
+  assert.equal(noAudit.status, 2, noAudit.stderr)
+  assert.match(noAudit.stderr, /needs --audit/)
+  const help = spawnSync('node', [CLI, '--help'], { encoding: 'utf8' })
+  assert.match(help.stdout, /--audit-require-source/)
+})
+
+test('source-bound exemptions still require a production report and never waive production', () => {
+  const vulnerable = report([{ package: 'picomatch', via: [{ ...advisory(PICOMATCH, { package: 'picomatch' }), source: 101 }] }])
+  const cwd = repo({ report: vulnerable, prodReport: vulnerable, exemptions: [exemption({ source: 101 })] })
+  const missing = run(cwd, '--audit-input', 'full.json', '--audit-require-source')
+  assert.equal(missing.code, 2, missing.out)
+  assert.match(missing.out, /needs --audit-prod-input/)
+  const prod = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-source')
+  assert.equal(prod.code, 1, prod.out)
+  assert.match(prod.out, /production tree/)
+})
+
+test('source severity duplicates and mismatches fail irrespective of order', () => {
+  for (const severities of [['moderate', 'high'], ['high', 'moderate']]) {
+    const via = severities.map((severity) => ({ ...advisory(PICOMATCH, { package: 'picomatch', severity }), source: 101 }))
+    const cwd = repo({ report: report([{ package: 'picomatch', via }]), prodReport: report(), exemptions: [exemption({ source: 101, severity: 'high' })] })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+    assert.equal(result.code, 1, result.out)
+    assert.match(result.out, /severity differs/)
+  }
+})
+
+test('strict severity permits a clean tree with no exemptions', () => {
+  for (const exemptions of [undefined, []]) {
+    const result = run(repo({ exemptions }), '--audit-input', 'full.json', '--audit-require-severity')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.stdout, /^audited=true$/m)
+  }
+})
+
+test('strict severity accepts a matching rating and blocks escalation', () => {
+  const entry = exemption({ packages: ['fixture'], severity: 'moderate' })
+  for (const [rating, expected] of [['moderate', 0], ['high', 1]]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', severity: rating, via: [{ id: PICOMATCH, severity: rating }] }]),
+      prodReport: report(), exemptions: [entry]
+    })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-severity')
+    assert.equal(result.code, expected, result.out)
+    if (expected) assert.match(result.out, /severity differs/)
+  }
+})
+
+test('strict severity rejects invalid ratings as usage errors', () => {
+  for (const severity of [null, '', 'HIGH', 42]) {
+    const result = run(repo({ exemptions: [exemption({ severity })] }), '--audit-input', 'full.json', '--audit-require-severity')
+    assert.equal(result.code, 2, result.out)
+    assert.match(result.out, /severity.*not one of/)
+  }
+})
+
+test('exemption validation errors take precedence over expiry', async (t) => {
+  const expired = exemption({ recheckBy: '2000-01-01', severity: 'high' })
+  const cases = [
+    ['missing strict severity on expired entry', [exemption({ recheckBy: '2000-01-01' })], true, /severity.*required/],
+    ['invalid severity on expired entry', [exemption({ recheckBy: '2000-01-01', severity: 'HIGH' })], false, /severity.*not one of/],
+    ['invalid packages on expired entry', [exemption({ recheckBy: '2000-01-01', packages: 'fixture' })], false, /packages.*not a list/],
+    ['invalid devOnly on expired entry', [exemption({ recheckBy: '2000-01-01', devOnly: 'yes' })], false, /devOnly.*not true or false/],
+    ['missing strict severity after expired entry', [expired, exemption()], true, /severity.*required/],
+    ['invalid severity after expired entry', [expired, exemption({ severity: 'HIGH' })], false, /severity.*not one of/],
+    ['invalid object after expired entry', [expired, null], false, /not an object/],
+    ['unknown key after expired entry', [expired, exemption({ typo: true })], false, /unknown key/],
+    ['invalid id after expired entry', [expired, exemption({ id: 'bad' })], false, /needs an id/],
+    ['invalid reason after expired entry', [expired, exemption({ reason: '' })], false, /needs a reason/],
+    ['invalid date after expired entry', [expired, exemption({ recheckBy: '2099-02-30' })], false, /valid calendar date/],
+    ['invalid packages after expired entry', [expired, exemption({ packages: 'fixture' })], false, /packages.*not a list/],
+    ['invalid devOnly after expired entry', [expired, exemption({ devOnly: 'yes' })], false, /devOnly.*not true or false/]
+  ]
+  for (const [name, exemptions, strict, message] of cases) {
+    await t.test(name, () => {
+      const args = ['--audit-input', 'full.json', '--audit-prod-input', 'prod.json']
+      if (strict) args.push('--audit-require-severity')
+      const result = run(repo({ exemptions, prodReport: report() }), ...args)
+      assert.equal(result.code, 2, result.out)
+      assert.match(result.out, message)
+    })
+  }
+})
+
+test('valid expired exemptions still fail as a verdict, reporting the first expired entry', () => {
+  const exemptions = [
+    exemption({ id: 'GHSA-aaaa-bbbb-cccc', recheckBy: '2000-01-01', severity: 'high' }),
+    exemption({ id: 'GHSA-dddd-eeee-ffff', recheckBy: '2001-01-01', severity: 'low' })
+  ]
+  const cwd = repo({ exemptions, prodReport: report() })
+  for (const args of [[], ['--audit-omit', 'dev']]) {
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-severity', ...args)
+    assert.equal(result.code, 1, result.out)
+    assert.match(result.out, /exemption for GHSA-aaaa-bbbb-cccc was due for review on 2000-01-01/)
+  }
+})
+
+test('strict severity requires every waiver to name its reviewed severity', () => {
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['fixture'], severity: 'low' }), exemption({ packages: ['fixture'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high', '--audit-require-severity')
+  assert.equal(code, 2, out)
+  assert.match(out, /severity.*required/)
+  assert.match(out, /GHSA-fc5q-39xc-vjpf/)
+})
+
+test('a severity-bound waiver refuses an escalated advisory', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc' // synthetic advisory
+  const cwd = repo({
+    report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'moderate' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /high GHSA-aaaa-bbbb-cccc fixture:.*severity/)
+})
+
+test('an unbounded overlapping waiver cannot bypass a severity-bound waiver', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  for (const entries of [
+    [exemption({ id, packages: [] }), exemption({ id, packages: ['fixture'], severity: 'moderate' })],
+    [exemption({ id, packages: ['fixture'], severity: 'moderate' }), exemption({ id, packages: [] })]
+  ]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+      prodReport: report(),
+      exemptions: entries
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 1, out)
+    assert.match(out, /severity differs/)
+  }
+})
+
+test('an unknown advisory severity cannot match a critical severity waiver', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'mystery', via: [{ id, severity: 'mystery' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'critical' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity differs/)
+})
+
+test('a matching severity-bound waiver passes without waiving production', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const vuln = report([{ package: 'fixture', severity: 'moderate', via: [{ id, severity: 'moderate' }] }])
+  const entry = exemption({ id, packages: ['fixture'], severity: 'moderate' })
+  const cwd = repo({ report: vuln, prodReport: report(), exemptions: [entry] })
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 0)
+  const production = repo({ report: vuln, prodReport: vuln, exemptions: [entry] })
+  assert.equal(run(production, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 1)
+})
+
+test('an unbounded waiver preserves the existing severity-agnostic policy', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', via: [{ id, severity: 'high' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'] })]
+  })
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json').code, 0)
+})
+
+test('a severity-bound waiver also requires review for a downgrade above the floor', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'low', via: [{ id, severity: 'low' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'moderate' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity differs/)
+  assert.equal(run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'moderate').code, 0)
+})
+
+test('invalid exemption severity is a usage error', () => {
+  const cwd = repo({ exemptions: [exemption({ severity: 'HIGH' })], prodReport: report() })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 2, out)
+  assert.match(out, /severity.*not one of/)
+})
+
+for (const severities of [['low', 'high'], ['high', 'low']]) {
+  test(`a high waiver rejects mixed duplicate advisory ratings in ${severities.join(', ')} order`, () => {
+    const id = 'GHSA-aaaa-bbbb-cccc'
+    const cwd = repo({
+      report: report([{ package: 'fixture', severity: 'high', via: severities.map((severity) => ({ id, severity })) }]),
+      prodReport: report(),
+      exemptions: [exemption({ id, packages: ['fixture'], severity: 'high' })]
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+    assert.equal(code, 1, out)
+    assert.match(out, /high GHSA-aaaa-bbbb-cccc fixture:.*severity differs/)
+  })
+}
+
+test('matching duplicate ratings still pass a severity-bound waiver', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'high', via: [{ id, severity: 'high' }, { id: id.toLowerCase(), severity: 'high' }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'high' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 0, out)
+  assert.match(out, /^advisories=1$/m)
+})
+
+test('duplicate ratings use the worst severity for floor, production and unbounded waivers', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  for (const severities of [['low', 'high'], ['high', 'low']]) {
+    const vuln = report([{ package: 'fixture', severity: 'high', via: severities.map((severity) => ({ id, severity })) }])
+    const entry = exemption({ id, packages: ['fixture'] })
+    const unwaived = repo({ report: vuln })
+    const failure = run(unwaived, '--audit-input', 'full.json', '--audit-level', 'high')
+    assert.equal(failure.code, 1, failure.out)
+    assert.match(failure.out, /high GHSA-aaaa-bbbb-cccc fixture: not in the allowlist/)
+    const waived = repo({ report: vuln, prodReport: report(), exemptions: [entry] })
+    assert.equal(run(waived, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high').code, 0)
+    const production = repo({ report: vuln, prodReport: vuln, exemptions: [entry] })
+    const shipped = run(production, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+    assert.equal(shipped.code, 1, shipped.out)
+    assert.match(shipped.out, /high GHSA-aaaa-bbbb-cccc fixture: in the production tree/)
+    assert.equal(run(production, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'critical').code, 0)
+  }
+})
+
+test('duplicate rating constraints are scoped to the advisory id and package', () => {
+  const first = 'GHSA-aaaa-bbbb-cccc'
+  const second = 'GHSA-dddd-eeee-ffff'
+  const cwd = repo({
+    report: report([
+      { package: 'fixture', severity: 'high', via: [{ id: first, severity: 'high' }, { id: second, severity: 'low' }] },
+      { package: 'other', severity: 'low', via: [{ id: first, severity: 'low' }] }
+    ]),
+    prodReport: report(),
+    exemptions: [
+      exemption({ id: first, packages: ['fixture'], severity: 'high' }),
+      exemption({ id: second, packages: ['fixture'], severity: 'low' }),
+      exemption({ id: first, packages: ['other'], severity: 'low' })
+    ]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 0, out)
+  assert.match(out, /^advisories=3$/m)
+})
+
+test('three duplicate ratings cannot hide a mismatch behind matching endpoints', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  const cwd = repo({
+    report: report([{ package: 'fixture', severity: 'high', via: ['high', 'low', 'high'].map((severity) => ({ id, severity })) }]),
+    prodReport: report(),
+    exemptions: [exemption({ id, packages: ['fixture'], severity: 'high' })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity differs/)
+})
+
+test('unknown severity survives duplicate critical advisory rows in either order', () => {
+  const id = 'GHSA-aaaa-bbbb-cccc'
+  for (const severities of [['critical', 'mystery'], ['mystery', 'critical']]) {
+    const cwd = repo({
+      report: report([{ package: 'fixture', severity: 'critical', via: severities.map((severity) => ({ id, severity })) }]),
+      prodReport: report(),
+      exemptions: [exemption({ id, packages: ['fixture'], severity: 'critical' })]
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 1, out)
+    assert.match(out, /severity differs/)
+  }
+})
+
 test('a dev advisory nobody has argued for fails, naming the id and the package', () => {
   const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]) })
   const { code, out } = run(cwd, '--audit-input', 'full.json')
@@ -577,10 +1104,10 @@ test('an exemption past its review date fails the gate', () => {
 })
 
 test('an exemption key this tool does not know is a usage error, not an inert field', () => {
-  const cwd = repo({ exemptions: [{ ...exemption(), source: 1247710 }] })
+  const cwd = repo({ exemptions: [{ ...exemption(), sourc: 1247710 }] })
   const { code, out } = run(cwd, '--audit-input', 'full.json')
   assert.equal(code, 2)
-  assert.match(out, /unknown key\(s\) source/)
+  assert.match(out, /unknown key\(s\) sourc/)
 })
 
 test('an exemption that is not a GHSA id is a usage error', () => {
@@ -893,6 +1420,18 @@ test('--audit alone writes nothing but its verdict', () => {
   assert.equal(code, 0)
   assert.equal(readFileSync(join(cwd, 'package.json'), 'utf8'), before)
   assert.equal(existsSync(join(cwd, 'judged.json')), false)
+})
+
+test('help describes the strict severity option', () => {
+  const result = spawnSync('node', [CLI, '--help'], { encoding: 'utf8' })
+  assert.equal(result.status, 0)
+  assert.match(result.stdout, /--audit-require-severity/)
+})
+
+test('strict severity without --audit is a usage error', () => {
+  const result = spawnSync('node', [CLI, '--audit-require-severity'], { encoding: 'utf8' })
+  assert.equal(result.status, 2)
+  assert.match(`${result.stdout}${result.stderr}`, /--audit-require-severity needs --audit/)
 })
 
 test('an audit flag without --audit is a usage error, not an ordinary release', () => {

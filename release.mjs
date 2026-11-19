@@ -59,6 +59,9 @@ const HELP = `sasjs-release - releases from conventional commits
                          exemptible, and a dev advisory passes only when the
                          allowlist argues for it
   --audit-level <l>      severity floor: info|low|moderate|high|critical (default low)
+  --audit-require-severity
+                         require a reviewed severity on every exemption (opt-in)
+  --audit-require-source require an exact npm source on every exemption (opt-in)
   --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)
@@ -99,7 +102,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // exist rather than failing.
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'audit', 'audit-config', 'audit-input',
-  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'assert-no-dependencies',
+  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'audit-require-severity', 'audit-require-source', 'assert-no-dependencies',
   'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
@@ -1383,7 +1386,7 @@ const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical']
 const DEFAULT_AUDIT_CONFIG = join('scripts', 'audit-allowlist.json')
 
 /** The keys an exemption may carry. Anything else is a typo that would be inert. */
-const EXEMPTION_KEYS = ['id', 'packages', 'devOnly', 'recheckBy', 'reason']
+const EXEMPTION_KEYS = ['id', 'packages', 'devOnly', 'recheckBy', 'reason', 'severity', 'source']
 
 /**
  * A gate failure: the tree has a problem, or the report cannot be read.
@@ -1401,16 +1404,17 @@ function gateFailure(message) {
 /**
  * The advisory a `via` entry names, if it names one.
  *
- * npm reports two kinds: an advisory it has an id for, whose `url` points at a
- * GHSA page, and one of its own, which carries a numeric `source` and no url.
- * Only the first can be exempted - an exemption is a claim about a specific
- * advisory - and the second is reported as a failure rather than dropped, because
- * "I cannot name this" is not "there is nothing to fix".
+ * npm reports advisory URLs such as https://github.com/advisories/GHSA-... .
+ * Only that complete URL identifies a GHSA: a substring in another URL, query,
+ * or malformed path must not turn an unnamed finding into an exemption.
+ * An advisory without a recognized URL is reported as a failure rather than
+ * dropped, because "I cannot name this" is not "there is nothing to fix".
  */
 function advisoryOf(via) {
   const url = typeof via?.url === 'string' ? via.url : ''
-  const found = /GHSA(?:-[0-9a-z]{4}){3}/i.exec(url)
-  return found ? found[0] : ''
+  const found = /^https:\/\/github\.com\/advisories\/(GHSA(?:-[0-9a-z]{4}){3})\/?$/i.exec(url)
+  // JavaScript's $ can match before a final newline; require the whole string.
+  return found && found[0] === url ? found[1] : ''
 }
 
 /** Advisory ids are reported in one case and written in another; compare them as one. */
@@ -1494,16 +1498,32 @@ function auditFindings(report) {
 
       const id = advisoryOf(via)
       const key = `${id.toUpperCase()}|${name}`
+      const previous = seen.get(key)
+      // Keep every raw rating for exact waiver checks, separately from the
+      // worst-case severity used for floor and production decisions.
+      const ratings = previous?.ratings || new Set()
+      const sources = previous?.sources || new Map()
+      const source = Number.isSafeInteger(via.source) && via.source > 0 ? via.source : null
+      const sourceRatings = sources.get(source) || new Set()
+      const rating = SEVERITIES.includes(via.severity) ? via.severity : null
+      sourceRatings.add(rating)
+      sources.set(source, sourceRatings)
+      ratings.add(rating)
       const finding = {
+        ratings,
+        sources,
         id,
         package: name,
         // an unrecognised severity is treated as the highest rather than the
         // lowest: a report this tool cannot read must not become a pass
         severity: SEVERITIES.includes(via.severity) ? via.severity : 'critical',
+        severityKnown: SEVERITIES.includes(via.severity),
         title: typeof via.title === 'string' ? via.title : ''
       }
-      const previous = seen.get(key)
-      if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity))
+      // Preserve an unknown rating over an equal-ranked critical in either order:
+      // normalization to critical must not make it satisfy a critical waiver.
+      if (!previous || SEVERITIES.indexOf(finding.severity) > SEVERITIES.indexOf(previous.severity) ||
+          (finding.severity === previous.severity && !finding.severityKnown))
         seen.set(key, finding)
     }
   }
@@ -1645,10 +1665,10 @@ function auditReport({ cwd, omit, input }) {
 /**
  * The exemption list, validated.
  *
- * A waiver is an argument, so the fields that carry the argument are required and
- * the ones that would be a second copy of the report are not accepted: `severity`
- * and `title` come from the advisory itself, and an entry that stored them could
- * disagree with the finding it describes.
+ * A waiver is an argument. Severity is an optional constraint on that argument,
+ * not a copy of the report: a changed rating requires the waiver to be reviewed.
+ * Omitting it retains the original severity-agnostic behavior. Title remains
+ * report data and is not accepted in the exemption.
  */
 function auditExemptions(cwd, omit) {
   const named = arg('audit-config')
@@ -1690,14 +1710,6 @@ function auditExemptions(cwd, omit) {
     if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== entry.recheckBy)
       fail(`${at} needs a valid calendar date for recheckBy`)
 
-    // A date has passed when the calendar says so, not the clock: comparing the
-    // strings is exact for YYYY-MM-DD and needs no timezone
-    if (entry.recheckBy < today)
-      gateFailure(
-        `the exemption for ${entry.id} was due for review on ${entry.recheckBy} - ` +
-          're-check it, then move the date or remove the entry'
-      )
-
     if (
       entry.packages !== undefined &&
       (!Array.isArray(entry.packages) || entry.packages.some((name) => typeof name !== 'string' || !name))
@@ -1707,7 +1719,19 @@ function auditExemptions(cwd, omit) {
     if (entry.devOnly !== undefined && typeof entry.devOnly !== 'boolean')
       fail(`${at} has a devOnly that is not true or false`)
 
+    if (flag('audit-require-severity') && entry.severity === undefined)
+      fail(`${at} severity is required with --audit-require-severity`)
+    if (entry.severity !== undefined && !SEVERITIES.includes(entry.severity))
+      fail(`${at} has a severity that is not one of ${SEVERITIES.join(', ')}`)
+
+    if (flag('audit-require-source') && entry.source === undefined)
+      fail(`${at} source is required with --audit-require-source`)
+    if (entry.source !== undefined && (!Number.isSafeInteger(entry.source) || entry.source <= 0))
+      fail(`${at} source must be a positive safe integer`)
+
     return {
+      severity: entry.severity,
+      source: entry.source,
       id: entry.id,
       packages: entry.packages || [],
       devOnly: entry.devOnly === true,
@@ -1715,6 +1739,17 @@ function auditExemptions(cwd, omit) {
       reason: entry.reason
     }
   })
+
+  // Validate every entry before issuing a verdict: expiry must not hide a
+  // malformed exemption or a missing required severity elsewhere in the list.
+  // Comparing YYYY-MM-DD strings treats the review date as valid all day UTC.
+  for (const entry of exemptions) {
+    if (entry.recheckBy < today)
+      gateFailure(
+        `the exemption for ${entry.id} was due for review on ${entry.recheckBy} - ` +
+          're-check it, then move the date or remove the entry'
+      )
+  }
 
   // An omitted-tree gate refuses exemptions: the partial report cannot establish
   // whether an omitted advisory is still present or whether a waiver is stale.
@@ -1747,12 +1782,12 @@ async function auditGate() {
 
   const floor = SEVERITIES.indexOf(level)
   const atFloor = (finding) => SEVERITIES.indexOf(finding.severity) >= floor
-  const matches = (finding) =>
-    exemptions.findIndex(
-      (entry) =>
-        sameId(entry.id, finding.id) &&
-        (!entry.packages.length || entry.packages.includes(finding.package))
-    )
+  const ratingsAtFloor = (ratings) => [...ratings].some((rating) =>
+    (rating === null ? SEVERITIES.length - 1 : SEVERITIES.indexOf(rating)) >= floor)
+  const applies = (entry, finding) =>
+    sameId(entry.id, finding.id) &&
+    (!entry.packages.length || entry.packages.includes(finding.package))
+  const matches = (finding) => exemptions.findIndex((entry) => applies(entry, finding))
 
   // A recorded replay runs no npm at all: if the production report is needed, it has
   // to arrive as a file too. Without this the gate would ask npm in a run whose whole
@@ -1792,10 +1827,34 @@ async function auditGate() {
 
   for (const finding of above) {
     const at = matches(finding)
+    // Every applicable bound is a restriction, regardless of list order or an
+    // overlapping unbounded entry; an older waiver must not undo a newer one.
+    const mismatch = exemptions.find((entry) =>
+      applies(entry, finding) &&
+      entry.severity !== undefined &&
+      (entry.source === undefined
+        ? [...finding.ratings].some((rating) => rating !== entry.severity)
+        : finding.sources.has(entry.source) &&
+          ratingsAtFloor(finding.sources.get(entry.source)) &&
+          [...finding.sources.get(entry.source)].some((rating) => rating !== entry.severity)))
 
     if (!finding.id) rows.set(key(finding), { finding, why: 'no GHSA id, so it cannot be exempted' })
     else if (at === -1) rows.set(key(finding), { finding, why: 'not in the allowlist' })
-    else used.add(at)
+    else if (mismatch)
+      rows.set(key(finding), { finding, why: `severity differs from allowlist (${mismatch.severity})` })
+    else {
+      const bound = exemptions.filter((entry) => applies(entry, finding) && entry.source !== undefined)
+      const unmatched = [...finding.sources].filter(([source, ratings]) =>
+        ratingsAtFloor(ratings) && !bound.some((entry) => entry.source === source)).map(([source]) => source)
+      if (bound.length && unmatched.length)
+        rows.set(key(finding), { finding, why: `source differs from allowlist (${unmatched.map((source) => source ?? 'missing or invalid').join(', ')})` })
+      else if (bound.length) {
+        for (const [source, ratings] of finding.sources) {
+          if (ratingsAtFloor(ratings))
+            used.add(exemptions.indexOf(bound.find((entry) => entry.source === source)))
+        }
+      } else used.add(at)
+    }
   }
 
   // Whatever the allowlist says, an advisory in the production tree blocks: the
@@ -1817,7 +1876,8 @@ async function auditGate() {
   // Check each named package against the full report, not the severity-filtered
   // findings. An unscoped entry remains current while its id appears anywhere.
   const stale = exemptions.flatMap((entry) => {
-    const matching = findings.filter((finding) => sameId(finding.id, entry.id))
+    const matching = findings.filter((finding) => sameId(finding.id, entry.id) &&
+      (entry.source === undefined || finding.sources.has(entry.source)))
     const missing = [...new Set(entry.packages)].filter((name) => !matching.some((finding) => finding.package === name))
     return (!entry.packages.length && !matching.length) || missing.length ? [{ entry, missing }] : []
   })
@@ -1837,17 +1897,19 @@ async function auditGate() {
         (finding.title ? ` - ${finding.title}` : '')
     )
 
-  for (const { entry, missing } of stale)
+  for (const { entry, missing } of stale) {
+    const identity = entry.source === undefined ? entry.id : `${entry.id} source ${entry.source}`
     console.log(missing.length
-      ? `${entry.id} is in the allowlist but the report no longer carries it for: ${missing.join(', ')}; ${missing.length === new Set(entry.packages).size ? 'remove the entry' : 'remove those packages or the entry'}`
-      : `${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
+      ? `${identity} is in the allowlist but the report no longer carries it for: ${missing.join(', ')}; ${missing.length === new Set(entry.packages).size ? 'remove the entry' : 'remove those packages or the entry'}`
+      : `${identity} is in the allowlist but the report no longer carries it: remove the entry`)
+  }
 
   if (rows.size)
     gateFailure(`${rows.size} advisory/advisories at or above ${level} that the allowlist does not clear`)
 
   if (stale.length)
     gateFailure(
-      `${stale.length} allowlist entr${stale.length === 1 ? 'y has' : 'ies have'} an id or named package missing from the report`
+      `${stale.length} allowlist entr${stale.length === 1 ? 'y has' : 'ies have'} an id or named package missing from the report (including any source bound)`
     )
 
   console.log(`no advisory at or above ${level} outside the allowlist`)
@@ -1936,7 +1998,7 @@ async function main() {
   // A flag that only means something with --audit is otherwise silent: `--audit-level
   // high` on its own would run an ordinary release, which is not what anyone typing
   // it expects.
-  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input']
+  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input', 'audit-require-severity', 'audit-require-source']
   if (!flag('audit') && auditOnly.some(flag)) fail(`--${auditOnly.find(flag)} needs --audit`)
 
   if (flag('assert-no-dependencies')) {
