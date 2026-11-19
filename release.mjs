@@ -1543,7 +1543,11 @@ function auditReport({ cwd, omit, input }) {
     while (!existsSync(join(auditCwd, 'package.json')) && !existsSync(join(auditCwd, 'node_modules')) && auditCwd !== dirname(auditCwd))
       auditCwd = dirname(auditCwd)
     const localPrefix = auditCwd
-    for (let parent = dirname(localPrefix); ; parent = dirname(parent)) {
+    // A local lockfile makes this an independent project. Otherwise search past
+    // intermediate manifests: npm workspaces may be nested beneath one of them.
+    // A different lockfile is a project boundary unless it explicitly links this
+    // package as a workspace.
+    for (let parent = dirname(localPrefix); !existsSync(join(localPrefix, 'package-lock.json')); parent = dirname(parent)) {
       try {
         const lock = JSON.parse(readFileSync(join(parent, 'package-lock.json'), 'utf8'))
         const entry = relative(parent, localPrefix).split(sep).join('/')
@@ -1552,7 +1556,7 @@ function auditReport({ cwd, omit, input }) {
           break
         }
       } catch { /* not a readable npm workspace lockfile */ }
-      if (existsSync(join(parent, 'package.json')) || parent === dirname(parent)) break
+      if (existsSync(join(parent, 'package-lock.json')) || parent === dirname(parent)) break
     }
     let workspaceProject = false
     let workspacePatterns = []

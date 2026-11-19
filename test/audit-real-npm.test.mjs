@@ -125,6 +125,43 @@ test('real npm audit from a workspace directory covers the root and sibling work
   assert.deepEqual(Object.keys(actual.vulnerabilities).sort(), names.slice(0, 3).sort(), result.stdout)
 })
 
+for (const location of ['root', 'nested']) {
+  test(`real npm ${location} audit finds root and sibling through an intermediate package manifest`, async (t) => {
+    const { cwd, env, requests } = await workspaceFixture(t)
+    writeFileSync(join(cwd, 'packages/package.json'), JSON.stringify({ name: 'intermediate', version: '1.0.0' }))
+    writeFileSync(join(cwd, '.npmrc'), `${readFileSync(join(cwd, '.npmrc'), 'utf8')}workspace=ws-a\n`)
+    env.npm_config_workspace = 'ws-a'
+    const target = location === 'root' ? cwd : join(cwd, 'packages/a')
+    const result = await execute(process.execPath, [CLI, '--repo-dir', target, '--audit', '--audit-report', 'actual.json'], { cwd: target, env })
+    assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(target, 'actual.json'), 'utf8')).vulnerabilities).sort(), names.slice(0, 3).sort(), `${result.stdout}\n${result.stderr}`)
+    assert.equal(requests.find((request) => request.url === '/-/npm/v1/security/advisories/bulk')?.authorization, 'Bearer fixture-secret')
+  })
+}
+
+test('real npm production audit finds root and sibling through an intermediate package manifest', async (t) => {
+  const { cwd, env } = await workspaceFixture(t)
+  writeFileSync(join(cwd, 'packages/package.json'), JSON.stringify({ name: 'intermediate', version: '1.0.0' }))
+  writeFileSync(join(cwd, '.npmrc'), `${readFileSync(join(cwd, '.npmrc'), 'utf8')}workspace=ws-a\n`)
+  env.npm_config_workspace = 'ws-a'
+  const a = JSON.parse(readFileSync(join(cwd, 'packages/a/package.json'), 'utf8'))
+  a.devDependencies = a.dependencies
+  delete a.dependencies
+  writeFileSync(join(cwd, 'packages/a/package.json'), JSON.stringify(a))
+  const lock = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8'))
+  lock.packages['packages/a'] = a
+  lock.packages['node_modules/scope-optional'].dev = true
+  writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify(lock))
+  const config = join(cwd, 'allowlist.json')
+  writeFileSync(config, JSON.stringify([{ id: 'GHSA-aaaa-bbbb-ccc1', packages: ['scope-optional'], devOnly: true, recheckBy: '2099-01-31', reason: 'Fixture exemption' }]))
+  for (const target of [cwd, join(cwd, 'packages/a')]) {
+    const result = await execute(process.execPath, [CLI, '--repo-dir', target, '--audit', '--audit-config', config], { cwd: target, env })
+    assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stdout, /scope-prod: in the production tree/)
+    assert.match(result.stdout, /scope-dev: in the production tree/)
+  }
+})
+
 test('real npm audits an independent project nested inside a workspace repository', async (t) => {
   const { cwd, env } = await workspaceFixture(t)
   const nested = join(cwd, 'packages/a/standalone')
