@@ -141,7 +141,7 @@ The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repos
 ]
 ```
 
-`packages` is optional and names the packages the argument covers - an id exempted for `picomatch` says nothing about the same id arriving under `micromatch`. `recheckBy` is required, because a waiver without a review date is the failure mode the date exists for. `devOnly` is optional; even when false or omitted, the entry applies only to findings absent from the production report. The id is the key and `packages` narrows an entry, never widens it.
+`packages` is optional and names the packages the argument covers - an id exempted for `picomatch` says nothing about the same id arriving under `micromatch`. A scoped entry is stale if **any** named package no longer carries that id in the full report, even if another package still does; remove the missing package or, if none remain, the entry. A missing or empty `packages` list is unscoped and becomes stale only when the id disappears entirely. Staleness is checked below as well as above the severity floor; `stale` counts entries, not missing packages. `recheckBy` is required, because a waiver without a review date is the failure mode the date exists for. `devOnly` is optional; even when false or omitted, the entry applies only to findings absent from the production report. The id is the key and `packages` narrows an entry, never widens it.
 
 Exit codes tell the two kinds of failure apart: `1` is a verdict (a finding, a stale entry, an expiry, an unreadable report) and `2` is this tool being asked something it cannot do (an unknown flag, a malformed exemption). A mistyped allowlist must not read as a vulnerability, and a vulnerability must not read as a broken pipeline.
 

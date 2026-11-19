@@ -1810,11 +1810,13 @@ async function auditGate() {
     })
   }
 
-  // An entry that stops appearing fails: a stale waiver is invisible in a passing
-  // build, which is how it outlives the problem it describes. Judged against every
-  // advisory the report carries, so raising the floor does not make an entry look
-  // stale when the advisory is still there.
-  const stale = exemptions.filter((entry) => !findings.some((finding) => sameId(finding.id, entry.id)))
+  // Check each named package against the full report, not the severity-filtered
+  // findings. An unscoped entry remains current while its id appears anywhere.
+  const stale = exemptions.flatMap((entry) => {
+    const matching = findings.filter((finding) => sameId(finding.id, entry.id))
+    const missing = [...new Set(entry.packages)].filter((name) => !matching.some((finding) => finding.package === name))
+    return (!entry.packages.length && !matching.length) || missing.length ? [{ entry, missing }] : []
+  })
 
   output({
     audited: rows.size === 0 && stale.length === 0,
@@ -1831,15 +1833,17 @@ async function auditGate() {
         (finding.title ? ` - ${finding.title}` : '')
     )
 
-  for (const entry of stale)
-    console.log(`${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
+  for (const { entry, missing } of stale)
+    console.log(missing.length
+      ? `${entry.id} is in the allowlist but the report no longer carries it for: ${missing.join(', ')}; ${missing.length === new Set(entry.packages).size ? 'remove the entry' : 'remove those packages or the entry'}`
+      : `${entry.id} is in the allowlist but the report no longer carries it: remove the entry`)
 
   if (rows.size)
     gateFailure(`${rows.size} advisory/advisories at or above ${level} that the allowlist does not clear`)
 
   if (stale.length)
     gateFailure(
-      `${stale.length} allowlist entr${stale.length === 1 ? 'y' : 'ies'} no longer match anything in the report`
+      `${stale.length} allowlist entr${stale.length === 1 ? 'y has' : 'ies have'} an id or named package missing from the report`
     )
 
   console.log(`no advisory at or above ${level} outside the allowlist`)

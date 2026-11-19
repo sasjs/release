@@ -156,6 +156,11 @@ const mutations = [
     replace: `  if (false)`
   },
   {
+    name: 'stale exemptions ignore package scope',
+    find: `    const missing = [...new Set(entry.packages)].filter((name) => !matching.some((finding) => finding.package === name))`,
+    replace: `    const missing = matching.length ? [] : [...new Set(entry.packages)]`
+  },
+  {
     name: 'the production report is never asked for',
     find: `  const shipped = omit
     ? above

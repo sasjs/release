@@ -229,7 +229,89 @@ test('an exemption that no longer appears fails, because a stale waiver is invis
   const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
   assert.equal(code, 1)
   assert.match(out, /is in the allowlist but the report no longer carries it/)
-  assert.match(out, /1 allowlist entry no longer match/)
+  assert.match(out, /1 allowlist entry has an id or named package missing/)
+})
+
+test('a package-scoped exemption is stale when the id appears only under another package below the floor', () => {
+  const cwd = repo({
+    report: report([{ package: 'bar', via: [{ id: PICOMATCH, severity: 'moderate' }], severity: 'moderate' }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['foo'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /^stale=1$/m)
+  assert.match(out, /no longer carries it for: foo; remove the entry/)
+})
+
+test('each named package must still carry the advisory, even if another named package does', () => {
+  const cwd = repo({
+    report: report([{ package: 'foo', via: [{ id: PICOMATCH }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['foo', 'bar', 'bar'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /^stale=1$/m)
+  assert.match(out, /no longer carries it for: bar; remove those packages or the entry/)
+  assert.doesNotMatch(out, /not in the allowlist/)
+})
+
+test('duplicate id exemptions are checked independently by package', () => {
+  const cwd = repo({
+    report: report([{ package: 'foo', via: [{ id: PICOMATCH }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['foo'] }), exemption({ id: PICOMATCH.toUpperCase(), packages: ['bar'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /^stale=1$/m)
+  assert.match(out, /no longer carries it for: bar; remove the entry/)
+})
+
+test('a scoped exemption does not waive the same advisory on another package', () => {
+  const cwd = repo({
+    report: report([{ package: 'foo', via: [{ id: PICOMATCH }] }, { package: 'bar', via: [{ id: PICOMATCH }] }]),
+    prodReport: report(),
+    exemptions: [exemption({ packages: ['foo'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /^stale=0$/m)
+  assert.match(out, new RegExp(`${PICOMATCH} bar: not in the allowlist`))
+})
+
+test('unscoped exemptions match the id anywhere, including with empty packages', () => {
+  for (const packages of [undefined, []]) {
+    const cwd = repo({
+      report: report([{ package: 'bar', via: [{ id: PICOMATCH }] }]),
+      prodReport: report(),
+      exemptions: [exemption({ id: PICOMATCH.toUpperCase(), packages })]
+    })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 0, out)
+    assert.match(out, /^stale=0$/m)
+  }
+})
+
+test('unscoped exemptions become stale when their id disappears', () => {
+  for (const packages of [undefined, []]) {
+    const cwd = repo({ exemptions: [exemption({ packages })], prodReport: report() })
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(code, 1, out)
+    assert.match(out, /^stale=1$/m)
+  }
+})
+
+test('each named package can be matched by the same advisory below the floor', () => {
+  const cwd = repo({
+    report: report(['foo', 'bar'].map((name) => ({ package: name, via: [{ id: PICOMATCH, severity: 'moderate' }], severity: 'moderate' }))),
+    prodReport: report(),
+    exemptions: [exemption({ id: PICOMATCH.toUpperCase(), packages: ['foo', 'bar'] })]
+  })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(code, 0, out)
+  assert.match(out, /^stale=0$/m)
 })
 
 test('raising the floor does not make an entry for a lower advisory look stale', () => {
