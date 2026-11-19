@@ -464,6 +464,57 @@ test('npm is asked for production even when devOnly is false', () => {
   assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json', 'audit --json --omit dev'])
 })
 
+test('a comma-separated omit set is passed to npm as repeated omit options', () => {
+  const cwd = repo()
+  const { env } = stubNpm(cwd)
+  writeFileSync(join(cwd, 'bin/npm'),
+    '#!/usr/bin/env node\n' +
+    "require('fs').writeFileSync(process.env.NPM_ARGV, JSON.stringify(process.argv.slice(2)))\n" +
+    "process.stdout.write(require('fs').readFileSync(process.env.NPM_REPORT))\n"
+  )
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit', '--audit-omit', 'dev,optional'], {
+    encoding: 'utf8', env: { ...process.env, ...env }
+  })
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+  assert.deepEqual(JSON.parse(readFileSync(join(cwd, 'argv.log'), 'utf8')),
+    ['audit', '--json', '--omit', 'dev', '--omit', 'optional'])
+})
+
+test('all supported npm omit values are accepted', () => {
+  for (const omit of ['dev', 'optional', 'peer', 'dev,optional,peer']) {
+    const cwd = repo()
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-omit', omit)
+    assert.equal(code, 0, `omit=${omit}: ${out}`)
+    assert.match(out, new RegExp(`^scope=omit:${omit}$`, 'm'))
+  }
+})
+
+test('unsupported omit values are usage errors even with a recorded report', () => {
+  for (const omit of ['invalid', 'dev,invalid', 'dev,', ',dev', '', ' dev']) {
+    const cwd = repo()
+    const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-omit', omit)
+    assert.equal(code, 2, `omit=${JSON.stringify(omit)}: ${out}`)
+    assert.match(out, /--audit-omit must be a comma-separated list of dev, optional, peer/)
+  }
+})
+
+test('an optional-only omission reports its scope without calling it the production tree', () => {
+  const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]) })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-omit', 'optional')
+  assert.equal(code, 1)
+  assert.match(out, /^scope=omit:optional$/m)
+  assert.match(out, /in the omitted tree, where nothing is exemptible/)
+  assert.doesNotMatch(out, /production tree|only what ships/)
+})
+
+test('an optional-only omission does not claim exemptions are in a production-only gate', () => {
+  const cwd = repo({ exemptions: [exemption()] })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-omit', 'optional')
+  assert.equal(code, 2)
+  assert.match(out, /judges an omitted tree, where nothing is exemptible/)
+  assert.doesNotMatch(out, /production tree|only what ships/)
+})
+
 test('a tree with no exemptions is answered by one npm call', () => {
   const cwd = repo()
   const { env } = stubNpm(cwd)

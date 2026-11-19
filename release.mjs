@@ -59,7 +59,7 @@ const HELP = `sasjs-release - releases from conventional commits
                          exemptible, and a dev advisory passes only when the
                          allowlist argues for it
   --audit-level <l>      severity floor: info|low|moderate|high|critical (default low)
-  --audit-omit <a,b>     judge the npm --omit set instead of the full tree, eg dev
+  --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)
   --audit-report <path>  write the report this run judged here
@@ -1500,7 +1500,7 @@ function auditReport({ cwd, omit, input }) {
       gateFailure(`the recorded report could not be read (${input}): ${error.message}`)
     }
   } else {
-    const argv = ['audit', '--json', ...(omit ? ['--omit', omit] : [])]
+    const argv = ['audit', '--json', ...(omit ? omit.split(',').flatMap((value) => ['--omit', value]) : [])]
     const run = spawnSync('npm', argv, { cwd, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
     npmStatus = run.status
     text = run.stdout || ''
@@ -1640,12 +1640,11 @@ function auditExemptions(cwd, omit) {
     }
   })
 
-  // An exemption on a production-only gate is a waiver that can never apply: the
-  // gate refuses to exempt anything that ships, so the list would be inert and
-  // every entry would report as stale.
+  // An omitted-tree gate refuses exemptions: the partial report cannot establish
+  // whether an omitted advisory is still present or whether a waiver is stale.
   if (omit && exemptions.length)
     fail(
-      `--audit-omit ${omit} judges only what ships, where nothing is exemptible, ` +
+      `--audit-omit ${omit} ${omit === 'dev' ? 'judges only what ships' : 'judges an omitted tree'}, where nothing is exemptible, ` +
         `but ${file} carries ${exemptions.length} exemption(s): drop the flag to judge the full tree`
     )
 
@@ -1666,6 +1665,8 @@ async function auditGate() {
   if (!SEVERITIES.includes(level)) fail(`--audit-level must be one of ${SEVERITIES.join(', ')}`)
 
   const omit = arg('audit-omit')
+  if (flag('audit-omit') && omit.split(',').some((value) => !['dev', 'optional', 'peer'].includes(value)))
+    fail('--audit-omit must be a comma-separated list of dev, optional, peer')
   const exemptions = auditExemptions(cwd, omit)
 
   const floor = SEVERITIES.indexOf(level)
@@ -1700,11 +1701,9 @@ async function auditGate() {
   const findings = auditFindings(judged)
   const above = findings.filter(atFloor)
 
-  // The production tree is a second report: --omit=dev is the only question that
-  // answers "does this ship" for a transitive dependency. Any exemption could
-  // hide a production finding, regardless of its devOnly field. With no entries
-  // there is nothing an exemption could hide. When the run itself is the
-  // production set, every finding in it is one.
+  // Any exemption can hide a production finding, so a full report with exemptions
+  // needs a second report omitting dev. An explicitly omitted tree is judged on
+  // its own, without exemptions; only omit=dev identifies the production tree.
   const shipped = omit
     ? above
     : needsProd
@@ -1733,7 +1732,9 @@ async function auditGate() {
       why:
         at !== -1 && exemptions[at].devOnly
           ? `in the production tree, though the allowlist calls it devOnly (review by ${exemptions[at].recheckBy})`
-          : 'in the production tree, where nothing is exemptible'
+          : omit && omit !== 'dev'
+            ? 'in the omitted tree, where nothing is exemptible'
+            : 'in the production tree, where nothing is exemptible'
     })
   }
 

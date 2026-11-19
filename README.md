@@ -53,7 +53,7 @@ Two things it does that the toolchain cannot:
 | `--config <path>` | config naming the assets to attach; the `release.assets` of `sasjs/sasjsconfig.json` is read by default, then a `.releaserc` |
 | `--audit` | judge the npm audit report: the production tree is never exemptible, a dev advisory passes only when the allowlist argues for it |
 | `--audit-level <l>` | severity floor, `info` to `critical` (default `low`) |
-| `--audit-omit <a,b>` | judge the `npm --omit` set (eg `dev`) instead of the full tree |
+| `--audit-omit <a,b>` | judge an npm omit set instead of the full tree: comma-separated `dev`, `optional`, `peer` (eg `dev,optional`) |
 | `--audit-config <path>` | exemption list (default `scripts/audit-allowlist.json`; a repository without one has none) |
 | `--audit-report <path>` | write the report this run judged |
 | `--audit-input <path>` | read a recorded full-tree report instead of running npm; any exemption requires `--audit-prod-input` as well |
@@ -124,6 +124,8 @@ What it enforces:
 - **An advisory with no GHSA id fails**, because an exemption is a claim about a specific advisory - and "I cannot name this" is not "there is nothing to fix".
 - **A report that cannot be read fails.** `npm audit --json` writes its own errors to stdout and exits non-zero, so a missing lockfile or an unreachable registry parses as JSON with no `vulnerabilities`. That is not a clean tree, and it must not become one once the exemption list empties out.
 - **Production is measured for every exemption.** Any entry, whether `devOnly` is true, false, or omitted, triggers a production report; an advisory in that report is never exemptible. With no entries the second call is skipped, because there is nothing an exemption could be hiding.
+
+An `--audit-omit` run judges only the requested partial tree and refuses a nonempty exemption list. `dev` alone selects the production report; omitting `optional` or `peer`, with or without `dev`, is a different scope and may exclude dependencies that ship. Use the full-tree gate when validating exemptions.
 
 The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repository without the file has no exemptions:
 
