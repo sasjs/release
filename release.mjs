@@ -63,7 +63,8 @@ const HELP = `sasjs-release - releases from conventional commits
                          require a reviewed severity on every exemption (opt-in)
   --audit-require-source require an exact npm source on every exemption (opt-in)
   --audit-require-packages
-                         require nonempty package scope on every exemption (opt-in)
+                         require a nonempty scope list on every exemption (opt-in):
+                         nonempty strings matched as exact report keys, not npm name validation
   --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)

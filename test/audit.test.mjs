@@ -424,6 +424,31 @@ test('strict package scope does not waive the same advisory on another package',
   assert.match(result.out, /other/)
 })
 
+test('package scopes use exact report keys, including unusual nonempty strings', () => {
+  // Fabricated keys document the accepted input shape, not real npm output.
+  for (const name of [' ', '../bad', '@broken', 'bad name', '@scope/pkg', 'LegacyName', 'http']) {
+    const data = report([{ package: name, via: [{ id: PICOMATCH }] }])
+    for (const strict of [false, true]) {
+      const args = ['--audit-input', 'full.json', '--audit-prod-input', 'prod.json']
+      if (strict) args.push('--audit-require-packages')
+      const exact = run(repo({ report: data, prodReport: report(), exemptions: [exemption({ packages: [name] })] }), ...args)
+      assert.equal(exact.code, 0, `${JSON.stringify(name)}: ${exact.out}`)
+      assert.match(exact.out, /^exempted=1$/m)
+      const different = run(repo({ report: data, prodReport: report(), exemptions: [exemption({ packages: [`${name} `] })] }), ...args)
+      assert.equal(different.code, 1, `${JSON.stringify(name)}: ${different.out}`)
+      assert.match(different.out, /not in the allowlist/)
+    }
+  }
+})
+
+test('package scope matching is case-sensitive', () => {
+  const data = report([{ package: 'LegacyName', via: [{ id: PICOMATCH }] }])
+  const result = run(repo({ report: data, prodReport: report(), exemptions: [exemption({ packages: ['legacyname'] })] }),
+    '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-packages')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /not in the allowlist/)
+})
+
 test('strict package scope rejects missing and empty packages as usage errors', () => {
   for (const packages of [undefined, []]) {
     const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]), prodReport: report(), exemptions: [exemption({ packages })] })
@@ -443,6 +468,8 @@ test('help describes strict package scope', () => {
   const result = spawnSync('node', [CLI, '--help'], { encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /--audit-require-packages/)
+  assert.match(result.stdout, /nonempty strings.*exact report keys/)
+  assert.match(result.stdout, /not npm name validation/)
 })
 
 test('strict package scope rejects malformed package lists', () => {
