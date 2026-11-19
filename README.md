@@ -56,8 +56,8 @@ Two things it does that the toolchain cannot:
 | `--audit-omit <a,b>` | judge the `npm --omit` set (eg `dev`) instead of the full tree |
 | `--audit-config <path>` | exemption list (default `scripts/audit-allowlist.json`; a repository without one has none) |
 | `--audit-report <path>` | write the report this run judged |
-| `--audit-input <path>` | read a recorded full-tree report instead of running npm; with a `devOnly` entry, `--audit-prod-input` comes with it |
-| `--audit-prod-input <path>` | read a recorded production report, for a `devOnly` entry |
+| `--audit-input <path>` | read a recorded full-tree report instead of running npm; any exemption requires `--audit-prod-input` as well |
+| `--audit-prod-input <path>` | read a recorded production report, required for a replay with any exemption |
 | `--assert-no-dependencies` | fail unless the installed `@sasjs/release` ships no dependencies |
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
@@ -123,7 +123,7 @@ What it enforces:
 - **An entry that stops appearing fails**, so an exemption cannot outlive its reason.
 - **An advisory with no GHSA id fails**, because an exemption is a claim about a specific advisory - and "I cannot name this" is not "there is nothing to fix".
 - **A report that cannot be read fails.** `npm audit --json` writes its own errors to stdout and exits non-zero, so a missing lockfile or an unreachable registry parses as JSON with no `vulnerabilities`. That is not a clean tree, and it must not become one once the exemption list empties out.
-- **`devOnly` is measured, not asserted.** When an entry claims it, the production report is asked for and the run fails if the advisory is there after all. With no entries the second call is skipped, because there is nothing an exemption could be hiding.
+- **Production is measured for every exemption.** Any entry, whether `devOnly` is true, false, or omitted, triggers a production report; an advisory in that report is never exemptible. With no entries the second call is skipped, because there is nothing an exemption could be hiding.
 
 The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repository without the file has no exemptions:
 
@@ -139,11 +139,11 @@ The exemptions are `scripts/audit-allowlist.json` - or `--audit-config`. A repos
 ]
 ```
 
-`packages` is optional and names the packages the argument covers - an id exempted for `picomatch` says nothing about the same id arriving under `micromatch`. `recheckBy` is required, because a waiver without a review date is the failure mode the date exists for. `devOnly` is checked per run. The id is the key and `packages` narrows an entry, never widens it.
+`packages` is optional and names the packages the argument covers - an id exempted for `picomatch` says nothing about the same id arriving under `micromatch`. `recheckBy` is required, because a waiver without a review date is the failure mode the date exists for. `devOnly` is optional; even when false or omitted, the entry applies only to findings absent from the production report. The id is the key and `packages` narrows an entry, never widens it.
 
 Exit codes tell the two kinds of failure apart: `1` is a verdict (a finding, a stale entry, an expiry, an unreadable report) and `2` is this tool being asked something it cannot do (an unknown flag, a malformed exemption). A mistyped allowlist must not read as a vulnerability, and a vulnerability must not read as a broken pipeline.
 
-`--audit` composes with `--prepare-publish` and with the tag and release modes, and runs first: a tree that carries an advisory nobody has argued for is not one to stamp a version onto or cut a tag from. `--audit-input` takes a recorded report instead of running npm, and `--audit-prod-input` the production one when a `devOnly` entry needs it - together they run no npm at all, so a failing build is replayed offline and the suite exercises each rule against real payloads.
+`--audit` composes with `--prepare-publish` and with the tag and release modes, and runs first: a tree that carries an advisory nobody has argued for is not one to stamp a version onto or cut a tag from. `--audit-input` takes a recorded report instead of running npm, and `--audit-prod-input` supplies the production report required when any exemption exists. Together they run no npm at all, so a failing build is replayed offline.
 
 The weekly watcher in a repository that files an issue on failure keeps only the part that renders the report and appends to the issue: `--audit --audit-report` is the verdict, and writing to an issue tracker is a second write surface this tool deliberately does not have.
 

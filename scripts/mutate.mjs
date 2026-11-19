@@ -181,6 +181,21 @@ const mutations = [
     replace: `    if (false)`
   },
   {
+    name: 'only devOnly exemptions trigger the production audit',
+    find: `  const needsProd = exemptions.length > 0`,
+    replace: `  const needsProd = exemptions.some((entry) => entry.devOnly)`
+  },
+  {
+    name: 'an orphaned via chain is accepted',
+    find: `    if (!reachable.has(name)) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`,
+    replace: `    if (false) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`
+  },
+  {
+    name: 'affected-package metadata checks are bypassed',
+    find: `  const counts = report.metadata?.vulnerabilities\n  if (!counts || typeof counts !== 'object' || Array.isArray(counts) ||\n      !Number.isSafeInteger(counts.total) || counts.total !== Object.keys(report.vulnerabilities).length)\n    gateFailure('npm audit metadata vulnerabilities total is missing or inconsistent with affected packages')`,
+    replace: `  const counts = report.metadata?.vulnerabilities`
+  },
+  {
     name: 'a package that ships dependencies passes the assertion',
     find: `  if (shipped.length)`,
     replace: `  if (false)`

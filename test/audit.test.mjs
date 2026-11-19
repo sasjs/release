@@ -35,7 +35,7 @@ const report = (entries = []) => ({
         name,
         severity,
         isDirect: false,
-        via: via.map((entry) => ('id' in entry ? advisory(entry.id, { ...entry, package: name }) : entry)),
+        via: via.map((entry) => (entry && typeof entry === 'object' && 'id' in entry ? advisory(entry.id, { ...entry, package: name }) : entry)),
         effects: [],
         range: '<=4.0.7',
         nodes: [`node_modules/${name}`],
@@ -43,7 +43,16 @@ const report = (entries = []) => ({
       }
     ])
   ),
-  metadata: { vulnerabilities: {}, dependencies: {} }
+  metadata: {
+    vulnerabilities: Object.fromEntries([
+      ...['info', 'low', 'moderate', 'high', 'critical'].map((severity) => [severity, entries.filter((entry) => {
+        const value = entry.severity || 'high'
+        return (['info', 'low', 'moderate', 'high', 'critical'].includes(value) ? value : 'critical') === severity
+      }).length]),
+      ['total', entries.length]
+    ]),
+    dependencies: {}
+  }
 })
 
 const PICOMATCH = 'GHSA-fc5q-39xc-vjpf'
@@ -130,6 +139,20 @@ function stubNpm(cwd, { full, prod } = {}) {
   }
 }
 
+test('a real npm v2 report accepts indirect chains and counts packages rather than advisories', () => {
+  // Captured with npm audit --json --package-lock-only in sasjs-cli, npm 12.2.3.
+  const fixture = fileURLToPath(new URL('./fixtures/npm-audit-sasjs-cli.json', import.meta.url))
+  const sample = JSON.parse(readFileSync(fixture, 'utf8'))
+  assert.ok(sample.metadata.vulnerabilities.total > 0)
+  assert.ok(Object.values(sample.vulnerabilities).some((vuln) => vuln.via.some((via) => typeof via === 'string')))
+  const cwd = repo({ report: sample })
+  const low = run(cwd, '--audit-input', 'full.json')
+  assert.equal(low.code, 1, low.out)
+  assert.match(low.out, /not in the allowlist/)
+  const high = run(cwd, '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(high.code, 0, high.out)
+})
+
 test('a clean tree passes, and says so as output', () => {
   const cwd = repo()
   const { code, stdout } = run(cwd, '--audit-input', 'full.json')
@@ -185,6 +208,15 @@ test('an advisory in the production tree fails even though the allowlist calls i
   assert.match(out, /in the production tree, though the allowlist calls it devOnly \(review by 2099-01-31\)/)
 })
 
+test('an exemption without devOnly cannot waive an advisory in production', () => {
+  const vuln = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const cwd = repo({ report: vuln, prodReport: vuln, exemptions: [exemption({ devOnly: undefined })] })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /in the production tree, where nothing is exemptible/)
+  assert.doesNotMatch(out, /calls it devOnly/)
+})
+
 test('an advisory in the omitted production report fails with no allowlist at all', () => {
   const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]) })
   const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-omit', 'dev')
@@ -218,11 +250,96 @@ test('a report with no vulnerabilities key is not a clean tree', () => {
   assert.match(out, /not an npm audit report: no vulnerabilities or auditReportVersion/)
 })
 
+test('an array of vulnerabilities is malformed, not a clean report', () => {
+  const cwd = repo({ report: { ...report(), vulnerabilities: [] } })
+  const { code, out } = run(cwd, '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /not an npm audit report/)
+})
+
+test('metadata claiming affected packages in an empty report cannot pass', () => {
+  const sample = report()
+  sample.metadata.vulnerabilities = { info: 0, low: 0, moderate: 0, high: 1, critical: 0, total: 1 }
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /metadata.*inconsistent/i)
+})
+
+test('missing affected-package metadata cannot be interpreted as a clean audit', () => {
+  const sample = report()
+  delete sample.metadata.vulnerabilities
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /metadata.*missing/i)
+})
+
+test('metadata total cannot count packages absent from the report', () => {
+  const sample = report()
+  sample.metadata.vulnerabilities.total = 1
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /metadata.*inconsistent/i)
+})
+
+test('metadata severity counts must agree with the affected package entries', () => {
+  const sample = report([{ package: 'a', via: [{ id: PICOMATCH }] }])
+  sample.metadata.vulnerabilities.high = 0
+  sample.metadata.vulnerabilities.low = 1
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'critical')
+  assert.equal(code, 1, out)
+  assert.match(out, /metadata.*inconsistent/i)
+})
+
+test('an npm error accompanying an otherwise clean report fails closed', () => {
+  const sample = { ...report(), error: { code: 'EFAIL', summary: 'audit incomplete' } }
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /audit.*error/i)
+})
+
 test('non-JSON is a failure, not an empty report', () => {
   const cwd = repo({ report: 'npm ERR! something went wrong\n' })
   const { code, out } = run(cwd, '--audit-input', 'full.json')
   assert.equal(code, 1)
   assert.match(out, /this is not an npm audit report/)
+})
+
+test('an unresolved indirect vulnerability cannot disappear from the verdict', () => {
+  const cwd = repo({ report: report([{ package: 'wrapper', via: ['missing'] }]) })
+  const { code, out } = run(cwd, '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /unresolved.*missing/i)
+})
+
+test('a cycle with no reachable advisory fails closed', () => {
+  const cwd = repo({ report: report([{ package: 'a', via: ['b'] }, { package: 'b', via: ['a'] }]) })
+  const { code, out } = run(cwd, '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /no reachable advisory/i)
+})
+
+test('an indirect cycle with a reachable advisory remains a valid report', () => {
+  const sample = report([{ package: 'a', via: ['b', { id: PICOMATCH }] }, { package: 'b', via: ['a'] }])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /GHSA-fc5q-39xc-vjpf a: not in the allowlist/)
+  assert.doesNotMatch(out, /no reachable advisory/)
+})
+
+test('a vulnerability whose name differs from its key is not exempted under the wrong package', () => {
+  const sample = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  sample.vulnerabilities.picomatch.name = 'different-package'
+  const cwd = repo({ report: sample, prodReport: report(), exemptions: [exemption()] })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /invalid.*vulnerability.*picomatch/i)
+})
+
+test('a malformed via alongside a valid advisory cannot be ignored', () => {
+  const cwd = repo({ report: report([{ package: 'a', via: [null, { id: PICOMATCH }] }]), exemptions: [exemption({ packages: ['a'] })], prodReport: report() })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(code, 1, out)
+  assert.match(out, /invalid.*via/i)
 })
 
 test('an advisory this tool cannot name fails rather than being dropped', () => {
@@ -248,6 +365,27 @@ test('a severity the report invents is treated as the highest, not the lowest', 
   assert.match(out, /critical GHSA-aaaa-bbbb-cccc leftpad/)
 })
 
+test('an unknown package severity cannot suppress a known lower advisory severity', () => {
+  const sample = report([{ package: 'a', severity: 'unknown', via: [{ id: PICOMATCH, severity: 'low' }] }])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity/i)
+})
+
+test('a report cannot lower a direct advisory severity below the package severity', () => {
+  const sample = report([{ package: 'a', severity: 'high', via: [{ id: PICOMATCH, severity: 'low' }] }])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity.*inconsistent/i)
+})
+
+test('duplicate advisory ids retain the highest severity regardless of order', () => {
+  const cwd = repo({ report: report([{ package: 'a', via: [{ id: PICOMATCH, severity: 'low' }, { id: PICOMATCH, severity: 'high' }] }]) })
+  const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /high GHSA-fc5q-39xc-vjpf a/)
+})
+
 test('an exemption for one package says nothing about the same id under another', () => {
   const cwd = repo({
     report: report([{ package: 'micromatch', via: [{ id: PICOMATCH }] }]),
@@ -264,6 +402,13 @@ test('an exemption without a review date is a usage error, not a pass', () => {
   const { code, out } = run(cwd, '--audit-input', 'full.json')
   assert.equal(code, 2)
   assert.match(out, /needs recheckBy as YYYY-MM-DD/)
+})
+
+test('an impossible review date cannot turn into an indefinite exemption', () => {
+  const cwd = repo({ exemptions: [exemption({ recheckBy: '2099-99-99' })] })
+  const { code, out } = run(cwd, '--audit-input', 'full.json')
+  assert.equal(code, 2, out)
+  assert.match(out, /valid.*date/i)
 })
 
 test('an exemption past its review date fails the gate', () => {
@@ -309,6 +454,16 @@ test('the gate asks npm for the full report, and for the production one only whe
   assert.deepEqual(argv, ['audit --json', 'audit --json --omit dev'])
 })
 
+test('npm is asked for production even when devOnly is false', () => {
+  const vuln = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const cwd = repo({ exemptions: [exemption({ devOnly: false })] })
+  const { env } = stubNpm(cwd, { full: vuln, prod: vuln })
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit'], { encoding: 'utf8', env: { ...process.env, ...env } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(result.stdout, /in the production tree, where nothing is exemptible/)
+  assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json', 'audit --json --omit dev'])
+})
+
 test('a tree with no exemptions is answered by one npm call', () => {
   const cwd = repo()
   const { env } = stubNpm(cwd)
@@ -318,6 +473,24 @@ test('a tree with no exemptions is answered by one npm call', () => {
   })
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
   assert.deepEqual(readFileSync(join(cwd, 'argv.log'), 'utf8').trim().split('\n'), ['audit --json'])
+})
+
+test('npm exit 1 with an empty report is not treated as a clean audit', () => {
+  const cwd = repo()
+  const { env } = stubNpm(cwd)
+  writeFileSync(join(cwd, 'bin/npm'), '#!/bin/sh\ncat "$NPM_REPORT"\nexit 1\n')
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit'], { encoding: 'utf8', env: { ...process.env, ...env } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /npm.*exit.*1.*empty/i)
+})
+
+test('npm failing to run cannot supply a valid-looking clean report', () => {
+  const cwd = repo()
+  const { env } = stubNpm(cwd)
+  writeFileSync(join(cwd, 'bin/npm'), '#!/bin/sh\ncat "$NPM_REPORT"\nexit 2\n')
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit'], { encoding: 'utf8', env: { ...process.env, ...env } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /npm.*exit.*2/i)
 })
 
 test('npm printing nothing is a failure that quotes what npm said', () => {
@@ -444,6 +617,17 @@ test('an audit flag without --audit is a usage error, not an ordinary release', 
   const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit-level', 'high'], { encoding: 'utf8' })
   assert.equal(result.status, 2)
   assert.match(`${result.stdout}${result.stderr}`, /--audit-level needs --audit/)
+})
+
+test('recorded replays with a false devOnly exemption require a production input and never call npm', () => {
+  const cwd = repo({ exemptions: [exemption({ devOnly: false })] })
+  const { env } = stubNpm(cwd)
+  const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--audit', '--audit-input', 'full.json'], {
+    encoding: 'utf8', env: { ...process.env, ...env }
+  })
+  assert.equal(result.status, 2, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /needs --audit-prod-input/)
+  assert.equal(readFileSync(join(cwd, 'argv.log'), 'utf8'), '')
 })
 
 test('a recorded replay never asks npm, so a devOnly entry needs both inputs', () => {
