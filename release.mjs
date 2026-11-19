@@ -62,6 +62,8 @@ const HELP = `sasjs-release - releases from conventional commits
   --audit-require-severity
                          require a reviewed severity on every exemption (opt-in)
   --audit-require-source require an exact npm source on every exemption (opt-in)
+  --audit-require-packages
+                         require nonempty package scope on every exemption (opt-in)
   --audit-omit <a,b>     judge the npm omit set: dev, optional, peer (eg dev,optional)
   --audit-config <path>  exemption list (default scripts/audit-allowlist.json; a
                          repository without one has no exemptions)
@@ -102,7 +104,7 @@ const HELP = `sasjs-release - releases from conventional commits
 // exist rather than failing.
 const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'audit', 'audit-config', 'audit-input',
-  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'audit-require-severity', 'audit-require-source', 'assert-no-dependencies',
+  'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'audit-require-severity', 'audit-require-source', 'audit-require-packages', 'assert-no-dependencies',
   'branch', 'config', 'draft', 'dry-run', 'help', 'host',
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
@@ -1715,6 +1717,8 @@ function auditExemptions(cwd, omit) {
       (!Array.isArray(entry.packages) || entry.packages.some((name) => typeof name !== 'string' || !name))
     )
       fail(`${at} has packages that are not a list of package names`)
+    if (flag('audit-require-packages') && (!entry.packages || !entry.packages.length))
+      fail(`${at} nonempty packages are required with --audit-require-packages`)
 
     if (entry.devOnly !== undefined && typeof entry.devOnly !== 'boolean')
       fail(`${at} has a devOnly that is not true or false`)
@@ -1741,7 +1745,7 @@ function auditExemptions(cwd, omit) {
   })
 
   // Validate every entry before issuing a verdict: expiry must not hide a
-  // malformed exemption or a missing required severity elsewhere in the list.
+  // malformed exemption or a missing required bound elsewhere in the list.
   // Comparing YYYY-MM-DD strings treats the review date as valid all day UTC.
   for (const entry of exemptions) {
     if (entry.recheckBy < today)
@@ -1998,7 +2002,7 @@ async function main() {
   // A flag that only means something with --audit is otherwise silent: `--audit-level
   // high` on its own would run an ordinary release, which is not what anyone typing
   // it expects.
-  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input', 'audit-require-severity', 'audit-require-source']
+  const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input', 'audit-require-severity', 'audit-require-source', 'audit-require-packages']
   if (!flag('audit') && auditOnly.some(flag)) fail(`--${auditOnly.find(flag)} needs --audit`)
 
   if (flag('assert-no-dependencies')) {

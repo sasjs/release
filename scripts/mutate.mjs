@@ -156,6 +156,21 @@ const mutations = [
     replace: `true`
   },
   {
+    name: 'strict package scope accepts missing packages',
+    find: `flag('audit-require-packages') && (!entry.packages || !entry.packages.length)`,
+    replace: `flag('audit-require-packages') && entry.packages && !entry.packages.length`
+  },
+  {
+    name: 'strict package scope accepts empty packages',
+    find: `flag('audit-require-packages') && (!entry.packages || !entry.packages.length)`,
+    replace: `flag('audit-require-packages') && !entry.packages`
+  },
+  {
+    name: 'strict package scope applies even when not requested',
+    find: `flag('audit-require-packages') && (!entry.packages || !entry.packages.length)`,
+    replace: `(!entry.packages || !entry.packages.length)`
+  },
+  {
     name: 'strict source does not require a bound',
     find: `flag('audit-require-source') && entry.source === undefined`,
     replace: `false`

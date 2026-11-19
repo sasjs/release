@@ -409,6 +409,96 @@ test('source-bound stale identity must match id and source, including unscoped e
   assert.match(result.out, /stale=1/)
 })
 
+test('strict package scope accepts a matching scoped exemption', () => {
+  const data = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const cwd = repo({ report: data, prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-packages')
+  assert.equal(result.code, 0, result.out)
+})
+
+test('strict package scope does not waive the same advisory on another package', () => {
+  const data = report(['picomatch', 'other'].map((name) => ({ package: name, via: [{ id: PICOMATCH }] })))
+  const cwd = repo({ report: data, prodReport: report(), exemptions: [exemption()] })
+  const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-packages')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /other/)
+})
+
+test('strict package scope rejects missing and empty packages as usage errors', () => {
+  for (const packages of [undefined, []]) {
+    const cwd = repo({ report: report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }]), prodReport: report(), exemptions: [exemption({ packages })] })
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-packages')
+    assert.equal(result.code, 2, result.out)
+    assert.match(result.out, /packages.*required.*--audit-require-packages/)
+  }
+})
+
+test('strict package scope without audit is a usage error', () => {
+  const result = spawnSync('node', [CLI, '--audit-require-packages'], { encoding: 'utf8' })
+  assert.equal(result.status, 2, result.stderr)
+  assert.match(result.stderr, /--audit-require-packages needs --audit/)
+})
+
+test('help describes strict package scope', () => {
+  const result = spawnSync('node', [CLI, '--help'], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /--audit-require-packages/)
+})
+
+test('strict package scope rejects malformed package lists', () => {
+  for (const packages of [null, 'picomatch', {}, [null], [''], [1]]) {
+    const result = run(repo({ exemptions: [exemption({ packages })] }), '--audit-input', 'full.json', '--audit-require-packages')
+    assert.equal(result.code, 2, result.out)
+    assert.match(result.out, /packages.*not a list of package names/)
+  }
+})
+
+test('strict package scope allows empty or absent exemption lists', () => {
+  for (const exemptions of [undefined, []]) {
+    const result = run(repo({ exemptions }), '--audit-input', 'full.json', '--audit-require-packages')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.stdout, /^audited=true$/m)
+  }
+})
+
+test('strict package scope validates all entries before expiry and below the audit floor', () => {
+  const expired = exemption({ recheckBy: '2000-01-01' })
+  const low = report([{ package: 'picomatch', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }])
+  for (const packages of [undefined, []]) {
+    for (const exemptions of [
+      [exemption({ packages, recheckBy: '2000-01-01' })],
+      [expired, exemption({ packages })],
+      [exemption(), exemption({ packages })]
+    ]) {
+      const result = run(repo({ report: low, prodReport: report(), exemptions }),
+        '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high', '--audit-require-packages')
+      assert.equal(result.code, 2, result.out)
+      assert.match(result.out, /packages.*required.*--audit-require-packages/)
+    }
+  }
+})
+
+test('strict package scope composes with source and severity bounds and production safety', () => {
+  const data = report([{ package: 'picomatch', via: [{ ...advisory(PICOMATCH, { package: 'picomatch' }), source: 101 }] }])
+  const args = ['--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-packages', '--audit-require-source', '--audit-require-severity']
+  for (const [entry, prodReport, code, message] of [
+    [exemption({ source: 101, severity: 'high' }), report(), 0, /exempted=1/],
+    [exemption({ source: 102, severity: 'high' }), report(), 1, /source/],
+    [exemption({ source: 101, severity: 'low' }), report(), 1, /severity differs/],
+    [exemption({ source: 101, severity: 'high' }), data, 1, /production tree/],
+    [exemption({ severity: 'high' }), report(), 2, /source is required/],
+    [exemption({ source: 101 }), report(), 2, /severity is required/]
+  ]) {
+    const result = run(repo({ report: data, prodReport, exemptions: [entry] }), ...args)
+    assert.equal(result.code, code, result.out)
+    assert.match(result.out, message)
+  }
+  const result = run(repo({ report: data, exemptions: [exemption({ source: 101, severity: 'high' })] }),
+    '--audit-input', 'full.json', '--audit-require-packages', '--audit-require-source', '--audit-require-severity')
+  assert.equal(result.code, 2, result.out)
+  assert.match(result.out, /needs --audit-prod-input/)
+})
+
 test('strict source requires valid numeric source on every entry', () => {
   for (const source of [null, '101', 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, true, []]) {
     const result = run(repo({ exemptions: [exemption({ source })] }), '--audit-input', 'full.json', '--audit-require-source')
