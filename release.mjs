@@ -1701,14 +1701,6 @@ function auditExemptions(cwd, omit) {
     if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== entry.recheckBy)
       fail(`${at} needs a valid calendar date for recheckBy`)
 
-    // A date has passed when the calendar says so, not the clock: comparing the
-    // strings is exact for YYYY-MM-DD and needs no timezone
-    if (entry.recheckBy < today)
-      gateFailure(
-        `the exemption for ${entry.id} was due for review on ${entry.recheckBy} - ` +
-          're-check it, then move the date or remove the entry'
-      )
-
     if (
       entry.packages !== undefined &&
       (!Array.isArray(entry.packages) || entry.packages.some((name) => typeof name !== 'string' || !name))
@@ -1732,6 +1724,17 @@ function auditExemptions(cwd, omit) {
       reason: entry.reason
     }
   })
+
+  // Validate every entry before issuing a verdict: expiry must not hide a
+  // malformed exemption or a missing required severity elsewhere in the list.
+  // Comparing YYYY-MM-DD strings treats the review date as valid all day UTC.
+  for (const entry of exemptions) {
+    if (entry.recheckBy < today)
+      gateFailure(
+        `the exemption for ${entry.id} was due for review on ${entry.recheckBy} - ` +
+          're-check it, then move the date or remove the entry'
+      )
+  }
 
   // An omitted-tree gate refuses exemptions: the partial report cannot establish
   // whether an omitted advisory is still present or whether a waiver is stale.

@@ -203,6 +203,47 @@ test('strict severity rejects invalid ratings as usage errors', () => {
   }
 })
 
+test('exemption validation errors take precedence over expiry', async (t) => {
+  const expired = exemption({ recheckBy: '2000-01-01', severity: 'high' })
+  const cases = [
+    ['missing strict severity on expired entry', [exemption({ recheckBy: '2000-01-01' })], true, /severity.*required/],
+    ['invalid severity on expired entry', [exemption({ recheckBy: '2000-01-01', severity: 'HIGH' })], false, /severity.*not one of/],
+    ['invalid packages on expired entry', [exemption({ recheckBy: '2000-01-01', packages: 'fixture' })], false, /packages.*not a list/],
+    ['invalid devOnly on expired entry', [exemption({ recheckBy: '2000-01-01', devOnly: 'yes' })], false, /devOnly.*not true or false/],
+    ['missing strict severity after expired entry', [expired, exemption()], true, /severity.*required/],
+    ['invalid severity after expired entry', [expired, exemption({ severity: 'HIGH' })], false, /severity.*not one of/],
+    ['invalid object after expired entry', [expired, null], false, /not an object/],
+    ['unknown key after expired entry', [expired, exemption({ typo: true })], false, /unknown key/],
+    ['invalid id after expired entry', [expired, exemption({ id: 'bad' })], false, /needs an id/],
+    ['invalid reason after expired entry', [expired, exemption({ reason: '' })], false, /needs a reason/],
+    ['invalid date after expired entry', [expired, exemption({ recheckBy: '2099-02-30' })], false, /valid calendar date/],
+    ['invalid packages after expired entry', [expired, exemption({ packages: 'fixture' })], false, /packages.*not a list/],
+    ['invalid devOnly after expired entry', [expired, exemption({ devOnly: 'yes' })], false, /devOnly.*not true or false/]
+  ]
+  for (const [name, exemptions, strict, message] of cases) {
+    await t.test(name, () => {
+      const args = ['--audit-input', 'full.json', '--audit-prod-input', 'prod.json']
+      if (strict) args.push('--audit-require-severity')
+      const result = run(repo({ exemptions, prodReport: report() }), ...args)
+      assert.equal(result.code, 2, result.out)
+      assert.match(result.out, message)
+    })
+  }
+})
+
+test('valid expired exemptions still fail as a verdict, reporting the first expired entry', () => {
+  const exemptions = [
+    exemption({ id: 'GHSA-aaaa-bbbb-cccc', recheckBy: '2000-01-01', severity: 'high' }),
+    exemption({ id: 'GHSA-dddd-eeee-ffff', recheckBy: '2001-01-01', severity: 'low' })
+  ]
+  const cwd = repo({ exemptions, prodReport: report() })
+  for (const args of [[], ['--audit-omit', 'dev']]) {
+    const result = run(cwd, '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-require-severity', ...args)
+    assert.equal(result.code, 1, result.out)
+    assert.match(result.out, /exemption for GHSA-aaaa-bbbb-cccc was due for review on 2000-01-01/)
+  }
+})
+
 test('strict severity requires every waiver to name its reviewed severity', () => {
   const cwd = repo({
     report: report([{ package: 'fixture', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }]),
