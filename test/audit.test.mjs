@@ -596,6 +596,74 @@ test('--assert-no-dependencies fails naming every dependency that ships', () => 
   assert.match(`${result.stdout}${result.stderr}`, /ships dependencies \(glob, undici\)/)
 })
 
+function runDependencyAssertion(fields) {
+  const cwd = mkdtempSync(join(tmpdir(), 'assert-'))
+  mkdirSync(join(cwd, 'node_modules/@sasjs/release'), { recursive: true })
+  writeFileSync(join(cwd, 'node_modules/@sasjs/release/package.json'), JSON.stringify({ version: '9.9.9', ...fields }))
+  return spawnSync('node', [CLI, '--repo-dir', cwd, '--assert-no-dependencies'], { encoding: 'utf8' })
+}
+
+test('--assert-no-dependencies rejects peer dependencies by name', () => {
+  const result = runDependencyAssertion({ peerDependencies: { 'peer-fixture': '^1' } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /peer-fixture/)
+})
+
+test('--assert-no-dependencies rejects optional dependencies by name', () => {
+  const result = runDependencyAssertion({ optionalDependencies: { 'optional-fixture': '^1' } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /optional-fixture/)
+})
+
+test('--assert-no-dependencies rejects bundledDependencies arrays by package name', () => {
+  const result = runDependencyAssertion({ bundledDependencies: ['@scope/bundled', 'other-bundled'] })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /@scope\/bundled, other-bundled/)
+})
+
+test('--assert-no-dependencies rejects bundleDependencies arrays by package name', () => {
+  const result = runDependencyAssertion({ bundleDependencies: ['alias-fixture'] })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /alias-fixture/)
+})
+
+test('--assert-no-dependencies rejects bundledDependencies object keys by name', () => {
+  const result = runDependencyAssertion({ bundledDependencies: { 'object-fixture': '^1' } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /object-fixture/)
+})
+
+test('--assert-no-dependencies rejects bundleDependencies object keys by name', () => {
+  const result = runDependencyAssertion({ bundleDependencies: { 'alias-object-fixture': '^1' } })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /alias-object-fixture/)
+})
+
+test('--assert-no-dependencies permits dev dependencies and empty or boolean bundle declarations', () => {
+  for (const fields of [
+    { devDependencies: { 'dev-fixture': '^1' } },
+    { dependencies: {}, peerDependencies: {}, optionalDependencies: {}, bundledDependencies: [], bundleDependencies: [] },
+    { bundledDependencies: false, bundleDependencies: true },
+    { bundledDependencies: {}, bundleDependencies: {} }
+  ]) {
+    const result = runDependencyAssertion(fields)
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+    assert.match(result.stdout, /@sasjs\/release 9\.9\.9 ships no dependencies/)
+  }
+})
+
+test('--assert-no-dependencies reports distinct names across all runtime sections', () => {
+  const result = runDependencyAssertion({
+    dependencies: { direct: '1', shared: '1' },
+    peerDependencies: { peer: '1', shared: '1' },
+    optionalDependencies: { optional: '1' },
+    bundledDependencies: ['bundled', 'shared'],
+    bundleDependencies: ['alias']
+  })
+  assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
+  assert.match(`${result.stdout}${result.stderr}`, /ships dependencies \(direct, shared, peer, optional, bundled, alias\)/)
+})
+
 test('--assert-no-dependencies on a tree that has not installed it is a usage error', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'assert-'))
   const result = spawnSync('node', [CLI, '--repo-dir', cwd, '--assert-no-dependencies'], { encoding: 'utf8' })

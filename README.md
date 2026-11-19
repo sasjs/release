@@ -151,6 +151,8 @@ The weekly watcher in a repository that files an issue on failure keeps only the
 
 A release job runs with `contents: write`, so the tree carrying the release tool has to be auditable - and the property that makes it so is that this package ships nothing of its own. Three workflows asserted that with an inline `node -e` block; the flag is the same assertion, next to the code that has to keep the promise:
 
+`dependencies`, `peerDependencies`, `optionalDependencies`, and both `bundledDependencies` / `bundleDependencies` count, including names in bundle arrays or object keys. Boolean bundle flags alone do not name dependencies; `true` bundles the declared dependencies, which are checked separately. Development dependencies are allowed. Failure exits 1 and lists the distinct package names; a missing or unreadable installed manifest exits 2.
+
 ```yaml
 - run: npm run release -- --assert-no-dependencies
 ```

@@ -196,6 +196,21 @@ const mutations = [
     replace: `  const counts = report.metadata?.vulnerabilities`
   },
   {
+    name: 'the assertion ignores non-direct runtime dependency fields',
+    find: `  const shipped = Object.keys({
+    ...pkg.dependencies,
+    ...pkg.peerDependencies,
+    ...pkg.optionalDependencies,
+    ...(Array.isArray(pkg.bundledDependencies)
+      ? Object.fromEntries(pkg.bundledDependencies.map((name) => [name, 1]))
+      : pkg.bundledDependencies),
+    ...(Array.isArray(pkg.bundleDependencies)
+      ? Object.fromEntries(pkg.bundleDependencies.map((name) => [name, 1]))
+      : pkg.bundleDependencies)
+  })`,
+    replace: `  const shipped = Object.keys(pkg.dependencies || {})`
+  },
+  {
     name: 'a package that ships dependencies passes the assertion',
     find: `  if (shipped.length)`,
     replace: `  if (false)`

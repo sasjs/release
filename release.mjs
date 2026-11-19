@@ -1794,7 +1794,17 @@ function assertNoDependencies(cwd) {
     fail(`--assert-no-dependencies: ${at} could not be read: ${error.message}`)
   }
 
-  const shipped = Object.keys(pkg.dependencies || {})
+  const shipped = Object.keys({
+    ...pkg.dependencies,
+    ...pkg.peerDependencies,
+    ...pkg.optionalDependencies,
+    ...(Array.isArray(pkg.bundledDependencies)
+      ? Object.fromEntries(pkg.bundledDependencies.map((name) => [name, 1]))
+      : pkg.bundledDependencies),
+    ...(Array.isArray(pkg.bundleDependencies)
+      ? Object.fromEntries(pkg.bundleDependencies.map((name) => [name, 1]))
+      : pkg.bundleDependencies)
+  })
 
   if (shipped.length)
     gateFailure(
