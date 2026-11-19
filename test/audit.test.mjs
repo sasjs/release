@@ -174,6 +174,71 @@ test('a dev advisory passes only when the allowlist argues for it and the produc
   assert.match(stdout, /^exempted=1$/m)
 })
 
+test('exempted counts distinct first applicable entries without source bounds', () => {
+  const data = report([
+    { package: 'a', via: [{ id: PICOMATCH }] },
+    { package: 'b', via: [{ id: PICOMATCH }] }
+  ])
+  const shared = exemption({ packages: [] })
+  const onlyA = exemption({ packages: ['a'] })
+  for (const [entries, count] of [[[shared, onlyA], 1], [[onlyA, shared], 2]]) {
+    const result = run(repo({ report: data, prodReport: report(), exemptions: entries }),
+      '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.out, /^advisories=2$/m)
+    assert.match(result.out, new RegExp(`^exempted=${count}$`, 'm'))
+  }
+})
+
+test('exempted selects first bound entry per above-floor source, ignoring unbounded overlaps', () => {
+  const via = (name, source, severity) => ({ ...advisory(PICOMATCH, { package: name, severity }), source })
+  const data = report([
+    { package: 'a', via: [via('a', 101, 'high'), via('a', 101, 'high'), via('a', 102, 'high'), via('a', 103, 'low')] },
+    { package: 'b', via: [via('b', 101, 'high')] }
+  ])
+  const entries = [exemption({ packages: [] }), exemption({ packages: [], source: 101 }),
+    exemption({ packages: ['a'], source: 101 }), exemption({ packages: ['a'], source: 102 }),
+    exemption({ packages: ['a'], source: 103 })]
+  for (const [order, count] of [[entries, 2], [[entries[0], entries[2], entries[1], entries[3], entries[4]], 3]]) {
+    const result = run(repo({ report: data, prodReport: report(), exemptions: order }),
+      '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+    assert.equal(result.code, 0, result.out)
+    assert.match(result.out, /^advisories=2$/m)
+    assert.match(result.out, new RegExp(`^exempted=${count}$`, 'm'))
+    assert.match(result.out, /^stale=0$/m)
+  }
+})
+
+test('exempted selects no entries for a finding blocked by severity or source', () => {
+  const via = (source) => ({ ...advisory(PICOMATCH, { package: 'picomatch' }), source })
+  for (const entries of [[exemption(), exemption({ severity: 'moderate' })],
+    [exemption(), exemption({ source: 101 })]]) {
+    const result = run(repo({ report: report([{ package: 'picomatch', via: [via(101), via(102)] }]),
+      prodReport: report(), exemptions: entries }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+    assert.equal(result.code, 1, result.out)
+    assert.match(result.out, entries[1].severity ? /severity differs/ : /source differs/)
+    assert.match(result.out, /^exempted=0$/m)
+  }
+})
+
+test('exempted is selected from the full report even when production blocks the gate', () => {
+  const data = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const result = run(repo({ report: data, prodReport: data, exemptions: [exemption()] }),
+    '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /production tree/)
+  assert.match(result.out, /^exempted=1$/m)
+})
+
+test('exempted remains selected when another entry is stale', () => {
+  const data = report([{ package: 'picomatch', via: [{ id: PICOMATCH }] }])
+  const result = run(repo({ report: data, prodReport: report(), exemptions: [exemption(),
+    exemption({ id: 'GHSA-aaaa-bbbb-cccc' })] }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json')
+  assert.equal(result.code, 1, result.out)
+  assert.match(result.out, /^stale=1$/m)
+  assert.match(result.out, /^exempted=1$/m)
+})
+
 test('a malformed advisory URL suffix cannot satisfy a waiver', () => {
   const via = { ...advisory(PICOMATCH, { package: 'picomatch' }), url: `https://github.com/advisories/${PICOMATCH}-extra` }
   const cwd = repo({ report: report([{ package: 'picomatch', via: [via] }]), prodReport: report(), exemptions: [exemption()] })

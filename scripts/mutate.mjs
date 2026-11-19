@@ -196,9 +196,9 @@ const mutations = [
   },
   {
     name: 'an exemption for one package exempts the id everywhere',
-    find: `        sameId(entry.id, finding.id) &&
-        (!entry.packages.length || entry.packages.includes(finding.package))`,
-    replace: `        sameId(entry.id, finding.id)`
+    find: `    sameId(entry.id, finding.id) &&
+    (!entry.packages.length || entry.packages.includes(finding.package))`,
+    replace: `    sameId(entry.id, finding.id)`
   },
   {
     name: 'a review date in the past is not enforced',

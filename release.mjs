@@ -1784,12 +1784,10 @@ async function auditGate() {
   const atFloor = (finding) => SEVERITIES.indexOf(finding.severity) >= floor
   const ratingsAtFloor = (ratings) => [...ratings].some((rating) =>
     (rating === null ? SEVERITIES.length - 1 : SEVERITIES.indexOf(rating)) >= floor)
-  const matches = (finding) =>
-    exemptions.findIndex(
-      (entry) =>
-        sameId(entry.id, finding.id) &&
-        (!entry.packages.length || entry.packages.includes(finding.package))
-    )
+  const applies = (entry, finding) =>
+    sameId(entry.id, finding.id) &&
+    (!entry.packages.length || entry.packages.includes(finding.package))
+  const matches = (finding) => exemptions.findIndex((entry) => applies(entry, finding))
 
   // A recorded replay runs no npm at all: if the production report is needed, it has
   // to arrive as a file too. Without this the gate would ask npm in a run whose whole
@@ -1832,8 +1830,7 @@ async function auditGate() {
     // Every applicable bound is a restriction, regardless of list order or an
     // overlapping unbounded entry; an older waiver must not undo a newer one.
     const mismatch = exemptions.find((entry) =>
-      sameId(entry.id, finding.id) &&
-      (!entry.packages.length || entry.packages.includes(finding.package)) &&
+      applies(entry, finding) &&
       entry.severity !== undefined &&
       (entry.source === undefined
         ? [...finding.ratings].some((rating) => rating !== entry.severity)
@@ -1846,8 +1843,7 @@ async function auditGate() {
     else if (mismatch)
       rows.set(key(finding), { finding, why: `severity differs from allowlist (${mismatch.severity})` })
     else {
-      const bound = exemptions.filter((entry) => sameId(entry.id, finding.id) &&
-        (!entry.packages.length || entry.packages.includes(finding.package)) && entry.source !== undefined)
+      const bound = exemptions.filter((entry) => applies(entry, finding) && entry.source !== undefined)
       const unmatched = [...finding.sources].filter(([source, ratings]) =>
         ratingsAtFloor(ratings) && !bound.some((entry) => entry.source === source)).map(([source]) => source)
       if (bound.length && unmatched.length)
