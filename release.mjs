@@ -1455,6 +1455,37 @@ function auditFindings(report) {
   for (const name of Object.keys(report.vulnerabilities))
     if (!reachable.has(name)) gateFailure(`audit vulnerability ${name} has no reachable advisory`)
 
+  // A metavulnerability refers to one version-specific cause, not necessarily
+  // the referenced package's maximum severity. Reconcile against reachable
+  // advisories instead, propagating maxima to a fixed point even through cycles.
+  // Never assign an upstream package's severity or identity to an advisory: that
+  // would let an exemption for one package silently waive another.
+  const causeSeverity = new Map()
+  const severityQueue = []
+  for (const [name, vuln] of Object.entries(report.vulnerabilities)) {
+    const direct = vuln.via.filter((via) => typeof via !== 'string')
+    if (!direct.length) continue
+    causeSeverity.set(name, Math.max(...direct.map((via) => {
+      const rank = SEVERITIES.indexOf(via.severity)
+      return rank < 0 ? SEVERITIES.length - 1 : rank
+    })))
+    severityQueue.push(name)
+  }
+  for (let i = 0; i < severityQueue.length; i++) {
+    const cause = severityQueue[i]
+    for (const name of dependents.get(cause) || []) {
+      if ((causeSeverity.get(name) ?? -1) < causeSeverity.get(cause)) {
+        causeSeverity.set(name, causeSeverity.get(cause))
+        severityQueue.push(name)
+      }
+    }
+  }
+  for (const [name, vuln] of Object.entries(report.vulnerabilities)) {
+    const rank = SEVERITIES.indexOf(vuln.severity)
+    if ((rank < 0 ? SEVERITIES.length - 1 : rank) > causeSeverity.get(name))
+      gateFailure(`audit severity inconsistent for ${name}: no reachable advisory explains package severity`)
+  }
+
   for (const [name, vuln] of Object.entries(report.vulnerabilities || {})) {
     for (const via of Array.isArray(vuln?.via) ? vuln.via : []) {
       // a string is a pointer at another package's entry, which is reported under

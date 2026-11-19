@@ -186,6 +186,11 @@ const mutations = [
     replace: `  const needsProd = exemptions.some((entry) => entry.devOnly)`
   },
   {
+    name: 'indirect and mixed package severity is not reconciled with reachable advisory causes',
+    find: `    if ((rank < 0 ? SEVERITIES.length - 1 : rank) > causeSeverity.get(name))`,
+    replace: `    if (false)`
+  },
+  {
     name: 'an orphaned via chain is accepted',
     find: `    if (!reachable.has(name)) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`,
     replace: `    if (false) gateFailure(\`audit vulnerability \${name} has no reachable advisory\`)`

@@ -379,6 +379,82 @@ test('a report cannot lower a direct advisory severity below the package severit
   assert.match(out, /severity.*inconsistent/i)
 })
 
+test('an indirect node cannot hide unexplained high package severity', () => {
+  const sample = report([
+    { package: 'wrapper', severity: 'high', via: ['dep'] },
+    { package: 'dep', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }
+  ])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity.*(inconsistent|reconcil)/i)
+})
+
+test('a mixed node cannot hide unexplained high package severity below a high floor', () => {
+  const sample = report([
+    { package: 'wrapper', severity: 'high', via: ['dep', { id: 'GHSA-aaaa-bbbb-cccc', severity: 'low' }] },
+    { package: 'dep', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }
+  ])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity.*(inconsistent|reconcil)/i)
+})
+
+test('a cycle cannot justify high severity solely by circular package claims', () => {
+  const sample = report([
+    { package: 'a', severity: 'high', via: ['b', { id: PICOMATCH, severity: 'low' }] },
+    { package: 'b', severity: 'high', via: ['a'] }
+  ])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity.*inconsistent/i)
+})
+
+test('severity propagates to a fixed point when a later cause raises a cycle', () => {
+  const sample = report([
+    { package: 'a', severity: 'high', via: ['b', 'c'] },
+    { package: 'b', severity: 'high', via: ['a', { id: PICOMATCH, severity: 'low' }] },
+    { package: 'c', severity: 'high', via: [{ id: 'GHSA-aaaa-bbbb-cccc', severity: 'high' }] }
+  ])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /GHSA-aaaa-bbbb-cccc c: not in the allowlist/)
+  assert.doesNotMatch(out, /severity.*inconsistent/i)
+})
+
+test('a high advisory explains a high cycle without inventing exemption scope', () => {
+  const sample = report([
+    { package: 'a', severity: 'high', via: ['b'] },
+    { package: 'b', severity: 'high', via: ['a', { id: PICOMATCH }] }
+  ])
+  const exemptions = [exemption({ packages: ['a'] })]
+  const { code, out } = run(repo({ report: sample, prodReport: report(), exemptions }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, new RegExp(`${PICOMATCH} b: not in the allowlist`))
+  assert.doesNotMatch(out, /severity.*inconsistent/i)
+})
+
+test('a referenced package may have higher severity than a particular metavulnerability', () => {
+  const sample = report([
+    { package: 'wrapper', severity: 'low', via: ['dep', { id: 'GHSA-aaaa-bbbb-cccc', severity: 'low' }] },
+    { package: 'dep', severity: 'high', via: [{ id: PICOMATCH, severity: 'high' }, { id: 'GHSA-dddd-eeee-ffff', severity: 'low' }] }
+  ])
+  const { code, out } = run(repo({ report: sample }), '--audit-input', 'full.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, new RegExp(`${PICOMATCH} dep: not in the allowlist`))
+  assert.doesNotMatch(out, /severity.*inconsistent/i)
+})
+
+test('a production report cannot hide unexplained indirect severity', () => {
+  const full = report([{ package: 'dep', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }])
+  const prod = report([
+    { package: 'wrapper', severity: 'high', via: ['dep'] },
+    { package: 'dep', severity: 'low', via: [{ id: PICOMATCH, severity: 'low' }] }
+  ])
+  const { code, out } = run(repo({ report: full, prodReport: prod, exemptions: [exemption({ packages: ['dep'] })] }), '--audit-input', 'full.json', '--audit-prod-input', 'prod.json', '--audit-level', 'high')
+  assert.equal(code, 1, out)
+  assert.match(out, /severity.*inconsistent/i)
+})
+
 test('duplicate advisory ids retain the highest severity regardless of order', () => {
   const cwd = repo({ report: report([{ package: 'a', via: [{ id: PICOMATCH, severity: 'low' }, { id: PICOMATCH, severity: 'high' }] }]) })
   const { code, out } = run(cwd, '--audit-input', 'full.json', '--audit-level', 'high')
