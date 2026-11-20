@@ -1581,7 +1581,11 @@ const NPM_GLOBAL_SHIM_V7 = NPM_GLOBAL_SHIM
 
 function windowsNpm(argv, options) {
   const pathKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'path')
-  const dirs = (options.env[pathKey] || '').split(';').filter(Boolean).map((dir) => dir.replace(/^"(.*)"$/, '$1'))
+  const pathValue = options.env[pathKey] || ''
+  // Quoted entries can contain separators, and lookup semantics vary by caller.
+  // Never silently skip a candidate while guessing how Windows interprets them.
+  if (pathValue.includes('"')) gateFailure('unsupported Windows PATH containing quotes; use unquoted entries without semicolons')
+  const dirs = pathValue.split(';').filter(Boolean)
   // A custom executable extension can change command resolution; never skip an
   // earlier candidate and accidentally audit with a different npm.
   const extKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'pathext')

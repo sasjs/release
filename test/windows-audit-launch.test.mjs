@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, copyFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -54,6 +54,60 @@ function install(root, name, code) {
 }
 
 const clean = { auditReportVersion: 2, vulnerabilities: {}, metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 }, dependencies: {} } }
+
+for (const scenario of [
+  { label: 'quoted semicolon before npm', kind: 'npm', path: (first, later) => `"${first}";${later}` },
+  { label: 'unclosed quote before npm', kind: 'npm', path: (first, later) => `"${first};${later}` },
+  { label: 'quoted semicolon before fallback Node', kind: 'node', path: (first, later, bin) => `${bin};"${first}";${later}` },
+  { label: 'stray closing quote before fallback Node', kind: 'node', path: (first, later, bin) => `${bin};${first}";${later}` }
+]) {
+  test(`Windows rejects ambiguous PATH: ${scenario.label}`, (t) => {
+    const { root, project, env } = fixture(t)
+    const code = `require('fs').writeFileSync(process.env.MARKER, process.execPath); console.log(${JSON.stringify(JSON.stringify(clean))})`
+    const first = scenario.kind === 'npm' ? install(root, 'first;inner', code) : join(root, 'first;inner')
+    const later = scenario.kind === 'npm' ? install(root, 'later', code) : join(root, 'later')
+    let bin
+    if (scenario.kind === 'node') {
+      bin = install(root, 'shim', code)
+      rmSync(join(bin, 'node.exe'))
+      mkdirSync(first); mkdirSync(later)
+      copyFileSync(process.execPath, join(first, 'node.exe'))
+      copyFileSync(process.execPath, join(later, 'node.exe'))
+    }
+    Object.assign(env, { PATH: scenario.path(first, later, bin), NoDefaultCurrentDirectoryInExePath: '1', TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}\n${existsSync(env.MARKER) ? `wrong launcher ran: ${readFileSync(env.MARKER, 'utf8')}` : 'no launcher ran'}`)
+    assert.match(result.stderr, /unsupported Windows PATH.*quot/i)
+    assert.throws(() => readFileSync(env.MARKER), { code: 'ENOENT' })
+  })
+}
+
+test('Windows rejects a normally quoted PATH entry rather than assuming cmd semantics', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'plain', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  Object.assign(env, { PATH: `"${bin}"`, NoDefaultCurrentDirectoryInExePath: '1', TEST_PREFIX: join(root, 'absent') })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /unsupported Windows PATH.*quot/i)
+})
+
+test('Windows cmd resolves quoted PATH entries in an isolated reference probe', { skip: process.platform !== 'win32' }, (t) => {
+  const { root, project, env } = fixture(t)
+  const later = join(root, 'later-probe')
+  mkdirSync(later)
+  writeFileSync(join(later, 'pathprobe.cmd'), '@echo LATER\r\n')
+  const cmd = process.env.ComSpec || process.env.COMSPEC || join(process.env.SystemRoot, 'System32', 'cmd.exe')
+  for (const name of ['first probe', 'first;probe']) {
+    const first = join(root, name)
+    mkdirSync(first)
+    writeFileSync(join(first, 'pathprobe.cmd'), '@echo FIRST\r\n')
+    Object.assign(env, { PATH: `"${first}";${later}`, PATHEXT: '.CMD', NoDefaultCurrentDirectoryInExePath: '1' })
+    // Fixed test-only command: no user-controlled arguments are passed to cmd.
+    const result = spawnSync(cmd, ['/d', '/c', 'pathprobe'], { cwd: project, env, encoding: 'utf8' })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.equal(result.stdout.trim(), 'FIRST', name)
+  }
+})
 
 test('Windows honours NoDefaultCurrentDirectoryInExePath instead of executing project-local npm', (t) => {
   const { root, project, env } = fixture(t)
