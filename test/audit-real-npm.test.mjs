@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,6 +9,70 @@ import { fileURLToPath } from 'node:url'
 
 const CLI = process.env.SASJS_RELEASE_ENTRY || fileURLToPath(new URL('../release.mjs', import.meta.url))
 const names = ['scope-prod', 'scope-optional', 'scope-dev', 'scope-peer']
+
+function writeIdentityPreload(preload) {
+  writeFileSync(preload, `const fs = require('node:fs'); const path = require('node:path'); if (process.argv[1] && path.basename(process.argv[1]).toLowerCase() === 'npm-cli.js') fs.appendFileSync(process.env.SASJS_NPM_IDENTITY_LOG, fs.realpathSync(process.argv[1]) + '\\n')\n`)
+}
+
+// NODE_OPTIONS parses backslashes as escapes within quoted arguments, on every OS.
+function preloadOption(preload) {
+  return `--require=${JSON.stringify(preload)}`
+}
+
+test('npm identity preload records separate CLI paths on separate lines', async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), 'npm-identity-'))
+  t.after(() => rmSync(cwd, { recursive: true, force: true }))
+  // Windows paths contain backslashes; make the NODE_OPTIONS parser exercise
+  // those characters on POSIX too, where backslash is a valid filename character.
+  const preloadDir = join(cwd, process.platform === 'win32' ? 'preload dir' : 'preload\\dir with spaces')
+  mkdirSync(preloadDir)
+  const preload = join(preloadDir, 'identity preload.cjs')
+  const identityLog = join(cwd, 'identity.log')
+  writeIdentityPreload(preload)
+  const env = { ...process.env, NODE_OPTIONS: preloadOption(preload), SASJS_NPM_IDENTITY_LOG: identityLog }
+  const paths = ['first', 'second'].map((dir) => {
+    mkdirSync(join(cwd, dir))
+    const cli = join(cwd, dir, 'npm-cli.js')
+    writeFileSync(cli, '')
+    return cli
+  })
+  for (const cli of paths) {
+    const result = await execute(process.execPath, [cli], { cwd, env })
+    assert.equal(result.code, 0, result.stderr)
+  }
+  assert.equal(readFileSync(identityLog, 'utf8'), paths.map((cli) => `${realpathSync(cli)}\n`).join(''))
+})
+
+test('real npm selected on PATH passes a clean audit against loopback', async (t) => {
+  if (process.env.SASJS_WINDOWS_EXPECTED_NPM_DIR) {
+    const selected = (Object.entries(process.env).find(([key]) => key.toLowerCase() === 'path')?.[1] || '').split(';')[0]
+    assert.equal(selected.toLowerCase(), process.env.SASJS_WINDOWS_EXPECTED_NPM_DIR.toLowerCase(), 'the expected npm directory must be first on PATH')
+  }
+  const { cwd, env, requests } = await fixture(t, { clean: true })
+  let identityLog
+  if (process.platform === 'win32' && process.env.SASJS_WINDOWS_EXPECTED_NPM_DIR) {
+    identityLog = join(cwd, 'npm-identity.log')
+    const preload = join(cwd, 'npm-identity.cjs')
+    writeIdentityPreload(preload)
+    Object.assign(env, { NODE_OPTIONS: preloadOption(preload), SASJS_NPM_IDENTITY_LOG: identityLog })
+    // Ask the actual cmd shim which npm CLI it runs under the same cwd/config.
+    const reference = await execute(env.ComSpec || env.COMSPEC || 'cmd.exe', ['/d', '/s', '/c', 'npm --version'], { cwd, env })
+    assert.equal(reference.code, 0, `${reference.stdout}\n${reference.stderr}`)
+    const referenceCli = readFileSync(identityLog, 'utf8').trim().split(/\r?\n/)
+    assert.equal(referenceCli.length, 1, `expected one reference npm CLI: ${referenceCli}`)
+    env.SASJS_REFERENCE_NPM_CLI = referenceCli[0]
+    rmSync(identityLog)
+  }
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`)
+  if (identityLog) {
+    const actualCli = readFileSync(identityLog, 'utf8').trim().split(/\r?\n/)
+    assert.deepEqual(actualCli, [env.SASJS_REFERENCE_NPM_CLI], 'audit must use the actual cmd-selected npm CLI')
+  }
+  assert.match(result.stdout, /^audited=true$/m)
+  assert.ok(requests.some((request) => request.url === '/-/npm/v1/security/advisories/bulk'), `${result.stdout}\n${result.stderr}`)
+  assert.ok(existsSync(join(cwd, 'actual.json')), `${result.stdout}\n${result.stderr}`)
+})
 
 function execute(command, args, options) {
   return new Promise((resolve, reject) => {
@@ -21,7 +85,7 @@ function execute(command, args, options) {
   })
 }
 
-async function fixture(t, { duplicateSource = false } = {}) {
+async function fixture(t, { duplicateSource = false, clean = false } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'audit-real-npm-'))
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
   const requests = []
@@ -37,7 +101,7 @@ async function fixture(t, { duplicateSource = false } = {}) {
       if (duplicateSource) advisories['scope-dev'].push({ ...advisories['scope-dev'][0], id: 10099, title: 'second advisory' })
       res.writeHead(200, { 'content-type': 'application/json' })
       const name = decodeURIComponent(req.url.slice(1))
-      res.end(JSON.stringify(req.url.startsWith('/-/') ? advisories : {
+      res.end(JSON.stringify(req.url.startsWith('/-/') ? (clean ? {} : advisories) : {
         name, 'dist-tags': { latest: '1.0.0' }, versions: { '1.0.0': { name, version: '1.0.0' } }, time: { modified: '2020-01-01T00:00:00.000Z' }
       }))
     })
