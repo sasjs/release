@@ -127,6 +127,53 @@ test('Windows rejects a normally quoted PATH entry rather than assuming cmd sema
   assert.match(result.stderr, /unsupported Windows PATH.*quot/i)
 })
 
+// An empty PATH segment is the current directory to cmd.exe, and whether the
+// current directory is searched at all depends on NoDefaultCurrentDirectoryInExePath
+// - so an empty segment cannot be mapped to a directory without guessing which
+// rule applies. The gate must fail closed, naming the empty entry.
+function installProjectNpm(project, identity) {
+  writeFileSync(join(project, 'npm.cmd'), canonical)
+  copyFileSync(process.execPath, join(project, 'node.exe'))
+  const js = join(project, 'node_modules', 'npm', 'bin')
+  mkdirSync(js, { recursive: true })
+  writeFileSync(join(js, 'npm-prefix.js'), `require('fs').writeFileSync(process.env.MARKER, 'project prefix ran'); console.log(process.env.TEST_PREFIX)`)
+  writeFileSync(join(js, 'npm-cli.js'), `require('fs').writeFileSync(process.env.MARKER, ${JSON.stringify(identity)}); console.log(${JSON.stringify(JSON.stringify(clean))})`)
+}
+
+for (const scenario of [
+  { label: 'an empty entry before the trusted npm with NoDefaultCurrentDirectoryInExePath', flag: '1', path: (bin, later) => `;${bin}` },
+  { label: 'an empty entry before the trusted npm by default', flag: undefined, path: (bin, later) => `;${bin}` },
+  { label: 'a trailing empty entry', flag: undefined, path: (bin, later) => `${bin};` },
+  { label: 'doubled semicolons between entries', flag: '1', path: (bin, later) => `${bin};;${later}` }
+]) {
+  test(`Windows fails closed on ${scenario.label}`, (t) => {
+    const { root, project, env } = fixture(t)
+    const code = `require('fs').writeFileSync(process.env.MARKER, 'trusted npm ran'); console.log(${JSON.stringify(JSON.stringify(clean))})`
+    const bin = install(root, 'trusted', code)
+    const later = install(root, 'later', code)
+    // A project-local npm reachable only through the empty entry's
+    // current-directory meaning is exactly what the gate must not guess about.
+    installProjectNpm(project, 'project npm ran')
+    Object.assign(env, { PATH: scenario.path(bin, later), TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+    if (scenario.flag !== undefined) env.NoDefaultCurrentDirectoryInExePath = scenario.flag
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}\n${existsSync(env.MARKER) ? `wrong launcher ran: ${readFileSync(env.MARKER, 'utf8')}` : 'no launcher ran'}`)
+    assert.match(result.stderr, /unsupported Windows PATH containing an empty entry/i)
+    assert.throws(() => readFileSync(env.MARKER), { code: 'ENOENT' })
+  })
+}
+
+test('Windows audit is unaffected by a PATH without empty entries', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'trusted', `require('fs').writeFileSync(process.env.MARKER, 'bin'); console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  const later = install(root, 'later', `require('fs').writeFileSync(process.env.MARKER, 'later'); console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  installProjectNpm(project, 'project')
+  Object.assign(env, { PATH: [bin, later].join(';'), NoDefaultCurrentDirectoryInExePath: '1', TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.equal(readFileSync(env.MARKER, 'utf8'), 'bin')
+})
+
 test('Windows cmd resolves quoted PATH entries in an isolated reference probe', { skip: process.platform !== 'win32' }, (t) => {
   const { root, project, env } = fixture(t)
   const later = join(root, 'later-probe')

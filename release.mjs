@@ -1610,6 +1610,11 @@ function windowsNpm(argv, options) {
   // Quoted entries can contain separators, and lookup semantics vary by caller.
   // Never silently skip a candidate while guessing how Windows interprets them.
   if (pathValue.includes('"')) gateFailure('unsupported Windows PATH containing quotes; use unquoted entries without semicolons')
+  // An empty PATH segment is the current directory to cmd.exe. Whether the
+  // current directory is searched at all depends on NoDefaultCurrentDirectoryInExePath,
+  // so an empty segment cannot be mapped to a directory without guessing which
+  // rule applies - fail closed instead of auditing with a different npm.
+  if (pathValue.split(';').some((entry) => entry === '')) gateFailure('unsupported Windows PATH containing an empty entry; write the directory explicitly')
   const dirs = pathValue.split(';').filter(Boolean)
   // A custom executable extension can change command resolution; never skip an
   // earlier candidate and accidentally audit with a different npm.
