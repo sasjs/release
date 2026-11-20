@@ -264,6 +264,28 @@ const mutations = [
     name: 'a package that ships dependencies passes the assertion',
     find: `  if (shipped.length)`,
     replace: `  if (false)`
+  },
+  {
+    name: 'shim blank-line tolerance is dropped',
+    find: `  return text.replace(/\\r\\n/g, '\\n').split('\\n').filter((line) => !/^[ \\t]*$/.test(line)).join('\\n').toLowerCase()`,
+    replace: `  return text.replace(/\\r\\n/g, '\\n')`
+  },
+  {
+    name: 'any Windows npm shim is accepted and executed',
+    find: `  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)
+  if (!distributionShim && ![NPM_GLOBAL_SHIM, NPM_GLOBAL_SHIM_V7].some((template) => contents === normalizeNpmShim(template)))`,
+    replace: `  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)
+  if (false)`
+  },
+  {
+    name: 'the distribution prefix selection runs for every shim',
+    find: `  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)`,
+    replace: `  const distributionShim = true`
+  },
+  {
+    name: 'the distribution shim skips the global-prefix CLI',
+    find: `  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)`,
+    replace: `  const distributionShim = false`
   }
 ]
 

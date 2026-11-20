@@ -1575,9 +1575,34 @@ IF EXIST "%dp0%\\node.exe" (
 
 endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\\node_modules\\npm\\bin\\npm-cli.js" %*`
 
-const NPM_GLOBAL_SHIM_V7 = NPM_GLOBAL_SHIM
-  .replace('  SET "_prog=node"\n)', '  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;.JS;=;%\n)')
-  .replace('set PATHEXT=%PATHEXT:;.JS;=;% & ', '')
+// Keep this independent of the other cmd-shim version: changing one template
+// must not silently change or remove support for the other.
+const NPM_GLOBAL_SHIM_V7 = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\npm\\bin\\npm-cli.js" %*`
+
+// Ignore only differences that cannot change what the shim executes:
+// CRLF vs LF, extra or missing empty/space-only/tab-only lines, and letter
+// case (cmd.exe treats commands, labels, variable names and paths
+// case-insensitively). In particular, never fold whitespace within a line,
+// comments, metacharacters, or substitutions into an accepted template.
+function normalizeNpmShim(text) {
+  return text.replace(/\r\n/g, '\n').split('\n').filter((line) => !/^[ \t]*$/.test(line)).join('\n').toLowerCase()
+}
 
 function windowsNpm(argv, options) {
   const pathKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'path')
@@ -1610,10 +1635,12 @@ function windowsNpm(argv, options) {
   }
   if (!shim) gateFailure('Windows npm.cmd was not found on PATH; install a standard Node/npm distribution')
   let contents
-  try { contents = readFileSync(shim, 'utf8').replace(/\r\n/g, '\n').trimEnd() } catch (error) {
+  try { contents = normalizeNpmShim(readFileSync(shim, 'utf8')) } catch (error) {
     gateFailure(`cannot read Windows npm shim ${shim}: ${error.message}`)
   }
-  if (![NPM_WINDOWS_SHIM, NPM_GLOBAL_SHIM, NPM_GLOBAL_SHIM_V7].includes(contents)) gateFailure(`unsupported Windows npm shim ${shim}; use a standard npm.cmd`)
+  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)
+  if (!distributionShim && ![NPM_GLOBAL_SHIM, NPM_GLOBAL_SHIM_V7].some((template) => contents === normalizeNpmShim(template)))
+    gateFailure(`unsupported Windows npm shim ${shim}; use a standard npm.cmd`)
   const bin = dirname(shim)
   let node = join(bin, 'node.exe')
   if (!existsSync(node)) {
@@ -1633,7 +1660,7 @@ function windowsNpm(argv, options) {
   if (!node) gateFailure(`Windows npm shim ${shim} needs node.exe on PATH`)
   const npmBin = join(bin, 'node_modules', 'npm', 'bin')
   let cli = join(npmBin, 'npm-cli.js')
-  if (contents === NPM_WINDOWS_SHIM) {
+  if (distributionShim) {
     const prefix = spawnSync(node, [join(npmBin, 'npm-prefix.js')], options)
     if (prefix.error || prefix.signal || prefix.status !== 0 || !String(prefix.stdout || '').trim())
       gateFailure(`Windows npm prefix lookup failed for ${shim}: ${prefix.error?.message || prefix.stderr || `exit ${prefix.status}`}`)

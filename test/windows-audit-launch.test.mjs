@@ -29,6 +29,42 @@ IF EXIST "%NPM_PREFIX_NPM_CLI_JS%" (
 "%NODE_EXE%" "%NPM_CLI_JS%" %*
 `
 
+const globalShim = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\\node_modules\\npm\\bin\\npm-cli.js" %*
+`
+const globalShimV7 = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\npm\\bin\\npm-cli.js" %*
+`
+
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'audit win & percent% '))
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -248,6 +284,89 @@ test('Windows fails closed for a tampered shim instead of interpreting it', (t) 
   assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
   assert.match(result.stderr, /unsupported Windows npm shim/)
 })
+
+test('Windows distribution tolerates blank lines and CRLF while preserving prefix selection', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'distribution-format', 'process.exit(73)')
+  const prefix = join(root, 'prefix')
+  const js = join(prefix, 'node_modules', 'npm', 'bin')
+  mkdirSync(js, { recursive: true })
+  writeFileSync(join(js, 'npm-cli.js'), `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  const formatted = `\r\n  \t\r\n${canonical.replaceAll('\n', '\r\n\t \r\n')}\r\n`
+  writeFileSync(join(bin, 'npm.cmd'), formatted)
+  Object.assign(env, { PATH: bin, TEST_PREFIX: prefix })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+})
+
+for (const [label, shim] of [['legacy', globalShim], ['v7', globalShimV7]]) {
+  test(`Windows ${label} global shim tolerates blank lines and does not run the prefix script`, (t) => {
+    const { root, project, env } = fixture(t)
+    const bin = install(root, `global-${label}`, `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+    writeFileSync(join(bin, 'npm.cmd'), `\n\t\n${shim.replaceAll('\n', '\r\n \t\r\n')}`)
+    writeFileSync(join(bin, 'node_modules/npm/bin/npm-prefix.js'), `require('fs').writeFileSync(process.env.MARKER, 'prefix ran'); process.exit(77)`)
+    Object.assign(env, { PATH: bin, MARKER: join(root, 'marker') })
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.equal(existsSync(env.MARKER), false)
+  })
+}
+
+test('Windows distribution tolerates a case-only npm.cmd without changing what runs', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'distribution-case', 'process.exit(73)')
+  const prefix = join(root, 'prefix')
+  const js = join(prefix, 'node_modules', 'npm', 'bin')
+  mkdirSync(js, { recursive: true })
+  writeFileSync(join(js, 'npm-cli.js'), `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  // a newer npm may print the same shim in a different case; cmd.exe executes
+  // commands, labels, variables and paths case-insensitively, so this is the
+  // same launcher - and it must still select the prefix CLI
+  writeFileSync(join(bin, 'npm.cmd'), canonical.replace(/ECHO/i, 'echo').replace('SETLOCAL', 'setlocal').replace(/NPM_CLI_JS/g, 'npm_cli_js').replace(/NODE_EXE/g, 'node_exe'))
+  Object.assign(env, { PATH: bin, TEST_PREFIX: prefix })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+})
+
+test('Windows v7 global shim remains supported if the legacy template changes', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'global-v7-independent', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  writeFileSync(join(bin, 'npm.cmd'), globalShimV7)
+  const source = readFileSync(CLI, 'utf8')
+  const oldLine = '  SET "_prog=node"\n)'
+  assert.equal(source.split(oldLine).length, 2, 'legacy template mutation must apply exactly once')
+  const mutated = source.replace(oldLine, '  SET "_prog=node"\n  REM changed legacy shim\n)')
+  const entry = join(root, 'mutated-release.mjs')
+  writeFileSync(entry, mutated)
+  Object.assign(env, { PATH: bin })
+  const result = spawnSync(process.execPath, [entry, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+})
+
+for (const [label, mutate] of [
+  ['appended command', (s) => `${s}\nECHO injected\n`],
+  ['chained command', (s) => s.replace('SETLOCAL', 'SETLOCAL & echo injected')],
+  ['command substitution', (s) => s.replace('CALL "%NODE_EXE%"', 'CALL "%NODE_EXE%" & echo injected')],
+  ['changed cli path', (s) => s.replace('npm-cli.js', 'evil-cli.js')],
+  ['removed prefix selection', (s) => s.replace('  SET "NPM_CLI_JS=%NPM_PREFIX_NPM_CLI_JS%"', '  REM no prefix')],
+  ['line continuation', (s) => s.replace('SETLOCAL\n', 'SETLOCAL ^\n')],
+  ['invisible control character', (s) => `${s}\u001a`],
+  ['additional comment', (s) => `REM extra\n${s}`],
+  ['bare carriage return', (s) => s.replace('SETLOCAL', 'SET\rLOCAL')]
+]) {
+  test(`Windows rejects shim ${label} before running prefix or CLI`, (t) => {
+    const { root, project, env } = fixture(t)
+    const code = `require('fs').writeFileSync(process.env.MARKER, 'cli ran'); console.log(${JSON.stringify(JSON.stringify(clean))})`
+    const bin = install(root, 'bad', code)
+    writeFileSync(join(bin, 'npm.cmd'), mutate(canonical))
+    writeFileSync(join(bin, 'node_modules/npm/bin/npm-prefix.js'), `require('fs').writeFileSync(process.env.MARKER, 'prefix ran'); console.log(process.env.TEST_PREFIX)`)
+    Object.assign(env, { PATH: bin, TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stderr, /unsupported Windows npm shim/)
+    assert.equal(existsSync(env.MARKER), false)
+  })
+}
 
 test('Windows audit preserves workspace selectors as literal arguments', (t) => {
   const { root, project, env } = fixture(t)
