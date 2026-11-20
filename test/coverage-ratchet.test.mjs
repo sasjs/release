@@ -297,7 +297,7 @@ test('a comment that cannot be written is a usage error, not a verdict', async (
   const { code, out } = await run(cwd, '--coverage-ratchet', '--coverage-markdown', 'blocker/comment.md')
 
   assert.equal(code, 2)
-  assert.match(out, /the coverage comment could not be written to .*blocker[/\\]comment\.md/)
+  assert.match(out, /--coverage-markdown: .*blocker[/\\]comment\.md could not be written/)
 })
 
 test('the comment carries the marker, the note and one row per metric', async () => {

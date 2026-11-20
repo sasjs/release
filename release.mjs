@@ -1970,7 +1970,8 @@ async function auditGate() {
   if (reportPath) {
     if (flag('dry-run')) console.log(`would write the audit report to ${reportPath}`)
     else
-      writeFileSync(
+      writeNamed(
+        'audit-report',
         isAbsolute(reportPath) ? reportPath : join(cwd, reportPath),
         `${JSON.stringify(judged, null, 2)}\n`
       )
@@ -2239,12 +2240,7 @@ function coverageRatchet() {
       console.log(`would write the coverage comment to ${commentPath}`)
       return
     }
-    try {
-      mkdirSync(dirname(target), { recursive: true })
-      writeFileSync(target, `${body}\n`)
-    } catch (error) {
-      fail(`--coverage-ratchet: the coverage comment could not be written to ${target}: ${error.message}`)
-    }
+    writeNamed('coverage-markdown', target, `${body}\n`)
   }
 
   console.log('Coverage ratchet')
@@ -2618,7 +2614,7 @@ async function main() {
   }
 
   const notesFile = arg('notes-file')
-  if (notesFile) writeFileSync(notesFile, `${body}\n`)
+  if (notesFile) writeNamed('notes-file', notesFile, `${body}\n`)
 
   // Checked before anything claims a release happened: `released=true` in the output
   // file is what the calling workflow believes, and a run that then dies on a missing
@@ -2680,6 +2676,25 @@ async function main() {
 }
 
 /**
+ * Write a file the caller named, without assuming its directory exists.
+ *
+ * Four options take a path - `--audit-report`, `--notes-file`, `--coverage-markdown`
+ * and `--output` - and every one of them is written into a caller's workspace, at a
+ * path a workflow computed. A directory that is not there is a configuration
+ * detail rather than a verdict: create it, and refuse by naming the option (exit 2)
+ * instead of leaving a raw ENOENT at an exit code the gates use for their findings.
+ */
+function writeNamed(option, path, body, { append = false } = {}) {
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    if (append) appendFileSync(path, body)
+    else writeFileSync(path, body)
+  } catch (error) {
+    fail(`--${option}: ${path} could not be written: ${error.message}`)
+  }
+}
+
+/**
  * The result, on stdout and - when asked - as key=value lines a workflow can
  * feed to whatever protocol it has (GITHUB_OUTPUT, GITHUB_ENV, a dotenv
  * artifact, or nothing at all).
@@ -2688,7 +2703,7 @@ function output(values) {
   const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`)
   for (const line of lines) console.log(line)
   const path = arg('output')
-  if (path) appendFileSync(path, `${lines.join('\n')}\n`)
+  if (path) writeNamed('output', path, `${lines.join('\n')}\n`, { append: true })
 }
 
 try {
