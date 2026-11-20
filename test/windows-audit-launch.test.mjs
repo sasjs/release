@@ -333,6 +333,9 @@ test('Windows v7 global shim remains supported if the legacy template changes', 
   const bin = install(root, 'global-v7-independent', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
   writeFileSync(join(bin, 'npm.cmd'), globalShimV7)
   const source = readFileSync(CLI, 'utf8')
+  // Mutate the legacy template only: an inserted comment inside its ELSE arm.
+  // The v7 template's ELSE arm has one more line, so the legacy arm's closing
+  // paren directly after SET "_prog=node" targets exactly the legacy copy.
   const oldLine = '  SET "_prog=node"\n)'
   assert.equal(source.split(oldLine).length, 2, 'legacy template mutation must apply exactly once')
   const mutated = source.replace(oldLine, '  SET "_prog=node"\n  REM changed legacy shim\n)')
