@@ -336,9 +336,12 @@ test('Windows v7 global shim remains supported if the legacy template changes', 
   // Mutate the legacy template only: an inserted comment inside its ELSE arm.
   // The v7 template's ELSE arm has one more line, so the legacy arm's closing
   // paren directly after SET "_prog=node" targets exactly the legacy copy.
+  // The checkout may carry either line ending, so match both.
   const oldLine = '  SET "_prog=node"\n)'
-  assert.equal(source.split(oldLine).length, 2, 'legacy template mutation must apply exactly once')
-  const mutated = source.replace(oldLine, '  SET "_prog=node"\n  REM changed legacy shim\n)')
+  const crlf = source.includes('\r\n')
+  const matchLine = crlf ? oldLine.replace(/\n/g, '\r\n') : oldLine
+  assert.equal(source.split(matchLine).length, 2, 'legacy template mutation must apply exactly once')
+  const mutated = source.replace(matchLine, matchLine.replace('\n)', `${crlf ? '\r\n' : '\n'}  REM changed legacy shim${crlf ? '\r\n' : '\n'})`))
   const entry = join(root, 'mutated-release.mjs')
   writeFileSync(entry, mutated)
   Object.assign(env, { PATH: bin })
