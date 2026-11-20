@@ -163,6 +163,28 @@ for (const scenario of [
   })
 }
 
+// A missing PATH-named key is not an empty PATH: reading the missing key as ''
+// once reported an empty entry - advice about an entry that does not exist. The
+// gate must name the real problem. An empty-string PATH is the other case: the
+// key exists, and the empty-entry gate above already refuses it.
+test('Windows fails closed when the environment has no PATH key in any case', (t) => {
+  const { project, env } = fixture(t)
+  assert.equal(Object.keys(env).filter((key) => key.toLowerCase() === 'path').length, 0, 'the fixture must provide an environment with no PATH-named key in any case')
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /Windows audit environment has no PATH; npm cannot be located without it/)
+})
+
+for (const key of ['PATH', 'Path']) {
+  test(`Windows reports an empty entry, not a missing PATH, for an empty-string ${key}`, (t) => {
+    const { project, env } = fixture(t)
+    Object.assign(env, { [key]: '' })
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stderr, /unsupported Windows PATH containing an empty entry/)
+  })
+}
+
 test('Windows audit is unaffected by a PATH without empty entries', (t) => {
   const { root, project, env } = fixture(t)
   const bin = install(root, 'trusted', `require('fs').writeFileSync(process.env.MARKER, 'bin'); console.log(${JSON.stringify(JSON.stringify(clean))})`)

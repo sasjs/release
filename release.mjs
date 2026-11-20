@@ -1606,7 +1606,8 @@ function normalizeNpmShim(text) {
 
 function windowsNpm(argv, options) {
   const pathKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'path')
-  const pathValue = options.env[pathKey] || ''
+  if (!pathKey) gateFailure('Windows audit environment has no PATH; npm cannot be located without it')
+  const pathValue = options.env[pathKey]
   // Quoted entries can contain separators, and lookup semantics vary by caller.
   // Never silently skip a candidate while guessing how Windows interprets them.
   if (pathValue.includes('"')) gateFailure('unsupported Windows PATH containing quotes; use unquoted entries without semicolons')
