@@ -1534,6 +1534,95 @@ function auditFindings(report) {
   return [...seen.values()]
 }
 
+// Windows cannot spawn .cmd files directly. Accept only known npm distribution
+// and generated global shims, then launch their CLI directly; never interpret
+// batch text or pass workspace names through cmd.exe.
+const NPM_WINDOWS_SHIM = `:: Created by npm, please don't edit manually.
+@ECHO OFF
+
+SETLOCAL
+
+SET "NODE_EXE=%~dp0\\node.exe"
+IF NOT EXIST "%NODE_EXE%" (
+  SET "NODE_EXE=node"
+)
+
+SET "NPM_PREFIX_JS=%~dp0\\node_modules\\npm\\bin\\npm-prefix.js"
+SET "NPM_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npm-cli.js"
+FOR /F "delims=" %%F IN ('CALL "%NODE_EXE%" "%NPM_PREFIX_JS%"') DO (
+  SET "NPM_PREFIX_NPM_CLI_JS=%%F\\node_modules\\npm\\bin\\npm-cli.js"
+)
+IF EXIST "%NPM_PREFIX_NPM_CLI_JS%" (
+  SET "NPM_CLI_JS=%NPM_PREFIX_NPM_CLI_JS%"
+)
+
+"%NODE_EXE%" "%NPM_CLI_JS%" %*`
+
+const NPM_GLOBAL_SHIM = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\\node_modules\\npm\\bin\\npm-cli.js" %*`
+
+const NPM_GLOBAL_SHIM_V7 = NPM_GLOBAL_SHIM
+  .replace('  SET "_prog=node"\n)', '  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;.JS;=;%\n)')
+  .replace('set PATHEXT=%PATHEXT:;.JS;=;% & ', '')
+
+function windowsNpm(argv, options) {
+  const pathKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'path')
+  const dirs = (options.env[pathKey] || '').split(';').filter(Boolean).map((dir) => dir.replace(/^"(.*)"$/, '$1'))
+  // A custom executable extension can change command resolution; never skip an
+  // earlier candidate and accidentally audit with a different npm.
+  const extKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'pathext')
+  const extensions = (options.env[extKey] || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((ext) => ext.toLowerCase())
+  if (extensions.some((ext) => !/^\.[A-Za-z0-9]+$/.test(ext))) gateFailure('unsupported Windows PATHEXT')
+  let shim
+  for (const dir of [options.cwd, ...dirs]) {
+    for (const ext of extensions) {
+      const file = join(resolve(options.cwd, dir), `npm${ext}`)
+      if (existsSync(file)) {
+        if (ext !== '.cmd') gateFailure(`unsupported Windows npm launcher ${file}; use a standard npm.cmd`)
+        shim = file
+        break
+      }
+    }
+    if (shim) break
+  }
+  if (!shim) gateFailure('Windows npm.cmd was not found on PATH; install a standard Node/npm distribution')
+  let contents
+  try { contents = readFileSync(shim, 'utf8').replace(/\r\n/g, '\n').trimEnd() } catch (error) {
+    gateFailure(`cannot read Windows npm shim ${shim}: ${error.message}`)
+  }
+  if (![NPM_WINDOWS_SHIM, NPM_GLOBAL_SHIM, NPM_GLOBAL_SHIM_V7].includes(contents)) gateFailure(`unsupported Windows npm shim ${shim}; use a standard npm.cmd`)
+  const bin = dirname(shim)
+  const node = [join(bin, 'node.exe'), ...dirs.map((dir) => join(resolve(options.cwd, dir), 'node.exe'))].find((file) => existsSync(file))
+  if (!node) gateFailure(`Windows npm shim ${shim} needs node.exe on PATH`)
+  const npmBin = join(bin, 'node_modules', 'npm', 'bin')
+  let cli = join(npmBin, 'npm-cli.js')
+  if (contents === NPM_WINDOWS_SHIM) {
+    const prefix = spawnSync(node, [join(npmBin, 'npm-prefix.js')], options)
+    if (prefix.error || prefix.signal || prefix.status !== 0 || !String(prefix.stdout || '').trim())
+      gateFailure(`Windows npm prefix lookup failed for ${shim}: ${prefix.error?.message || prefix.stderr || `exit ${prefix.status}`}`)
+    const prefixDir = String(prefix.stdout).trim()
+    if (!isAbsolute(prefixDir) || /[\r\n]/.test(prefixDir)) gateFailure(`Windows npm prefix lookup returned an invalid path for ${shim}`)
+    const prefixCli = join(prefixDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    if (existsSync(prefixCli)) cli = prefixCli
+  }
+  if (!existsSync(cli)) gateFailure(`Windows npm CLI not found for ${shim}: ${cli}`)
+  return spawnSync(node, [cli, ...argv], options)
+}
+
 /**
  * The report to judge: `npm audit --json`, or a recorded one.
  *
@@ -1600,7 +1689,8 @@ function auditReport({ cwd, omit, input }) {
     const workspaceArgs = workspaceProject ? [...workspaceSelectors.flatMap((path) => ['--workspace', path]), '--include-workspace-root', '--workspaces'] : []
     const argv = ['audit', '--json', ...workspaceArgs, ...included.flatMap((value) => ['--include', value]),
       ...omitted.flatMap((value) => ['--omit', value])]
-    const run = spawnSync('npm', argv, { cwd: auditCwd, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    const options = { cwd: auditCwd, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
+    const run = process.platform === 'win32' ? windowsNpm(argv, options) : spawnSync('npm', argv, options)
     npmStatus = run.status
     text = run.stdout || ''
 

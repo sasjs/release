@@ -10,6 +10,19 @@ import { fileURLToPath } from 'node:url'
 const CLI = process.env.SASJS_RELEASE_ENTRY || fileURLToPath(new URL('../release.mjs', import.meta.url))
 const names = ['scope-prod', 'scope-optional', 'scope-dev', 'scope-peer']
 
+test('real npm selected on PATH passes a clean audit against loopback', async (t) => {
+  if (process.env.SASJS_WINDOWS_EXPECTED_NPM_DIR) {
+    const selected = (Object.entries(process.env).find(([key]) => key.toLowerCase() === 'path')?.[1] || '').split(';')[0]
+    assert.equal(selected.toLowerCase(), process.env.SASJS_WINDOWS_EXPECTED_NPM_DIR.toLowerCase(), 'the expected npm directory must be first on PATH')
+  }
+  const { cwd, env, requests } = await fixture(t, { clean: true })
+  const result = await execute(process.execPath, [CLI, '--repo-dir', cwd, '--audit', '--audit-report', 'actual.json'], { cwd, env })
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stdout, /^audited=true$/m)
+  assert.ok(requests.some((request) => request.url === '/-/npm/v1/security/advisories/bulk'), `${result.stdout}\n${result.stderr}`)
+  assert.ok(existsSync(join(cwd, 'actual.json')), `${result.stdout}\n${result.stderr}`)
+})
+
 function execute(command, args, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, options)
@@ -21,7 +34,7 @@ function execute(command, args, options) {
   })
 }
 
-async function fixture(t, { duplicateSource = false } = {}) {
+async function fixture(t, { duplicateSource = false, clean = false } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'audit-real-npm-'))
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
   const requests = []
@@ -37,7 +50,7 @@ async function fixture(t, { duplicateSource = false } = {}) {
       if (duplicateSource) advisories['scope-dev'].push({ ...advisories['scope-dev'][0], id: 10099, title: 'second advisory' })
       res.writeHead(200, { 'content-type': 'application/json' })
       const name = decodeURIComponent(req.url.slice(1))
-      res.end(JSON.stringify(req.url.startsWith('/-/') ? advisories : {
+      res.end(JSON.stringify(req.url.startsWith('/-/') ? (clean ? {} : advisories) : {
         name, 'dist-tags': { latest: '1.0.0' }, versions: { '1.0.0': { name, version: '1.0.0' } }, time: { modified: '2020-01-01T00:00:00.000Z' }
       }))
     })

@@ -40,6 +40,50 @@ jobs:
           test -s action.yml
           grep -q 'release.mjs' action.yml
 
+  windows-audit:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Pin npm for audit integration tests
+        shell: pwsh
+        run: |
+          $nodeDir = Split-Path (Get-Command node.exe).Source
+          $globalDir = Join-Path $env:RUNNER_TEMP 'release-npm-global'
+          if ($globalDir -eq $nodeDir) { throw 'Global npm must not overwrite the distribution npm' }
+          $env:npm_config_prefix = $globalDir
+          npm install --global --ignore-scripts npm@11.6.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm --version
+          Remove-Item Env:npm_config_prefix
+      - name: Exercise the Node distribution npm.cmd
+        shell: pwsh
+        run: |
+          $nodeDir = Split-Path (Get-Command node.exe).Source
+          $env:PATH = "$nodeDir;$env:PATH"
+          $env:SASJS_WINDOWS_EXPECTED_NPM_DIR = $nodeDir
+          Write-Host "Distribution npm.cmd: $nodeDir/npm.cmd; selected prefix determined by npm config"
+          node --test test/audit-real-npm.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Exercise globally installed npm.cmd and launch edge cases
+        shell: pwsh
+        run: |
+          $globalDir = Join-Path $env:RUNNER_TEMP 'release-npm-global'
+          if (-not (Test-Path (Join-Path $globalDir 'npm.cmd'))) { throw "Missing npm.cmd in $globalDir" }
+          $env:PATH = "$globalDir;$env:PATH"
+          $env:SASJS_WINDOWS_EXPECTED_NPM_DIR = $globalDir
+          Write-Host "Global npm.cmd: $globalDir/npm.cmd"
+          & (Join-Path $globalDir 'npm.cmd') --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test test/windows-audit-launch.test.mjs test/audit-real-npm.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   coverage:
     # lines can be executed without being checked; branches are where every defect
     # in this tool's history lived (an exact-pin pattern, a 404 treated as
