@@ -1,0 +1,104 @@
+name: Coverage baseline
+
+# The half of the coverage gate that has to run on the default branch: publish the
+# coverage summary a pull request is measured against.
+#
+# A repository that keeps this workflow as a caller states its build and nothing
+# else - the checkout, the artifact name and its retention live here, once, rather
+# than in five copies that drifted on the node version, the npm pin and whether a
+# build ran at all.
+#
+# The comparison itself is `sasjs-release --coverage-ratchet`, run by the calling
+# repository's pull request workflow against this artifact.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version the baseline is measured on
+        type: string
+        required: false
+        default: '22'
+      pre-install-command:
+        description: >-
+          How the toolchain is fixed before installing - an npm release to put on
+          PATH, or a script that verifies one. Empty means the runner's own.
+        type: string
+        required: false
+        default: ''
+      install-command:
+        description: How dependencies are installed
+        type: string
+        required: false
+        default: npm ci
+      setup-command:
+        description: >-
+          What the test run needs that is not a dependency - an OS package, a
+          generated file. Runs after the install.
+        type: string
+        required: false
+        default: ''
+      build-command:
+        description: >-
+          Build to run before the tests, for a repository whose tests import the
+          build output. Empty means none.
+        type: string
+        required: false
+        default: ''
+      test-command:
+        description: Must write coverage/coverage-summary.json
+        type: string
+        required: false
+        default: npx jest --config=jest.config.js --silent --runInBand --ci --coverage
+      timeout-minutes:
+        description: How long the run may take
+        type: number
+        required: false
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # The inputs are the calling workflow's own text, committed in the repository
+      # that calls this one - not data from a pull request - so running them is the
+      # same act as writing them in the caller.
+      - name: Fix the toolchain
+        if: inputs.pre-install-command != ''
+        run: ${{ inputs.pre-install-command }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Prepare the test run
+        if: inputs.setup-command != ''
+        run: ${{ inputs.setup-command }}
+
+      - name: Build
+        if: inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+      - name: Generate the coverage summary
+        # plain jest, not a coverage-report action: there is no pull request to
+        # comment on here, and the action's failure would skip the upload
+        run: ${{ inputs.test-command }}
+
+      - name: Publish the coverage baseline
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-summary
+          path: coverage/coverage-summary.json
+          retention-days: 90

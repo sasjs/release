@@ -72,6 +72,20 @@ const HELP = `sasjs-release - releases from conventional commits
   --audit-input <path>   read a recorded full-tree report instead of running npm
   --audit-prod-input <p> read a recorded production report (needed for a replay
                          with any exemption)
+  --coverage-ratchet     fail when any coverage metric falls below the summary
+                         published for the base branch: the half of the gate that
+                         jest's coverageThreshold cannot do
+  --coverage-head <p>    the summary this run produced
+                         (default coverage/coverage-summary.json)
+  --coverage-base <p>    the summary published for the base commit
+                         (default coverage-base/coverage-summary.json)
+  --coverage-tolerance <n>
+                         percentage points that may be lost unremarked (default 0.05)
+  --coverage-missing-baseline <f>
+                         fail|skip when the base summary is absent (default fail)
+  --coverage-markdown <p>
+                         write the comparison as a pull request comment here
+  --coverage-note <text> say where the baseline came from, in that comment
   --assert-no-dependencies
                          fail unless the installed @sasjs/release ships no
                          dependencies of its own
@@ -107,6 +121,8 @@ const known = new Set([
   'api-url', 'asset', 'asset-link', 'attach', 'audit', 'audit-config', 'audit-input',
   'audit-level', 'audit-omit', 'audit-prod-input', 'audit-report', 'audit-require-severity', 'audit-require-source', 'audit-require-packages', 'assert-no-dependencies',
   'branch', 'config', 'draft', 'dry-run', 'help', 'host',
+  'coverage-ratchet', 'coverage-head', 'coverage-base', 'coverage-tolerance',
+  'coverage-markdown', 'coverage-missing-baseline', 'coverage-note',
   'discover-publish', 'level', 'notes-file', 'output', 'paths', 'prepare-publish', 'prerelease',
   'keep-draft', 'no-assets', 'push-tag', 'show-context', 'registry', 'release', 'repo', 'repo-dir', 'republish', 'sha',
   'no-registry-lookup',
@@ -2067,6 +2083,239 @@ async function auditGate() {
 }
 
 /**
+ * The coverage ratchet.
+ *
+ * `coverageThreshold.global` in `jest.config.js` is a floor: one number that only
+ * moves when someone remembers to move it, so it either lags behind real coverage
+ * forever or fails an unrelated pull request the moment coverage slips. The half it
+ * cannot do is the comparison against the tree the pull request is diffed against -
+ * and that shell, with its baseline lookup, its tolerance and its pull request
+ * comment, was copied into five repositories.
+ *
+ * - the `coverage-baseline` workflow publishes `coverage-summary.json` as an
+ *   artifact on every push to the default branch;
+ * - a pull request compares its own summary with the one published for its base
+ *   commit, and any metric more than `--coverage-tolerance` below it fails;
+ * - an improvement passes and is reported, so the effective bar tracks the
+ *   repository without a commit;
+ * - no baseline is a failure, not a pass. A gate that silently degrades to the
+ *   fixed number is the state this exists to leave behind, so
+ *   `--coverage-missing-baseline skip` exists only for a base commit that predates
+ *   the workflow, which the caller proves by checking that the workflow file is
+ *   absent there.
+ */
+const COVERAGE_METRICS = ['statements', 'branches', 'functions', 'lines']
+const DEFAULT_COVERAGE_TOLERANCE = 0.05
+
+const coverageRound = (value) => Math.round(value * 100) / 100
+const coverageSigned = (value) => `${value > 0 ? '+' : ''}${value}`
+
+/**
+ * The `total` entry of a jest json-summary report.
+ *
+ * A file that is not there is a different answer from a file that is there and
+ * unreadable: the first is a missing baseline, which this mode has an option for,
+ * so it is checked by the caller. Everything else - invalid JSON, an object with
+ * no `total` - is a malformed report rather than a finding, and exits 2 like every
+ * other usage error, because a mistyped path must not read as a coverage drop.
+ */
+function coverageTotal(file, side) {
+  let report
+
+  try {
+    report = JSON.parse(readFileSync(file, 'utf8'))
+  } catch (error) {
+    fail(`--coverage-ratchet: the ${side} summary at ${file} could not be read: ${error.message}`)
+  }
+
+  if (!report || typeof report !== 'object' || !report.total || typeof report.total !== 'object')
+    fail(
+      `--coverage-ratchet: the ${side} summary at ${file} carries no \`total\` entry - ` +
+        'is it jest\'s json-summary report?'
+    )
+
+  return report.total
+}
+
+/**
+ * A metric's percentage, or a refusal.
+ *
+ * jest writes all four metrics, so a missing one is a malformed report rather than
+ * a metric that does not apply; skipping it would narrow the gate without saying so.
+ */
+function coveragePct(total, metric, side) {
+  const entry = total[metric]
+
+  if (!entry || typeof entry.pct !== 'number')
+    fail(
+      `--coverage-ratchet: the ${side} report has no numeric \`${metric}\` percentage - ` +
+        "jest's json-summary always carries all four, so this is a malformed report"
+    )
+
+  return entry.pct
+}
+
+/**
+ * One row per metric, with the tolerance applied to the unrounded difference:
+ * rounding first turns a 0.054pt drop into -0.05, which a 0.05 tolerance would then
+ * pass as unchanged.
+ */
+function coverageCompare(head, base, tolerance) {
+  return COVERAGE_METRICS.map((metric) => {
+    const headPct = coveragePct(head, metric, 'head')
+    const basePct = coveragePct(base, metric, 'base')
+    const delta = headPct - basePct
+
+    return {
+      metric,
+      base: basePct,
+      head: headPct,
+      delta: coverageRound(delta),
+      verdict: delta < -tolerance ? 'regressed' : delta > tolerance ? 'improved' : 'unchanged'
+    }
+  })
+}
+
+/**
+ * The comparison as a pull request comment, so the report a reviewer reads and the
+ * verdict the job acts on are one calculation rather than two. The marker lets a
+ * re-run update the same comment instead of posting a second one.
+ */
+function coverageComment({ rows, tolerance, note }) {
+  const regressions = rows.filter((row) => row.verdict === 'regressed')
+
+  const lines = [
+    '<!-- coverage-ratchet -->',
+    '## Coverage ratchet',
+    '',
+    note,
+    '',
+    '| Metric | Base | Head | Delta | |',
+    '| --- | ---: | ---: | ---: | --- |',
+    ...rows.map(
+      (row) =>
+        `| ${row.metric} | ${row.base}% | ${row.head}% | ${coverageSigned(row.delta)} | ${row.verdict} |`
+    ),
+    ''
+  ]
+
+  if (regressions.length)
+    lines.push(
+      `**${regressions.length} metric(s) below the base by more than ${tolerance}pt.** Add tests for the code that lost coverage.`,
+      '',
+      'If the drop is intended - deleted code, or a toolchain upgrade that counts differently - say why in the description, and lower `coverageThreshold` in `jest.config.js` if this repository has one.'
+    )
+  else lines.push('No metric is below the base.')
+
+  return lines.join('\n')
+}
+
+function coverageRatchet() {
+  const cwd = arg('repo-dir', process.cwd())
+  const locate = (path) => (isAbsolute(path) ? path : join(cwd, path))
+  const headFile = locate(arg('coverage-head', join('coverage', 'coverage-summary.json')))
+  const baseFile = locate(arg('coverage-base', join('coverage-base', 'coverage-summary.json')))
+  const tolerance = Number(arg('coverage-tolerance', DEFAULT_COVERAGE_TOLERANCE))
+  const missing = arg('coverage-missing-baseline', 'fail')
+  const commentPath = arg('coverage-markdown')
+  const note = arg(
+    'coverage-note',
+    'Compared against the coverage summary published for the base commit of this pull request.'
+  )
+
+  if (!Number.isFinite(tolerance) || tolerance < 0)
+    fail('--coverage-tolerance must be a non-negative number of percentage points')
+  if (!['fail', 'skip'].includes(missing))
+    fail('--coverage-missing-baseline must be fail or skip')
+
+  const writeComment = (body) => {
+    if (!commentPath) return
+    if (flag('dry-run')) {
+      console.log(`would write the coverage comment to ${commentPath}`)
+      return
+    }
+    writeFileSync(locate(commentPath), `${body}\n`)
+  }
+
+  console.log('Coverage ratchet')
+
+  if (!existsSync(baseFile)) {
+    // The dispatch hint is only worth printing with the branch it has to name, and
+    // a checkout without a remote answers with nothing rather than with a guess.
+    const branch = attempt(() =>
+      git(cwd, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
+    ).replace(/^origin\//, '')
+    const detail =
+      'The coverage-baseline workflow publishes one on every push to the default branch. ' +
+      'Check that it has run for the base commit (its artifact lasts 90 days)' +
+      (branch ? `, or dispatch it by hand:\n  gh workflow run coverage-baseline.yml --ref ${branch}` : '') +
+      '.'
+
+    if (missing === 'skip') {
+      console.log(
+        `\nNo baseline at ${baseFile}, and the base commit predates the coverage-baseline ` +
+          `workflow, so there is nothing to compare against.\n${detail}`
+      )
+      writeComment(
+        [
+          '<!-- coverage-ratchet -->',
+          '## Coverage ratchet',
+          '',
+          '**No comparison was made.** The base commit of this pull request predates the `coverage-baseline` workflow, so it has no published coverage. Every pull request based on a commit that carries the workflow is gated.'
+        ].join('\n')
+      )
+      output({ coverage: 'skipped', regressions: 0, tolerance })
+      return
+    }
+
+    console.error(
+      `\nNo baseline at ${baseFile}, so there is nothing to compare against.\n${detail}\n` +
+        'Falling back to the committed threshold here would leave the gate looser than it looks.'
+    )
+    writeComment(
+      [
+        '<!-- coverage-ratchet -->',
+        '## Coverage ratchet',
+        '',
+        '**No baseline was available, so the comparison did not run.** The `coverage-baseline` workflow publishes one on every push to the default branch; this pull request found none for its base commit.'
+      ].join('\n')
+    )
+    output({ coverage: 'missing', regressions: 0, tolerance })
+    gateFailure('no coverage baseline for the base commit, so coverage could not be compared')
+  }
+
+  const rows = coverageCompare(
+    coverageTotal(headFile, 'head'),
+    coverageTotal(baseFile, 'base'),
+    tolerance
+  )
+  const regressions = rows.filter((row) => row.verdict === 'regressed')
+
+  const width = Math.max(...rows.map((row) => row.metric.length), 8)
+  for (const row of rows)
+    console.log(
+      `  ${row.metric.padEnd(width)}  base ${String(row.base).padStart(6)}  head ${String(row.head).padStart(6)}  ${coverageSigned(row.delta).padStart(7)}  ${row.verdict}`
+    )
+
+  writeComment(coverageComment({ rows, tolerance, note }))
+  output({ coverage: regressions.length ? 'regressed' : 'ok', regressions: regressions.length, tolerance })
+
+  if (regressions.length) {
+    console.error(
+      `\n${regressions.length} metric(s) below the base branch by more than ${tolerance}pt:`
+    )
+    for (const row of regressions)
+      console.error(`  ${row.metric}: ${row.base}% -> ${row.head}% (${row.delta})`)
+    gateFailure(
+      `coverage went backwards: ${regressions.map((row) => row.metric).join(', ')} ` +
+        `below the base by more than ${tolerance}pt. Add tests for the code that lost it.`
+    )
+  }
+
+  console.log('\nNo metric is below the base branch.')
+}
+
+/**
  * This package's own auditability.
  *
  * The release job runs with `contents: write`, so the tree that carries this tool
@@ -2137,6 +2386,7 @@ async function main() {
     [
       'assert-no-dependencies',
       'audit',
+      'coverage-ratchet',
       'prepare-publish',
       'discover-publish',
       'attach',
@@ -2152,6 +2402,12 @@ async function main() {
   const auditOnly = ['audit-level', 'audit-omit', 'audit-config', 'audit-report', 'audit-input', 'audit-prod-input', 'audit-require-severity', 'audit-require-source', 'audit-require-packages']
   if (!flag('audit') && auditOnly.some(flag)) fail(`--${auditOnly.find(flag)} needs --audit`)
 
+  // The same for the ratchet's own options: `--coverage-head x` alone would cut a
+  // release over the tree it was meant to measure.
+  const coverageOnly = ['coverage-head', 'coverage-base', 'coverage-tolerance', 'coverage-markdown', 'coverage-missing-baseline', 'coverage-note']
+  if (!flag('coverage-ratchet') && coverageOnly.some(flag))
+    fail(`--${coverageOnly.find(flag)} needs --coverage-ratchet`)
+
   if (flag('assert-no-dependencies')) {
     assertNoDependencies(arg('repo-dir', process.cwd()))
     if (!otherMode('assert-no-dependencies')) return
@@ -2160,6 +2416,13 @@ async function main() {
   if (flag('audit')) {
     await auditGate()
     if (!otherMode('audit')) return
+  }
+
+  // After the audit, before anything is decided: a tree that fails either gate is
+  // not one to stamp a version onto.
+  if (flag('coverage-ratchet')) {
+    coverageRatchet()
+    if (!otherMode('coverage-ratchet')) return
   }
 
   if (flag('discover-publish') || flag('prepare-publish')) {
