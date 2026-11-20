@@ -21,7 +21,9 @@ function preloadOption(preload) {
 
 test('npm identity preload records separate CLI paths on separate lines', async (t) => {
   const cwd = mkdtempSync(join(tmpdir(), 'npm-identity-'))
-  t.after(() => rmSync(cwd, { recursive: true, force: true }))
+  // see the note in windows-audit-launch.test.mjs: a Windows directory outlives the
+  // child that used it by a moment, and rmSync retries for exactly that
+  t.after(() => rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }))
   // Windows paths contain backslashes; make the NODE_OPTIONS parser exercise
   // those characters on POSIX too, where backslash is a valid filename character.
   const preloadDir = join(cwd, process.platform === 'win32' ? 'preload dir' : 'preload\\dir with spaces')
@@ -87,7 +89,9 @@ function execute(command, args, options) {
 
 async function fixture(t, { duplicateSource = false, clean = false } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), 'audit-real-npm-'))
-  t.after(() => rmSync(cwd, { recursive: true, force: true }))
+  // see the note in windows-audit-launch.test.mjs: a Windows directory outlives the
+  // child that used it by a moment, and rmSync retries for exactly that
+  t.after(() => rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }))
   const requests = []
   const server = createServer((req, res) => {
     let body = ''

@@ -67,7 +67,10 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'audit win & percent% '))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
+  // Windows keeps a handle on a directory for a moment after the child that used it
+  // exits; rmSync retries EBUSY/EPERM/ENOTEMPTY/EMFILE for exactly this, and a
+  // teardown that gives up on the first EPERM fails an otherwise green suite.
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }))
   const project = join(root, 'project & data')
   mkdirSync(project)
   writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }))
