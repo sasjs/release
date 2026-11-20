@@ -167,7 +167,11 @@ for (const scenario of [
 // once reported an empty entry - advice about an entry that does not exist. The
 // gate must name the real problem. An empty-string PATH is the other case: the
 // key exists, and the empty-entry gate above already refuses it.
-test('Windows fails closed when the environment has no PATH key in any case', (t) => {
+// Native Windows cannot reach this state: libuv's make_program_env re-adds
+// PATH (and other required vars) from the parent process when the caller's
+// env block omits it, so the child always sees a PATH-named key. Only the
+// platform-spoofed run can observe a genuinely missing key.
+test('Windows fails closed when the environment has no PATH key in any case', { skip: process.platform === 'win32' ? 'native Windows children always receive PATH from libuv' : false }, (t) => {
   const { project, env } = fixture(t)
   assert.equal(Object.keys(env).filter((key) => key.toLowerCase() === 'path').length, 0, 'the fixture must provide an environment with no PATH-named key in any case')
   const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })

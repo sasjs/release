@@ -81,9 +81,6 @@ jobs:
           Write-Host "Global npm.cmd: $globalDir/npm.cmd"
           & (Join-Path $globalDir 'npm.cmd') --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Diagnostic: which PATH-like keys survive a child env block without PATH?
-          node -e "const { spawnSync } = require('node:child_process'); const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !['path','pathext'].includes(k.toLowerCase()))); const r = spawnSync(process.execPath, ['-e', 'console.log(JSON.stringify(Object.keys(process.env).filter(k=>k.toLowerCase()===\"path\")))'], { env, encoding: 'utf8' }); console.log('child PATH-like keys:', r.stdout.trim(), 'stderr:', r.stderr.trim())"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --test test/windows-audit-launch.test.mjs test/audit-real-npm.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
