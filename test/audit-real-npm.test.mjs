@@ -14,13 +14,22 @@ function writeIdentityPreload(preload) {
   writeFileSync(preload, `const fs = require('node:fs'); const path = require('node:path'); if (process.argv[1] && path.basename(process.argv[1]).toLowerCase() === 'npm-cli.js') fs.appendFileSync(process.env.SASJS_NPM_IDENTITY_LOG, fs.realpathSync(process.argv[1]) + '\\n')\n`)
 }
 
+// NODE_OPTIONS parses backslashes as escapes within quoted arguments, on every OS.
+function preloadOption(preload) {
+  return `--require=${JSON.stringify(preload)}`
+}
+
 test('npm identity preload records separate CLI paths on separate lines', async (t) => {
   const cwd = mkdtempSync(join(tmpdir(), 'npm-identity-'))
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
-  const preload = join(cwd, 'identity preload.cjs')
+  // Windows paths contain backslashes; make the NODE_OPTIONS parser exercise
+  // those characters on POSIX too, where backslash is a valid filename character.
+  const preloadDir = join(cwd, process.platform === 'win32' ? 'preload dir' : 'preload\\dir with spaces')
+  mkdirSync(preloadDir)
+  const preload = join(preloadDir, 'identity preload.cjs')
   const identityLog = join(cwd, 'identity.log')
   writeIdentityPreload(preload)
-  const env = { ...process.env, NODE_OPTIONS: `--require="${preload}"`, SASJS_NPM_IDENTITY_LOG: identityLog }
+  const env = { ...process.env, NODE_OPTIONS: preloadOption(preload), SASJS_NPM_IDENTITY_LOG: identityLog }
   const paths = ['first', 'second'].map((dir) => {
     mkdirSync(join(cwd, dir))
     const cli = join(cwd, dir, 'npm-cli.js')
@@ -45,7 +54,7 @@ test('real npm selected on PATH passes a clean audit against loopback', async (t
     identityLog = join(cwd, 'npm-identity.log')
     const preload = join(cwd, 'npm-identity.cjs')
     writeIdentityPreload(preload)
-    Object.assign(env, { NODE_OPTIONS: `--require="${preload}"`, SASJS_NPM_IDENTITY_LOG: identityLog })
+    Object.assign(env, { NODE_OPTIONS: preloadOption(preload), SASJS_NPM_IDENTITY_LOG: identityLog })
     // Ask the actual cmd shim which npm CLI it runs under the same cwd/config.
     const reference = await execute(env.ComSpec || env.COMSPEC || 'cmd.exe', ['/d', '/s', '/c', 'npm --version'], { cwd, env })
     assert.equal(reference.code, 0, `${reference.stdout}\n${reference.stderr}`)
