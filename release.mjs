@@ -1587,8 +1587,13 @@ function windowsNpm(argv, options) {
   const extKey = Object.keys(options.env).find((key) => key.toLowerCase() === 'pathext')
   const extensions = (options.env[extKey] || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((ext) => ext.toLowerCase())
   if (extensions.some((ext) => !/^\.[A-Za-z0-9]+$/.test(ext))) gateFailure('unsupported Windows PATHEXT')
+  // cmd.exe includes the current directory unless this variable exists (its
+  // value is irrelevant). Explicit PATH entries such as "." still apply.
+  // https://learn.microsoft.com/windows/win32/api/processenv/nf-processenv-needcurrentdirectoryforexepatha
+  const noDefaultCwd = Object.keys(options.env).some((key) => key.toLowerCase() === 'nodefaultcurrentdirectoryinexepath')
+  const searchDirs = [...(noDefaultCwd ? [] : [options.cwd]), ...dirs]
   let shim
-  for (const dir of [options.cwd, ...dirs]) {
+  for (const dir of searchDirs) {
     for (const ext of extensions) {
       const file = join(resolve(options.cwd, dir), `npm${ext}`)
       if (existsSync(file)) {
@@ -1606,7 +1611,21 @@ function windowsNpm(argv, options) {
   }
   if (![NPM_WINDOWS_SHIM, NPM_GLOBAL_SHIM, NPM_GLOBAL_SHIM_V7].includes(contents)) gateFailure(`unsupported Windows npm shim ${shim}; use a standard npm.cmd`)
   const bin = dirname(shim)
-  const node = [join(bin, 'node.exe'), ...dirs.map((dir) => join(resolve(options.cwd, dir), 'node.exe'))].find((file) => existsSync(file))
+  let node = join(bin, 'node.exe')
+  if (!existsSync(node)) {
+    node = undefined
+    for (const dir of searchDirs) {
+      for (const ext of extensions) {
+        const file = join(resolve(options.cwd, dir), `node${ext}`)
+        if (existsSync(file)) {
+          if (ext !== '.exe') gateFailure(`unsupported Windows node launcher ${file}; use node.exe`)
+          node = file
+          break
+        }
+      }
+      if (node) break
+    }
+  }
   if (!node) gateFailure(`Windows npm shim ${shim} needs node.exe on PATH`)
   const npmBin = join(bin, 'node_modules', 'npm', 'bin')
   let cli = join(npmBin, 'npm-cli.js')

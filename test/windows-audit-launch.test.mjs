@@ -37,7 +37,8 @@ function fixture(t) {
   writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0' }))
   const preload = join(root, 'platform.cjs')
   writeFileSync(preload, "Object.defineProperty(process, 'platform', {value:'win32'})\n")
-  const env = { ...process.env, NODE_OPTIONS: process.platform === 'win32' ? '' : `--require=\"${preload}\"` }
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !['path', 'pathext', 'nodefaultcurrentdirectoryinexepath'].includes(key.toLowerCase())))
+  env.NODE_OPTIONS = process.platform === 'win32' ? '' : `--require=\"${preload}\"`
   return { root, project, env }
 }
 
@@ -53,6 +54,116 @@ function install(root, name, code) {
 }
 
 const clean = { auditReportVersion: 2, vulnerabilities: {}, metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 }, dependencies: {} } }
+
+test('Windows honours NoDefaultCurrentDirectoryInExePath instead of executing project-local npm', (t) => {
+  const { root, project, env } = fixture(t)
+  install(root, 'trusted', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  writeFileSync(join(project, 'npm.cmd'), canonical)
+  copyFileSync(process.execPath, join(project, 'node.exe'))
+  const js = join(project, 'node_modules', 'npm', 'bin')
+  mkdirSync(js, { recursive: true })
+  writeFileSync(join(js, 'npm-prefix.js'), `require('fs').writeFileSync(process.env.MARKER, 'executed'); console.log(process.env.TEST_PREFIX)`)
+  writeFileSync(join(js, 'npm-cli.js'), 'process.exit(88)')
+  Object.assign(env, { PATH: join(root, 'trusted'), NoDefaultCurrentDirectoryInExePath: '1', TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.throws(() => readFileSync(env.MARKER), { code: 'ENOENT' })
+})
+
+test('Windows fails closed instead of bypassing a PATH node.cmd fallback', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'npm-shim', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  rmSync(join(bin, 'node.exe'))
+  const launcher = join(root, 'launcher')
+  mkdirSync(launcher)
+  writeFileSync(join(launcher, 'node.cmd'), 'not executed')
+  const later = join(root, 'later')
+  mkdirSync(later)
+  copyFileSync(process.execPath, join(later, 'node.exe'))
+  Object.assign(env, { PATH: [bin, launcher, later].join(';'), PATHEXT: '.COM;.EXE;.BAT;.CMD', TEST_PREFIX: join(root, 'absent') })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /unsupported.*node\.cmd/i)
+})
+
+for (const scenario of [
+  { label: 'default', flag: undefined, path: 'bin', expected: 'project' },
+  { label: 'disabled nonempty', flag: '0', path: 'bin', expected: 'bin' },
+  { label: 'disabled empty', flag: '', path: 'bin', expected: 'bin' },
+  { label: 'disabled but explicit dot', flag: '1', path: 'dot-first', expected: 'project' },
+  { label: 'disabled with dot later', flag: '1', path: 'dot-last', expected: 'bin' }
+]) {
+  test(`Windows npm current-directory precedence: ${scenario.label}`, (t) => {
+    const { root, project, env } = fixture(t)
+    const code = `require('fs').writeFileSync(process.env.MARKER, process.env.IDENTITY); console.log(${JSON.stringify(JSON.stringify(clean))})`
+    const bin = install(root, 'bin', code)
+    const projectBin = install(root, 'local', code)
+    // Move only npm-related files into the project, preserving its package.json.
+    mkdirSync(join(project, 'node_modules', 'npm', 'bin'), { recursive: true })
+    for (const file of ['npm.cmd', 'node.exe', 'node_modules/npm/bin/npm-prefix.js', 'node_modules/npm/bin/npm-cli.js'])
+      copyFileSync(join(projectBin, file), join(project, file))
+    // Prefix script distinguishes the selected shim without relying on parent cwd.
+    writeFileSync(join(project, 'node_modules/npm/bin/npm-cli.js'), code.replace('process.env.IDENTITY', "'project'"))
+    writeFileSync(join(bin, 'node_modules/npm/bin/npm-cli.js'), code.replace('process.env.IDENTITY', "'bin'"))
+    Object.assign(env, { PATH: scenario.path === 'dot-first' ? `.;${bin}` : scenario.path === 'dot-last' ? `${bin};.` : bin, TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'marker') })
+    if (scenario.flag !== undefined) env.NoDefaultCurrentDirectoryInExePath = scenario.flag
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.equal(readFileSync(env.MARKER, 'utf8'), scenario.expected)
+  })
+}
+
+for (const scenario of [
+  { label: 'current directory bat', dir: 'cwd', ext: 'bat', pathext: '.EXE;.BAT;.CMD' },
+  { label: 'earlier PATH cmd', dir: 'path', ext: 'cmd', pathext: '.EXE;.BAT;.CMD' },
+  { label: 'custom PATHEXT', dir: 'path', ext: 'foo', pathext: '.FOO;.EXE;.CMD' },
+  { label: 'same-directory PATHEXT before exe', dir: 'same', ext: 'cmd', pathext: '.CMD;.EXE' }
+]) {
+  test(`Windows node fallback rejects ${scenario.label}`, (t) => {
+    const { root, project, env } = fixture(t)
+    const bin = install(root, 'npm-bin', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+    rmSync(join(bin, 'node.exe'))
+    const first = join(root, 'first')
+    const later = join(root, 'later')
+    mkdirSync(first); mkdirSync(later)
+    copyFileSync(process.execPath, join(later, 'node.exe'))
+    writeFileSync(join(scenario.dir === 'cwd' ? project : scenario.dir === 'same' ? later : first, `node.${scenario.ext}`), 'not executed')
+    Object.assign(env, { PATH: [bin, first, later].join(';'), PATHEXT: scenario.pathext, TEST_PREFIX: join(root, 'absent') })
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stderr, new RegExp(`unsupported.*node\\.${scenario.ext}`, 'i'))
+  })
+}
+
+for (const scenario of [
+  { label: 'enabled', disabled: false, expected: 'project' },
+  { label: 'disabled', disabled: true, expected: 'path' },
+  { label: 'explicit dot', disabled: true, dot: true, expected: 'project' }
+]) {
+  test(`Windows node fallback current-directory search: ${scenario.label}`, (t) => {
+    const { root, project, env } = fixture(t)
+    const bin = install(root, 'npm-bin', `require('fs').writeFileSync(process.env.MARKER, process.execPath); console.log(${JSON.stringify(JSON.stringify(clean))})`)
+    rmSync(join(bin, 'node.exe'))
+    const later = join(root, 'later')
+    mkdirSync(later)
+    copyFileSync(process.execPath, join(later, 'node.exe'))
+    copyFileSync(process.execPath, join(project, 'node.exe'))
+    Object.assign(env, { PATH: [bin, ...(scenario.dot ? ['.'] : []), later].join(';'), PATHEXT: '.EXE;.CMD', TEST_PREFIX: join(root, 'absent'), MARKER: join(root, 'node-used') })
+    if (scenario.disabled) env.NoDefaultCurrentDirectoryInExePath = '1'
+    const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.equal(readFileSync(env.MARKER, 'utf8').toLowerCase(), join(scenario.expected === 'project' ? project : later, 'node.exe').toLowerCase())
+  })
+}
+
+test('Windows node beside npm wins over earlier PATH and current-directory wrappers', (t) => {
+  const { root, project, env } = fixture(t)
+  const bin = install(root, 'npm-bin', `console.log(${JSON.stringify(JSON.stringify(clean))})`)
+  writeFileSync(join(project, 'node.cmd'), 'not executed')
+  Object.assign(env, { PATH: bin, PATHEXT: '.CMD;.EXE', TEST_PREFIX: join(root, 'absent') })
+  const result = spawnSync(process.execPath, [CLI, '--repo-dir', project, '--audit'], { env, encoding: 'utf8' })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+})
 
 test('Windows PATHEXT does not silently bypass an earlier custom launcher', (t) => {
   const { root, project, env } = fixture(t)
