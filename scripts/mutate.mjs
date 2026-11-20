@@ -286,6 +286,26 @@ const mutations = [
     name: 'the distribution shim skips the global-prefix CLI',
     find: `  const distributionShim = contents === normalizeNpmShim(NPM_WINDOWS_SHIM)`,
     replace: `  const distributionShim = false`
+  },
+  {
+    name: 'the coverage tolerance is applied to the rounded delta',
+    find: `      verdict: delta < -tolerance ? 'regressed' : delta > tolerance ? 'improved' : 'unchanged'`,
+    replace: `      verdict: coverageRound(delta) < -tolerance ? 'regressed' : coverageRound(delta) > tolerance ? 'improved' : 'unchanged'`
+  },
+  {
+    name: 'the coverage tolerance boundary is inclusive, so a drop at the tolerance fails',
+    find: `      verdict: delta < -tolerance ? 'regressed' : delta > tolerance ? 'improved' : 'unchanged'`,
+    replace: `      verdict: delta <= -tolerance ? 'regressed' : delta > tolerance ? 'improved' : 'unchanged'`
+  },
+  {
+    name: 'a missing coverage baseline is compared anyway',
+    find: `  if (!existsSync(baseFile)) {`,
+    replace: `  if (false) {`
+  },
+  {
+    name: 'a missing coverage baseline is a pass',
+    find: `    gateFailure('no coverage baseline for the base commit, so coverage could not be compared')`,
+    replace: `    return`
   }
 ]
 

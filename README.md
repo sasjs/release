@@ -62,6 +62,13 @@ Two things it does that the toolchain cannot:
 | `--audit-input <path>` | read a recorded full-tree report instead of running npm; any exemption requires `--audit-prod-input` as well |
 | `--audit-prod-input <path>` | read a recorded production report, required for a replay with any exemption |
 | `--assert-no-dependencies` | fail unless the installed `@sasjs/release` ships no dependencies |
+| `--coverage-ratchet` | fail when a coverage metric falls below the summary published for the base branch |
+| `--coverage-head <path>` | the summary this run produced (default `coverage/coverage-summary.json`) |
+| `--coverage-base <path>` | the summary published for the base commit (default `coverage-base/coverage-summary.json`) |
+| `--coverage-tolerance <n>` | percentage points that may be lost unremarked (default `0.05`) |
+| `--coverage-missing-baseline <f>` | `fail` (default) or `skip` when the base summary is absent |
+| `--coverage-markdown <path>` | write the comparison as a pull request comment here |
+| `--coverage-note <text>` | say where the baseline came from, in that comment |
 | `--no-assets` | cut the release with no files attached; the artefacts are built from the tag and attached later |
 | `--keep-draft` | leaving the release a draft after attaching, rather than publishing it |
 | `--attach <tag>` | upload the configured assets to a release that already exists, and cut nothing |
@@ -173,6 +180,64 @@ A release job runs with `contents: write`, so the tree carrying the release tool
 ```yaml
 - run: npm run release -- --assert-no-dependencies
 ```
+
+## The coverage ratchet
+
+`coverageThreshold.global` in `jest.config.js` is a floor: one number that only moves when someone remembers to move it, so it either lags behind real coverage forever or fails an unrelated pull request the moment coverage slips. The half it cannot do is the comparison against the tree the pull request is diffed against - and the shell that did it, with its baseline lookup, its tolerance, its comment and its no-baseline handling, was copied into five repositories.
+
+`--coverage-ratchet` is that gate once:
+
+```yaml
+- name: Ratchet the coverage
+  run: npx @sasjs/release --coverage-ratchet --coverage-markdown coverage-comment.md
+```
+
+It reads the two files every repository already produced: the `coverage/coverage-summary.json` its own test run wrote, and the base commit's copy, downloaded into `coverage-base/`.
+
+What it enforces:
+
+- **A metric more than `--coverage-tolerance` below the base fails the job.** The tolerance is applied to the unrounded difference, because rounding first turns a 0.054pt drop into `-0.05` and lets it pass as unchanged. A drop of exactly the tolerance is unchanged: the rule is "more than". An improvement passes and is reported, so the effective bar tracks the repository without a commit.
+- **No baseline fails.** A gate that silently degrades to the fixed threshold is the state this exists to leave behind. `--coverage-missing-baseline skip` covers one case only - a base commit that predates the baseline workflow - and the caller is expected to prove that by checking the workflow file is absent there. Nothing in this tool can verify the claim, so its output says as much: a skip that outlives its reason is an exit-0 no-op, and only the pull request graph can tell you it has.
+- **A malformed report is a usage error, not a verdict.** Invalid JSON, a summary with no `total`, or one of the four metrics missing its `pct` exits `2`, like every other misuse. A mistyped path must not read as a coverage drop, and a coverage drop must not read as a broken pipeline.
+- **The comment is the same calculation as the verdict.** `--coverage-markdown` writes the table a reviewer reads, carrying the `<!-- coverage-ratchet -->` marker so a re-run updates the existing comment rather than posting a second one. `--coverage-note` says where the baseline came from, when it is not the base commit itself. A directory the path names is created, and a path that cannot be written is a usage error (exit `2`) rather than a raw `ENOENT` at the exit code a regression returns.
+
+The result is printed as `key=value` lines like every other mode: `coverage` is `ok`, `regressed`, `skipped` or `missing`, with `regressions` and `tolerance` beside it.
+
+### Publishing the baseline
+
+The baseline is the half that has to run on the default branch. `sasjs/release` carries it as a reusable workflow, so a repository states its own build rather than copying the pipeline:
+
+```yaml
+name: Coverage baseline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deliberately not cancel-in-progress: a baseline is per commit, and a pull
+  # request based on that commit needs it after a newer commit on main has
+  # landed.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    # A tag is not a pin: the estate's action-pins check demands a commit for every
+    # external `uses:`, reusable workflows included. Take the SHA of the release you
+    # are on and say which one it is in the comment.
+    uses: sasjs/release/.github/workflows/coverage-baseline.yml@<40-character sha> # v0.17.0
+    with:
+      build-command: npm run build
+```
+
+The inputs are the axes the five copies actually differed on, and nothing else: `node-version` (`22`), `pre-install-command` (empty; `npm install -g npm@12.2.0`, or a script that verifies the npm it puts on PATH), `install-command` (`npm ci`), `setup-command` (empty; `sudo apt-get install -y doxygen`, or `npm run setup`), `build-command` (empty), `test-command` (`npx jest --config=jest.config.js --silent --runInBand --ci --coverage`) and `timeout-minutes` (`30`). The test command has to write `coverage/coverage-summary.json`, which the workflow publishes as the `coverage-summary` artifact with 90-day retention.
+
+`concurrency` stays in the caller: a called workflow cannot be given a concurrency group by its caller, and its `github.workflow` context is the caller's name. That is the one block a repository keeps, and it is there because a cancelled baseline leaves a commit with no baseline at all.
 
 ## Permissions
 
