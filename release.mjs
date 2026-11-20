@@ -21,7 +21,7 @@
  * before the tag step, and the tag alone exists when it is returned after.
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, statSync, writeFileSync, appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -2228,13 +2228,23 @@ function coverageRatchet() {
   if (!['fail', 'skip'].includes(missing))
     fail('--coverage-missing-baseline must be fail or skip')
 
+  // The comment path is the caller's, and a directory that is not there is a
+  // configuration detail rather than a finding: create it, and if the write still
+  // fails say so as a usage error (exit 2) instead of letting a raw ENOENT look
+  // like the verdict a coverage regression returns.
   const writeComment = (body) => {
     if (!commentPath) return
+    const target = locate(commentPath)
     if (flag('dry-run')) {
       console.log(`would write the coverage comment to ${commentPath}`)
       return
     }
-    writeFileSync(locate(commentPath), `${body}\n`)
+    try {
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, `${body}\n`)
+    } catch (error) {
+      fail(`--coverage-ratchet: the coverage comment could not be written to ${target}: ${error.message}`)
+    }
   }
 
   console.log('Coverage ratchet')
@@ -2253,8 +2263,10 @@ function coverageRatchet() {
 
     if (missing === 'skip') {
       console.log(
-        `\nNo baseline at ${baseFile}, and the base commit predates the coverage-baseline ` +
-          `workflow, so there is nothing to compare against.\n${detail}`
+        `\nNo baseline at ${baseFile}, and --coverage-missing-baseline is skip, so there is ` +
+          `nothing to compare against. Nothing here verifies that the base commit really ` +
+          `predates the workflow - the graph is the caller's to check - so this is only ` +
+          `sound while that is true.\n${detail}`
       )
       writeComment(
         [

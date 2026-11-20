@@ -102,3 +102,7 @@ jobs:
           name: coverage-summary
           path: coverage/coverage-summary.json
           retention-days: 90
+          # A caller whose test-command does not write the summary would otherwise get
+          # a green baseline job that publishes nothing, and the mistake would surface
+          # as "no baseline" on every pull request of that repository instead of here.
+          if-no-files-found: error

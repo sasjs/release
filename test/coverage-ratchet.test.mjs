@@ -275,6 +275,31 @@ test('relative paths are resolved against --repo-dir, and absolute ones are not'
   assert.equal(direct.code, 0)
 })
 
+test('a comment path whose directory does not exist is created', async () => {
+  const cwd = repo({})
+  const { code } = await run(
+    cwd,
+    '--coverage-ratchet',
+    '--coverage-markdown',
+    'reports/nested/comment.md'
+  )
+
+  assert.equal(code, 0)
+  assert.match(readFileSync(join(cwd, 'reports', 'nested', 'comment.md'), 'utf8'), /## Coverage ratchet/)
+})
+
+test('a comment that cannot be written is a usage error, not a verdict', async () => {
+  // a file where the directory would have to go: mkdir fails with ENOTDIR however
+  // the checkout is laid out, so this does not depend on permissions
+  const cwd = repo({})
+  writeFileSync(join(cwd, 'blocker'), 'not a directory')
+
+  const { code, out } = await run(cwd, '--coverage-ratchet', '--coverage-markdown', 'blocker/comment.md')
+
+  assert.equal(code, 2)
+  assert.match(out, /the coverage comment could not be written to .*blocker[/\\]comment\.md/)
+})
+
 test('the comment carries the marker, the note and one row per metric', async () => {
   const cwd = repo({ base: [90, 80, 70, 90] })
   await run(

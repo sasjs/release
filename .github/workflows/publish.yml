@@ -188,6 +188,6 @@ jobs:
 
       - name: Publish
         if: steps.tag.outputs.skip != 'true' && steps.prepare.outputs.publish == 'true'
-        run: npm publish --access public
+        run: npm publish --access public --ignore-scripts=false
         # no NODE_AUTH_TOKEN: the OIDC token is exchanged for a short-lived
         # credential, so there is no long-lived secret in this repository
