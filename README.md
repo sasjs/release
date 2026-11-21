@@ -230,12 +230,14 @@ jobs:
     # A tag is not a pin: the estate's action-pins check demands a commit for every
     # external `uses:`, reusable workflows included. Take the SHA of the release you
     # are on and say which one it is in the comment.
-    uses: sasjs/release/.github/workflows/coverage-baseline.yml@<40-character sha> # v0.17.0
+    uses: sasjs/release/.github/workflows/coverage-baseline.yml@<40-character sha> # v0.18.0
     with:
+      runs-on: ubuntu-latest # the image this repository's pull request job uses
+      node-version: 22 # and its Node version: both are required, with no default
       build-command: npm run build
 ```
 
-The inputs are the axes the five copies actually differed on, and nothing else: `node-version` (`22`), `pre-install-command` (empty; `npm install -g npm@12.2.0`, or a script that verifies the npm it puts on PATH), `install-command` (`npm ci`), `setup-command` (empty; `sudo apt-get install -y doxygen`, or `npm run setup`), `build-command` (empty), `test-command` (`npx jest --config=jest.config.js --silent --runInBand --ci --coverage`) and `timeout-minutes` (`30`). The test command has to write `coverage/coverage-summary.json`, which the workflow publishes as the `coverage-summary` artifact with 90-day retention.
+The inputs are the axes the five copies differed on - the node version and the npm pin among them - plus `runs-on`, which none of them could express because each hardcoded its own image into its own job (`sasjs/adapter` on `ubuntu-22.04`, the rest on `ubuntu-latest`). Both toolchain inputs are required, with no default: a coverage percentage belongs to the toolchain that computed it, so a baseline from a different image or a different Node is not comparable with the head it is measured against. A floating label narrows that window rather than closing it - `ubuntu-latest`, or `lts/krypton` within a major, can be resolved differently a month later, and the baseline artifact is kept for 90 days - so a repository that wants the guarantee pins an image in its pull request job as well, and passes the same one here. The input's job is to make that value explicit rather than inherited. `vscode-extension` measures both halves on `lts/krypton` rather than 22, so a single reusable workflow cannot know either value: a default would give a caller whose head uses one image or Node version a baseline from another, and `ubuntu-latest` is a moving target besides. The rest follow the copies: `pre-install-command` (empty; `npm install -g npm@12.2.0`, or a script that verifies the npm it puts on PATH), `install-command` (`npm ci`), `setup-command` (empty; `sudo apt-get install -y doxygen`, or `npm run setup`), `build-command` (empty), `test-command` (`npx jest --config=jest.config.js --silent --runInBand --ci --coverage`) and `timeout-minutes` (`30`). The test command has to write `coverage/coverage-summary.json`, which the workflow publishes as the `coverage-summary` artifact with 90-day retention.
 
 `concurrency` stays in the caller: a called workflow cannot be given a concurrency group by its caller, and its `github.workflow` context is the caller's name. That is the one block a repository keeps, and it is there because a cancelled baseline leaves a commit with no baseline at all.
 

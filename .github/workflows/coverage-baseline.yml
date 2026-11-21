@@ -3,21 +3,40 @@ name: Coverage baseline
 # The half of the coverage gate that has to run on the default branch: publish the
 # coverage summary a pull request is measured against.
 #
-# A repository that keeps this workflow as a caller states its build and nothing
-# else - the checkout, the artifact name and its retention live here, once, rather
-# than in five copies that drifted on the node version, the npm pin and whether a
-# build ran at all.
+# A repository that keeps this workflow as a caller states its build, the image its
+# pull request job runs on and its Node version - the checkout, the artifact name and
+# its retention live here, once, rather than in five copies that drifted on the node
+# version, the npm pin and whether a build ran at all. The image and the Node version
+# are not details: a coverage percentage belongs to the toolchain that computed it,
+# so a baseline measured with a different one is not comparable with the head it is
+# measured against, which is why both are required rather than defaulted here.
 #
 # The comparison itself is `sasjs-release --coverage-ratchet`, run by the calling
 # repository's pull request workflow against this artifact.
 on:
   workflow_call:
     inputs:
-      node-version:
-        description: Node version the baseline is measured on
+      runs-on:
+        description: >-
+          The image the baseline is measured on. It has to be the image the caller's
+          pull request job runs on - a coverage percentage is a property of the
+          toolchain that computed it, so the two halves of the comparison must come
+          from the same one. Required, with no default: a default here is the silent
+          mismatch this input exists to remove, because a caller that pins its own job
+          and forgets this one would get a baseline from a different image and no
+          error anywhere.
         type: string
-        required: false
-        default: '22'
+        required: true
+      node-version:
+        description: >-
+          The Node version the baseline is measured on, and like the image it has to
+          be the one the caller's pull request job uses - the same argument, since the
+          compiler and the test runner are part of the toolchain that produced the
+          percentages. Required, with no default, like the image: a caller that omits
+          it fails at its call site rather than measuring its baseline on a version
+          none of its jobs use.
+        type: string
+        required: true
       pre-install-command:
         description: >-
           How the toolchain is fixed before installing - an npm release to put on
@@ -61,7 +80,7 @@ permissions:
 jobs:
   baseline:
     name: baseline
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
