@@ -1,0 +1,97 @@
+name: Attest release assets
+description: >-
+  Generate build provenance for the files a release will attach, and name the
+  bundle the way the OpenSSF scorecard reads it. Its Signed-Releases check looks
+  at release assets by filename: `*.intoto.jsonl` earns the full score, and the
+  bundle this produces carries no extension of its own, so it is renamed before
+  anyone uploads it.
+
+inputs:
+  version:
+    description: >-
+      The version the assets belong to, used in the file name
+      (`provenance-<version>.intoto.jsonl`). A leading `v` is dropped, so a tag
+      and a version both give the same name, and the rest must be a single path
+      segment - a monorepo tag like `pkg/v1.2.3` is refused rather than turned into
+      a directory.
+    required: true
+  subject-path:
+    description: >-
+      The files the release will attach - the exact ones being attested, as a
+      path, a glob or a list. The attestation is about these bytes; attesting a
+      rebuild of them attests something the release does not contain.
+    required: true
+  output-dir:
+    description: Where the renamed bundle is written.
+    required: false
+    default: dist
+
+outputs:
+  bundle-path:
+    description: The `*.intoto.jsonl` file to pass to `sasjs-release --asset`.
+    value: ${{ steps.name.outputs.path }}
+
+# A composite action cannot grant itself permissions, and an attestation needs
+# two: `id-token: write` for the OIDC token that names the workflow, commit and
+# repository in the statement, and `attestations: write` to record it. The job
+# that calls this must grant both, beside whatever `contents: write` its release
+# step needs to attach the file.
+runs:
+  using: composite
+  steps:
+    - name: Generate the provenance attestation
+      id: attest
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: ${{ inputs.subject-path }}
+
+    - name: Name the bundle the way the scorecard reads it
+      id: name
+      shell: bash
+      env:
+        BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        VERSION: ${{ inputs.version }}
+        OUT: ${{ inputs.output-dir }}
+      # Every refusal comes before the write it guards, and names this action: a
+      # caller reading `cp: cannot stat ''` has to work out which input was empty.
+      run: |
+        set -euo pipefail
+        version="${VERSION#v}"
+        if [ -z "$version" ]; then
+          echo "::error::attest-assets: version is empty, so the bundle cannot be named"
+          exit 1
+        fi
+        # The version becomes a file name and a line in $GITHUB_OUTPUT, so the
+        # allowed set is what both can carry: semver's own characters and nothing
+        # else. A newline would write a second line into the output file, and a
+        # space puts a space in the asset name.
+        case "$version" in
+          *[!0-9A-Za-z.+-]*)
+            echo "::error::attest-assets: version '$version' has characters that are not valid in a file name"
+            exit 1
+            ;;
+          . | ..)
+            echo "::error::attest-assets: version '$version' is not a single path segment, so it cannot name a file"
+            exit 1
+            ;;
+        esac
+        if [ -z "${OUT:-}" ]; then
+          echo "::error::attest-assets: output-dir is empty, so there is nowhere to write the bundle"
+          exit 1
+        fi
+        if [ -z "${BUNDLE:-}" ] || [ ! -f "$BUNDLE" ]; then
+          echo "::error::attest-assets: the attestation reported no bundle at '${BUNDLE:-}', so there is nothing to name"
+          exit 1
+        fi
+        # Size, not existence, is the property that matters: an empty attestation is
+        # a file. Checked here rather than after the copy, so a refusal leaves no
+        # zero-byte asset behind for a release to pick up.
+        if [ ! -s "$BUNDLE" ]; then
+          echo "::error::attest-assets: the bundle at '$BUNDLE' is empty - the attestation produced nothing to attach"
+          exit 1
+        fi
+        mkdir -p "$OUT"
+        target="$OUT/provenance-${version}.intoto.jsonl"
+        cp "$BUNDLE" "$target"
+        echo "path=$target" >> "$GITHUB_OUTPUT"
+        echo "provenance: $target ($(wc -c < "$target") bytes)"

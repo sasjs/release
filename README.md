@@ -241,6 +241,41 @@ The inputs are the axes the five copies differed on - the node version and the n
 
 `concurrency` stays in the caller: a called workflow cannot be given a concurrency group by its caller, and its `github.workflow` context is the caller's name. That is the one block a repository keeps, and it is there because a cancelled baseline leaves a commit with no baseline at all.
 
+## Signed releases
+
+The OpenSSF scorecard's Signed-Releases check takes the **newest five releases**, ignores any of those that attach no assets, and scores what is left: a release with a provenance attestation (`*.intoto.jsonl`) scores 10, one with a detached signature (`.asc`, `.minisig`, `.sig`, `.sign`, `.sigstore`, `.sigstore.json`) scores 8, and the result is the average over the releases it scored.
+
+Two consequences worth expecting rather than discovering:
+
+- **The score climbs one release at a time, by `10 / n`**, where `n` is how many of the newest five carry assets. With five asseted releases that is 2 after the first signed one and 10 after the fifth; with three it is 3, 6, 10.
+- **The window is the newest five releases, not the newest five with assets.** A release inside that window with no assets is skipped rather than replaced by an older one, so a project whose five most recent releases attach nothing reports nothing at all - even if older releases were signed. Attaching a tarball is the prerequisite for the check to have an opinion.
+
+GitHub's `actions/attest-build-provenance` produces the 10-scoring bundle from OIDC, and the file it writes carries no extension of its own - so the rename is the step everyone gets wrong, and it happens in exactly one place: here.
+
+```yaml
+jobs:
+  publish:
+    permissions:
+      contents: write     # the release and its assets
+      id-token: write     # the OIDC token the statement names
+      attestations: write # the attestation record
+    steps:
+      - uses: sasjs/release/.github/actions/attest-assets@<40-character sha> # v0.19.0
+        id: attest
+        with:
+          version: ${{ steps.prepare.outputs.version }}
+          subject-path: dist/*.tgz
+
+      - run: |
+          npm run release -- --attach "$TAG" \
+            --asset dist/sasjs-thing.tgz \
+            --asset "${{ steps.attest.outputs.bundle-path }}"
+```
+
+A composite action cannot grant its own permissions, so the job states them, and an attestation fails without both of the last two. `subject-path` must name the files the release attaches, byte for byte: attesting a rebuild attests something the release does not contain. A leading `v` on the version is dropped, so `version: v1.2.3` and `version: 1.2.3` both produce `provenance-1.2.3.intoto.jsonl`.
+
+The action refuses to report a path it did not write, and refuses an empty version: a zero-byte asset attached to a release looks like a success in the step log and scores nothing.
+
 ## Permissions
 
 The whole release is one credential: a token that may write contents on the repository. No branch is written, nothing is committed, and no workflow-file change is involved.
