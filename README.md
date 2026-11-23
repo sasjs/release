@@ -429,9 +429,9 @@ build second" safe there - a run that dies after the cut burns no version, and
 the next run re-classifies the same commits to the same one. (Gitea and GitLab
 create the tag with the release, so a draft there already names one.)
 
-On GitHub, a release that already exists for a tag is reused only when it names
-the commit being released - compared as a sha, so a shallow checkout is enough
-to tell. A `target_commitish` that is not a sha (the branch name a release made
+On GitHub, a release with a full-sha `target_commitish` is reused only when it
+names the commit being released, so a shallow checkout is enough to compare it.
+A `target_commitish` that is not a sha (the branch name a release made
 in the web UI stores) cannot be compared with what the release held, so it is
 reused as before. Gitea and GitLab reuse an existing release as they always
 have: the identity check is GitHub-only, where these draft semantics were
@@ -439,17 +439,21 @@ measured.
 
 - **same commit** - it is the previous run's draft, and this run finishes it
   (`a release for this tag already exists: finishing it`);
-- **another commit, still a draft** - it is abandoned work: its notes describe a
-  range nobody published, and finishing it would attach this build to a tag
-  created at the other commit. The release is re-read immediately before the
-  delete and the run refuses if it has been published in the meantime, so a live
-  release is never removed; otherwise the draft is deleted and the release cut
-  again at this commit, and the run says so (`discarded a stale draft for vX: it
-  named <the old commit>, and this run releases <this one>`);
+- **another commit, still a draft** - the run refuses without deleting or
+  replacing the draft. Inspect its notes and assets, then coordinate with its
+  owner: finish it from its commit or explicitly remove it before retrying. This
+  changes earlier automatic retries: a later commit no longer silently replaces
+  an abandoned draft;
 - **another commit and published** - the tag is taken. The run refuses
   (`a published release for vX already names <sha>, and this run releases <sha> -
   refusing to attach this build to it`) rather than attaching today's files to
   yesterday's release.
+
+The lookup and creation are not atomic. Another writer can create or change a
+draft after discovery; coordinate concurrent release writers. A lookup error can
+also be treated as a miss by the existing retry logic. This protection is not a
+strict identity check for branch or short-sha targets and is not sufficient by
+itself to establish provenance.
 
 On GitHub, and only there, the tag itself is checked before anything is created:
 GitHub ignores `target_commitish` once the tag exists, so a release created for a

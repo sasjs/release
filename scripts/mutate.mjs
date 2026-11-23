@@ -114,9 +114,9 @@ const mutations = [
     replace: `    const workspaceArgs = []`
   },
   {
-    name: 'a draft published while the run looked at it is deleted anyway',
-    find: `          if (current?.draft !== true)`,
-    replace: `          if (false)`
+    name: 'a mismatched draft is silently reused',
+    find: "    if (existing.draft !== true)",
+    replace: "    if (existing.draft === true) return existing\n    if (existing.draft !== true)"
   },
   {
     name: 'a tag on another commit does not stop the create',
