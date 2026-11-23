@@ -1952,59 +1952,34 @@ test('a tag on an unmerged branch is not the base', () => {
  * leaves when it dies after the cut: a draft creates no tag, so the next run
  * re-classifies the same commits to the same version and finds this draft
  * waiting. Finishing it would attach today's build to a tag created at
- * yesterday's commit, so the draft is discarded and the release cut again.
+ * yesterday's commit, and discarding it could destroy another run's work.
  */
-test('a draft that names another commit is discarded, and the release cut at this one', async (t) => {
+test('a draft that names another commit is preserved and refused', async (t) => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   const head = git(cwd, 'rev-parse', 'HEAD')
   const earlier = git(cwd, 'rev-parse', 'HEAD~1')
-  let base = ''
 
   const replacement = await stub((request) => {
     if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
       return { status: 404, json: {} }
     if (request.method === 'GET' && /\/releases\?/.test(request.url))
       return { json: [{ id: 7, tag_name: 'v1.8.0', draft: true, target_commitish: earlier }] }
-    // the discard re-reads the release immediately before deleting it
-    if (request.method === 'GET' && /\/releases\/7$/.test(request.url))
-      return { json: { id: 7, tag_name: 'v1.8.0', draft: true, assets: [] } }
-    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases')
-      return {
-        json: {
-          id: 8,
-          tag_name: 'v1.8.0',
-          draft: true,
-          target_commitish: head,
-          upload_url: `${base}/upload{?name,label}`
-        }
-      }
     return { json: { ok: true } }
   })
   t.after(() => replacement.stop())
-  base = replacement.base
   process.env.GH_TOKEN = 'token-123'
 
-  const out = await runInParallel(
+  const message = await failureInParallel(
     cwd, '--tag', '--host', 'github', '--release', '--draft',
     '--api-url', replacement.base, '--repo', 'sasjs/app'
   )
 
-  assert.match(out, /discarded a stale draft for v1\.8\.0/)
-  const deleted = replacement.seen.find((r) => r.method === 'DELETE')
-  assert.equal(deleted.url, '/repos/sasjs/app/releases/7')
+  assert.match(message, /draft release for v1\.8\.0 already names/)
+  assert.ok(message.includes(earlier))
+  assert.ok(message.includes(head))
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+  assert.equal(replacement.seen.some((r) => r.method === 'POST'), false)
 
-  const created = replacement.seen.find(
-    (r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'
-  )
-  const payload = JSON.parse(created.body)
-  assert.equal(payload.target_commitish, head, 'the new draft names this commit')
-  assert.equal(payload.draft, true)
-  // the discard happens before the create, or the create answers 422 for a tag
-  // that is still held by the draft it just deleted
-  assert.ok(
-    replacement.seen.indexOf(deleted) < replacement.seen.indexOf(created),
-    'the stale draft is deleted before the release is created again'
-  )
 })
 
 test('a draft that names this commit is finished, not discarded', async (t) => {
@@ -2039,6 +2014,35 @@ test('a draft that names this commit is finished, not discarded', async (t) => {
     false,
     'the existing draft is reused rather than created again'
   )
+})
+
+test('a mismatched draft discovered after a 422 is preserved without a second create', async (t) => {
+  const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
+  const earlier = git(cwd, 'rev-parse', 'HEAD~1')
+  let attempts = 0
+  const replacement = await stub((request) => {
+    if (request.method === 'GET' && /\/releases\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'GET' && /\/releases\?/.test(request.url))
+      return { json: attempts ? [{ id: 7, tag_name: 'v1.8.0', draft: true, target_commitish: earlier }] : [] }
+    if (request.method === 'GET' && /\/git\/ref\/tags\//.test(request.url))
+      return { status: 404, json: {} }
+    if (request.method === 'POST' && request.url === '/repos/sasjs/app/releases') {
+      attempts++
+      return { status: 422, json: { message: 'already exists' } }
+    }
+    return { json: { id: 7, draft: true } }
+  })
+  t.after(() => replacement.stop())
+  process.env.GH_TOKEN = 'token-123'
+
+  const message = await failureInParallel(
+    cwd, '--tag', '--host', 'github', '--release', '--draft',
+    '--api-url', replacement.base, '--repo', 'sasjs/app'
+  )
+  assert.match(message, /draft release for v1\.8\.0 already names/)
+  assert.equal(attempts, 1)
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
 })
 
 test('a published release naming another commit is refused rather than attached to', async (t) => {
@@ -2076,7 +2080,7 @@ test('a published release naming another commit is refused rather than attached 
   )
 })
 
-test('a stale draft naming a commit the checkout does not carry is still discarded', async (t) => {
+test('a draft naming a commit the checkout does not carry is preserved', async (t) => {
   // A release job's checkout can be shallow, and the commit a stale draft names
   // is exactly the object it will not have - so the sha is compared as a string
   // rather than resolved through git, or this case would reuse the draft.
@@ -2108,17 +2112,15 @@ test('a stale draft naming a commit the checkout does not carry is still discard
   base = replacement.base
   process.env.GH_TOKEN = 'token-123'
 
-  const out = await runInParallel(
+  const message = await failureInParallel(
     cwd, '--tag', '--host', 'github', '--release', '--draft',
     '--api-url', replacement.base, '--repo', 'sasjs/app'
   )
 
-  assert.match(out, /discarded a stale draft for v1\.8\.0/)
-  assert.equal(replacement.seen.find((r) => r.method === 'DELETE').url, '/repos/sasjs/app/releases/21')
-  const created = replacement.seen.find(
-    (r) => r.method === 'POST' && r.url === '/repos/sasjs/app/releases'
-  )
-  assert.equal(JSON.parse(created.body).target_commitish, head)
+  assert.match(message, /draft release for v1\.8\.0 already names/)
+  assert.ok(message.includes(absent))
+  assert.ok(message.includes(head))
+  assert.equal(replacement.seen.some((r) => r.method === 'DELETE' || r.method === 'POST'), false)
 })
 
 test('a release naming a branch is reused, because a branch cannot be compared', async (t) => {
@@ -2150,11 +2152,7 @@ test('a release naming a branch is reused, because a branch cannot be compared',
   assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
 })
 
-test('a draft published while the run was looking at it is not deleted', async (t) => {
-  // The lookup that finds the draft is seconds old. If it has been published in
-  // between, deleting it destroys a live release and its assets - so the state is
-  // re-read immediately before the delete and the run refuses, as the published
-  // branch does.
+test('a mismatched draft is never re-read for deletion', async (t) => {
   const cwd = repo({ commits: ['feat: initial', 'feat: one'] })
   const earlier = git(cwd, 'rev-parse', 'HEAD~1')
 
@@ -2176,8 +2174,9 @@ test('a draft published while the run was looking at it is not deleted', async (
     '--api-url', replacement.base, '--repo', 'sasjs/app'
   )
 
-  assert.match(message, /was published while this run was looking at it/)
+  assert.match(message, /draft release for v1\.8\.0 already names/)
   assert.equal(replacement.seen.some((r) => r.method === 'DELETE'), false)
+  assert.equal(replacement.seen.some((r) => r.url === '/repos/sasjs/app/releases/7'), false)
 })
 
 test('a tag already on another commit refuses the create', async (t) => {

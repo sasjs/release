@@ -438,12 +438,9 @@ async function createOrFind(url, options, find, identity) {
   // is not enough once drafts are in play: a re-run after publishing produced a
   // duplicate draft on a real repository.
   //
-  // An existing release is reused only when it names the commit this run is
-  // releasing. It usually does not: a draft creates no tag (the tag appears when
-  // the draft is published, so a run that dies after the cut burns nothing), and
-  // the next run re-classifies the same commits to the same version - so the
-  // release it finds was cut for an EARLIER commit. Finishing that one would
-  // attach today's build to a tag created at yesterday's commit.
+  // A draft creates no tag, so a later run may calculate the same version for
+  // another commit. Neither finishing nor deleting that draft is safe: it may
+  // contain work or assets from another run.
   const reuse = async (existing) => {
     // A sha is compared as a STRING, not resolved through the clone: a release
     // job's checkout may be shallow, and the commit a stale draft names is
@@ -470,11 +467,9 @@ async function createOrFind(url, options, find, identity) {
         `a published release for ${identity.tag} already names ${named}, and this run releases ${identity.commit} - refusing to attach this build to it`
       )
 
-    await identity.discard(existing)
-    console.log(
-      `discarded a stale draft for ${identity.tag}: it named ${named}, and this run releases ${identity.commit}`
+    fail(
+      `a draft release for ${identity.tag} already names ${named}, and this run releases ${identity.commit} - refusing to replace it; inspect the draft and resolve the conflict manually`
     )
-    return null
   }
 
   // Anything the host will not check for us has to be checked before the create:
@@ -488,8 +483,7 @@ async function createOrFind(url, options, find, identity) {
   // `id` is what makes a response a release: a host that answers 200 with
   // something else (an empty object, an error body) has not found one
   if (existing && existing.id) {
-    const reused = await reuse(existing)
-    if (reused) return reused
+    return reuse(existing)
   }
 
   try {
@@ -500,11 +494,7 @@ async function createOrFind(url, options, find, identity) {
     // reporting the 404 from the lookup sends the reader after the wrong call
     const refused = await find().catch(() => null)
     if (!refused || !refused.id) throw error
-    const reused = await reuse(refused)
-    if (reused) return reused
-    // the stale draft is gone, so the same create is now a create rather than a
-    // refusal - which is what a second attempt means here
-    return await create()
+    return reuse(refused)
   }
 }
 
@@ -1034,25 +1024,6 @@ async function publish({
       {
         tag,
         commit,
-        // Re-read before deleting: the lookup that found this release is seconds
-        // old, and a draft can be published in between - by a human, by
-        // `gh release edit --draft=false`, by another run. Deleting it then
-        // destroys a live release and its assets, so the state that justifies the
-        // delete is read again here and the run refuses rather than mutates.
-        discard: async (release) => {
-          const current = await request(
-            `${base}/repos/${repo}/releases/${release.id}`,
-            { headers }
-          )
-          if (current?.draft !== true)
-            fail(
-              `the release for ${tag} was published while this run was looking at it, so it is not a stale draft to discard - refusing to delete a live release`
-            )
-          await request(`${base}/repos/${repo}/releases/${release.id}`, {
-            method: 'DELETE',
-            headers
-          })
-        },
         // GitHub ignores target_commitish when the tag already exists, so a
         // release created for a tag that is already on another commit would point
         // at that commit while this run says it released this one. Ask the host
